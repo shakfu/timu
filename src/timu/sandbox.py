@@ -22,10 +22,11 @@ MAC_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 @dataclass(frozen=True)
 class Policy:
-    """Resolved paths. Write roots are also readable."""
+    """Resolved paths. Write roots are also readable. deny_write wins over them."""
 
     read_roots: tuple[Path, ...]
     write_roots: tuple[Path, ...]
+    deny_write: tuple[Path, ...] = ()
 
 
 class Sandbox(Protocol):
@@ -97,6 +98,9 @@ def mac_profile(
         f"(allow file-write* {writes} {dev})",
         '(deny file-write* (regex #"/\\.git(/|$)"))',
     ]
+    if policy.deny_write:  # subpath matches regardless of case on case-insensitive APFS
+        denied = " ".join(f"(subpath {_q(p)})" for p in policy.deny_write)
+        lines.append(f"(deny file-write* {denied})")
     if home is not None:
         readable = (*policy.read_roots, *policy.write_roots, *extra_read)
         lines.append(f"(deny file-read* (subpath {_q(home)}))")

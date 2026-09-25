@@ -22,6 +22,9 @@ class ToolOutput:
     untrusted: bool = False  # the text carries web content; the agent becomes untrusted
 
 
+PROTECTED = ("timu.toml", ".timu")
+"""Workdir entries that later runs read as config and skills; no agent may write them."""
+
 Delegate = Callable[[str, str, str, tuple[str, ...]], Result]
 """delegate(role, goal, accept, input ids) -> the child's Result. Raises DelegateError."""
 

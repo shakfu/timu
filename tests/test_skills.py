@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -150,6 +151,25 @@ def test_find_first_root_wins(tmp_path: Path) -> None:
         ("shared", "project copy"),
         ("only-user", "Does only-user."),
     ]
+    assert found[0].shadows == (user / "shared",)
+    assert found[1].shadows == ()
+
+
+def test_agent_warns_when_a_skill_is_shadowed(tmp_path: Path) -> None:
+    project, user = tmp_path / "project", tmp_path / "user"
+    skill(project, "alpha")
+    skill(user, "alpha")
+    role = Role("r", "p", (LOAD_SKILL,), skills=("alpha",))
+    events: list[Any] = []
+    Agent(
+        role,
+        FakeProvider([text("ok")]),
+        events.append,
+        tmp_path,
+        skill_roots=[project, user],
+    ).run(Task("x"))
+    warnings = [e.data["message"] for e in events if e.kind == "warning"]
+    assert warnings == [f"skill alpha: {project / 'alpha'} shadows {user / 'alpha'}"]
 
 
 def test_find_errors(tmp_path: Path) -> None:

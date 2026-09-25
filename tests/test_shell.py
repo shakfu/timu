@@ -196,6 +196,10 @@ def test_sandbox_writes(dirs: tuple[Path, Path, Path]) -> None:
     assert sh(ctx, "echo x > .git/hooks-pre-commit").is_error
     assert not (outside / "o.txt").exists()
     assert not (ws / ".git" / "hooks-pre-commit").exists()
+    for cmd in ("echo x > timu.toml", "echo x > TIMU.toml", "mkdir -p .timu/skills"):
+        assert sh(ctx, cmd).is_error, cmd
+    assert not (ws / "timu.toml").exists()
+    assert not (ws / ".timu").exists()
 
 
 @mac_only
@@ -264,6 +268,12 @@ def test_profile_rule_order() -> None:
     )
     assert lines.index('(allow file-read-metadata (subpath "/Users/u"))') > deny_home
     assert "file-read" not in mac_profile(policy, None)  # no home, no read rules
+
+
+def test_profile_denies_after_allowing_writes() -> None:
+    policy = Policy((), (Path("/w"),), (Path("/w/timu.toml"),))
+    lines = mac_profile(policy, None).splitlines()
+    assert lines[-1] == '(deny file-write* (subpath "/w/timu.toml"))'
 
 
 def test_profile_quotes_paths() -> None:

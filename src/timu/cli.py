@@ -126,7 +126,10 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("-C", "--workdir", type=Path, default=Path("."), help="default: .")
     run.add_argument(
-        "--config", type=Path, help="default: ./timu.toml, then ~/.config/timu/"
+        "--config",
+        type=Path,
+        help="trusted in full. Default: ~/.config/timu/timu.toml, then ./timu.toml "
+        "for models and roles only",
     )
     run.add_argument(
         "--report", default="REVIEW.md", help="report path (default: REVIEW.md)"

@@ -94,6 +94,11 @@ class Agent:
         self._emit("start", goal=task.goal)
         if isinstance(ctx.sandbox, NoSandbox):
             self._emit("warning", message="shell commands run without a sandbox")
+        for s in ctx.skills:  # a workspace skill can replace a user skill of that name
+            for other in s.shadows:
+                self._emit(
+                    "warning", message=f"skill {s.name}: {s.path} shadows {other}"
+                )
 
         untrusted = self._untrusted or any(a.tainted for a in task.inputs)
 

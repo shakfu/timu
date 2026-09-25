@@ -8,7 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.2.0]
 
+### Security
+
+- `./timu.toml` may set only models, timeouts, `extra_body` and `[roles]`; other keys come from the user config, the environment or `--config`. It overlays the user config instead of replacing it. Before, a cloned repo's `timu.toml` could set `base_url` and `api_key_env`, and timu sent that environment variable as a bearer token to the repo's server. It could also add `$HOME` paths to `sandbox.extra_read`.
+
+- Agents cannot write `timu.toml` or `.timu/` at the workspace root, with the `write` tool or in the sandbox, so one run cannot change the config or skills of the next. The `write` tool's `.git` check now ignores case: `.GIT/config` passed it on case-insensitive macOS volumes.
+
 ### Added
+
+- A warning when a skill in `./.timu/skills` replaces a user skill of the same name. Workspace skills still take precedence; the warning shows that yours did not run.
 
 - Agent loop: `Agent(role, provider, sink, workdir).run(task) -> Result`. It stops on a final answer, provider error, refusal, cancel, any `Budget` limit, or 3 identical consecutive tool calls. Design in `docs/dev/design.md`, phases in `docs/dev/plan.md`.
 

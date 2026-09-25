@@ -21,6 +21,40 @@ The source is `docs/media/architecture.d2`. `make diagrams` regenerates the SVG.
 
 No role holds network access together with the ability to write files or run commands. Web content, and anything derived from it, reaches other agents only as marked, untrusted data. See design section 6.
 
+## Workflows
+
+A workflow turns one objective into tasks for agents and combines their results. It decides which roles run, in what order, and what passes between them. timu has two kinds (design section 7):
+
+- **Pipeline**: Python code starts agents in a fixed order.
+- **Delegation**: a `lead` agent starts other agents with its `delegate` tool, in an order it picks at run time.
+
+The built-in workflows, in `src/timu/workflow.py`:
+
+| Workflow | Kind | Steps |
+|-|-|-|
+| `fix-review` (default) | pipeline | Coder, then reviewer. The report's first line is `VERDICT: APPROVE` or `VERDICT: CHANGES`. On `CHANGES`, the coder gets the report and tries again. Stops on approval or after `--max-rounds` (default 3). A report with no verdict fails the run. |
+| `research-fix-review` | pipeline | Researcher first. Its findings and source URLs go to the coder as untrusted inputs. Then `fix-review`. |
+| `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Delegation depth is at most 2. |
+
+All agents in a workflow share one `Run`: one budget, one trace, one cancel flag. Each agent gets the smaller of its role's budget and what the run has left. Agents pass work as artifacts that record their origin. They never paste it into a goal, so the untrusted mark survives.
+
+### Adding a workflow
+
+Workflows are code. `timu.toml` cannot define one, and there is no plugin hook. A workflow is a function that takes a `Run` and an objective and returns a `Result`:
+
+```python
+def code_then_review(run: Run, objective: str) -> Result:
+    coded = run.run_agent(CODER, Task(objective, accept="The tests pass."))
+    if coded.status == "done":
+        work = Artifact("coder-summary", coded.summary, origin=Origin.AGENT,
+                        source=coded.trace_id, untrusted=coded.untrusted)
+        coded = run.run_agent(REVIEWER, Task("Review the coder's work.", (work,)))
+    run.emit("workflow_result", status=coded.status, summary=coded.summary)
+    return replace(coded, usage=run.used, trace_id=run.run_id)
+```
+
+To expose it, add its name to the `--workflow` choices in `src/timu/cli.py` and call it from `main`. `main` also lists the roles whose providers it checks before the run starts.
+
 ## Requirements
 
 - Python 3.11 or later. No runtime dependencies.
@@ -40,7 +74,7 @@ uv run timu --help
 
 ## Configure
 
-timu reads `./timu.toml`, else `~/.config/timu/timu.toml`. A minimal file:
+timu reads `~/.config/timu/timu.toml`. A minimal file:
 
 ```toml
 [provider]
@@ -51,6 +85,8 @@ model = "openai/gpt-6-luna"              # an OpenRouter model id
 [sandbox]
 extra_read = ["~/.local/share/uv/python"]  # toolchains under $HOME
 ```
+
+A `./timu.toml` in the current directory overrides it, but may set only `provider.model`, `provider.timeout`, `provider.extra_body` and `[roles]`. A cloned repo can ship that file, so it cannot choose where requests and keys go or what the sandbox reads. Agents cannot write `timu.toml` or `.timu/` in the workspace.
 
 The API key comes from `OPENROUTER_API_KEY`, or the variable `api_key_env` names. `TIMU_MODEL` and `TIMU_BASE_URL` override the file. `src/timu/config.py` documents every key, including per-role models, skills and the search key.
 
@@ -64,13 +100,7 @@ timu run --workflow research-fix-review "upgrade to the current tomllib API"
 timu run --workflow lead "add a --json flag to the report command"
 ```
 
-| Workflow | Agents |
-|-|-|
-| `fix-review` (default) | coder, then reviewer; repeats until approved or `--max-rounds` (default 3) |
-| `research-fix-review` | researcher first, then `fix-review` |
-| `lead` | a lead that delegates to the other three as it sees fit |
-
-The reviewer's report goes to `REVIEW.md`, or `--report PATH`. Add it to `.gitignore`; timu warns if it is not ignored.
+`--workflow` picks one of the workflows above. The reviewer's report goes to `REVIEW.md`, or `--report PATH`. Add it to `.gitignore`; timu warns if it is not ignored.
 
 Useful flags:
 

@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from timu.tool import Context, Tool, ToolOutput
+from timu.tool import PROTECTED, Context, Tool, ToolOutput
 from timu.types import Capability
 
 MAX_FILE = (
@@ -103,9 +103,17 @@ def writable(ctx: Context, raw: str) -> Path:
     if lexical in ctx.write_files and lexical.is_symlink():
         raise FsError(f"{raw}: is a symlink; refusing to write through it")
     real = _real(lexical)
-    if ".git" in real.parts:  # hooks and config there can run commands later
+    # casefold: macOS volumes are case-insensitive, and realpath keeps the given case
+    if ".git" in (p.casefold() for p in real.parts):  # hooks and config can run code
         raise FsError(f"{raw}: writes inside .git are not allowed")
-    if real in ctx.write_files or _within(real, ctx.write_roots):
+    if real in ctx.write_files:
+        return real
+    rel = (
+        real.relative_to(ctx.workdir).parts if real.is_relative_to(ctx.workdir) else ()
+    )
+    if rel and rel[0].casefold() in PROTECTED:
+        raise FsError(f"{raw}: timu reads this on later runs; agents may not write it")
+    if _within(real, ctx.write_roots):
         return real
     raise FsError(f"{raw}: outside the writable roots")
 

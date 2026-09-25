@@ -17,8 +17,11 @@
     [sandbox]
     extra_read = ["~/.local/share/uv"]   # toolchains under $HOME (interim, design 15.8)
 
-The file is ./timu.toml, else $XDG_CONFIG_HOME/timu/timu.toml (default
-~/.config/timu/timu.toml). TIMU_BASE_URL and TIMU_MODEL override the file.
+The user file is $XDG_CONFIG_HOME/timu/timu.toml (default ~/.config/timu/timu.toml).
+./timu.toml overlays it but may set only provider.model, provider.timeout,
+provider.extra_body and [roles]: a cloned repo writes that file, so it must not choose
+where requests and keys go or what the sandbox reads. TIMU_BASE_URL and TIMU_MODEL
+override both. An explicit --config file is trusted in full.
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ from timu.tools.web import web_search_tool
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
+LOCAL = Path("timu.toml")
+LOCAL_PROVIDER_KEYS = frozenset({"model", "timeout", "extra_body"})
 
 
 class ConfigError(ValueError):
@@ -85,11 +90,8 @@ class Config:
         return web_search_tool(key) if key else None
 
 
-def config_path(env: Mapping[str, str] = os.environ) -> Path | None:
-    """The first config file that exists, or None."""
-    local = Path("timu.toml")
-    if local.is_file():
-        return local
+def user_config_path(env: Mapping[str, str] = os.environ) -> Path | None:
+    """The user config file if it exists, else None."""
     base = env.get("XDG_CONFIG_HOME") or (
         str(Path(env["HOME"]) / ".config") if env.get("HOME") else ""
     )
@@ -100,15 +102,21 @@ def config_path(env: Mapping[str, str] = os.environ) -> Path | None:
 def load_config(
     path: Path | None = None, env: Mapping[str, str] = os.environ
 ) -> Config:
-    """Read path, or the first config file found, then apply env overrides."""
-    path = path or config_path(env)
-    raw: dict[str, Any] = {}
+    """Read path; else the user file overlaid by ./timu.toml. Then apply env
+    overrides. Raises ConfigError, including for a key ./timu.toml may not set."""
     if path is not None:
-        try:
-            raw = tomllib.loads(path.read_text())
-        except (OSError, tomllib.TOMLDecodeError) as e:
-            raise ConfigError(f"{path}: {e}") from None
-    src = str(path) if path else "defaults"
+        raw, src = _read(path), str(path)
+    else:
+        raw, found = {}, []
+        if user := user_config_path(env):
+            raw = _read(user)
+            found.append(str(user))
+        if LOCAL.is_file():
+            local = _read(LOCAL)
+            _refuse_local(local)
+            raw = _merge(raw, local)
+            found.append(str(LOCAL))
+        src = " + ".join(found) or "defaults"
     prov = _table(raw, "provider", src)
     roles = _table(raw, "roles", src)
     config = Config(
@@ -138,6 +146,33 @@ def load_config(
     if model := env.get("TIMU_MODEL"):
         config = replace(config, model=model)
     return config
+
+
+def _read(path: Path) -> dict[str, Any]:
+    try:
+        return tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{path}: {e}") from None
+
+
+def _refuse_local(raw: Mapping[str, Any]) -> None:
+    prov = raw.get("provider", {})
+    keys = [k for k in raw if k not in ("provider", "roles")]
+    if isinstance(prov, dict):
+        keys += [f"provider.{k}" for k in prov if k not in LOCAL_PROVIDER_KEYS]
+    if keys:
+        raise ConfigError(
+            f"{LOCAL}: {', '.join(keys)} may be set only in the user config, "
+            "the environment, or a file passed with --config"
+        )
+
+
+def _merge(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in over.items():
+        both = isinstance(v, dict) and isinstance(out.get(k), dict)
+        out[k] = _merge(out[k], v) if both else v
+    return out
 
 
 def _table(raw: Mapping[str, Any], key: str, src: str) -> dict[str, Any]:

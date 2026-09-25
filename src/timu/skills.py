@@ -14,7 +14,7 @@ import json
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
@@ -34,6 +34,7 @@ class Skill:
     compatibility: str = ""
     metadata: Mapping[str, str] = field(default_factory=dict)
     allowed_tools: tuple[str, ...] = ()  # parsed, not enforced (plan D6)
+    shadows: tuple[Path, ...] = ()  # same-name skill directories in later roots
 
     def body(self) -> str:
         """The Markdown after the frontmatter, read now so edits are picked up."""
@@ -61,7 +62,7 @@ def find(names: Iterable[str], roots: Sequence[Path]) -> tuple[Skill, ...]:
         if not dirs:
             where = ", ".join(str(r) for r in roots) or "no skill roots"
             raise SkillError(f"skill {name} not found in {where}")
-        found.append(parse(dirs[0]))
+        found.append(replace(parse(dirs[0]), shadows=tuple(dirs[1:])))
     return tuple(found)
 
 

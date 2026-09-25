@@ -12,7 +12,7 @@ from contextlib import suppress
 from typing import Any
 
 from timu.sandbox import Policy
-from timu.tool import Context, Tool, ToolOutput
+from timu.tool import PROTECTED, Context, Tool, ToolOutput
 from timu.types import Capability
 
 SHELL_TIMEOUT_MAX = 600  # seconds
@@ -100,8 +100,10 @@ def _shell(ctx: Context, args: Mapping[str, Any]) -> ToolOutput:
     timeout = _timeout(ctx, args)
     skill_dirs = tuple(s.path for s in ctx.skills)  # so skill scripts can run
     policy = Policy(
-        (*ctx.read_roots, *skill_dirs), (*ctx.write_roots, ctx.tmp)
-    )  # never write_files
+        (*ctx.read_roots, *skill_dirs),
+        (*ctx.write_roots, ctx.tmp),  # never write_files
+        tuple(ctx.workdir / p for p in PROTECTED),
+    )
     argv = ctx.sandbox.wrap(["/bin/sh", "-c", cmd], policy)
     try:
         proc = subprocess.Popen(

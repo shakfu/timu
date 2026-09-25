@@ -263,11 +263,26 @@ def test_write_through_symlink_outside(ws: Path, run: Run) -> None:
 def test_write_refusals(ws: Path, run: Run) -> None:
     (ws / ".git").mkdir()
     assert ".git are not allowed" in err(run(WRITE, path=".git/config", content="x"))
+    assert ".git are not allowed" in err(run(WRITE, path=".GIT/config", content="x"))
     assert "is a directory" in err(run(WRITE, path="src", content="x"))
     read_only = context(ws, write_roots=())
     assert "outside the writable roots" in err(
         run(WRITE, read_only, path="a.txt", content="x")
     )
+
+
+@pytest.mark.parametrize(
+    "path", ["timu.toml", "TIMU.toml", ".timu/skills/s/SKILL.md", ".Timu/roles/r.md"]
+)
+def test_write_refuses_files_later_runs_read(ws: Path, run: Run, path: str) -> None:
+    assert "agents may not write it" in err(run(WRITE, path=path, content="x"))
+    assert not (ws / "timu.toml").exists()
+    assert not (ws / ".timu").exists()
+
+
+def test_write_allows_protected_names_below_the_root(ws: Path, run: Run) -> None:
+    ok(run(WRITE, path="src/timu.toml", content="x"))
+    ok(run(WRITE, path="src/.timu/x", content="x"))
 
 
 # ---- edit ----
