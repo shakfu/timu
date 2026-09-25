@@ -1,6 +1,6 @@
 # timu
 
-timo, which is "team" in Swahili, provides a team of specialised LLM agents. Each agent has a role that fixes its prompt, tools and permissions. Workflows combine the roles toward one objective.
+**timu**—Swahili for *team*—brings together specialised LLM agents, each with a defined role that determines its prompt, tools, and permissions. Workflows coordinate these roles to achieve a shared objective.
 
 Status: alpha. The design is in `docs/dev/design.md`.
 
