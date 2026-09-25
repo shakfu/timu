@@ -120,9 +120,8 @@ def test_content_cannot_close_the_wrapper() -> None:
 def test_random_suffix_per_render() -> None:
     task = Task("x", (Artifact("r", "c", origin=Origin.NET),))
     suffixes = {
-        re.search(r"untrusted-([0-9a-f]+)", render_task(task)).group(1)
-        for _ in range(5)
-    }  # type: ignore[union-attr]
+        re.findall(r"untrusted-([0-9a-f]+)", render_task(task))[0] for _ in range(5)
+    }
     assert len(suffixes) > 1
 
 

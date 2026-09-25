@@ -13,13 +13,14 @@ from typing import Any
 import pytest
 
 from scenarios import SCENARIOS, redact, restore
-from timu import Capability, Event, Result, Tool, ToolOutput
+from timu import Capability, Event, Result, Tool, ToolOutput, Usage
 from timu.cli import main
 from timu.provider.base import Provider, Reply
 from timu.provider.fake import FakeProvider, call, calls, text
 from timu.sandbox import MacSandbox, NoSandbox, Sandbox, detect
 from timu.trace import (
     TraceError,
+    _cost,
     compare,
     load,
     recorded_tool,
@@ -155,8 +156,16 @@ def test_tree_and_render(tmp_path: Path) -> None:
     lines = render(trace).splitlines()
     assert lines[0].startswith("run ") and " done: 11 turns, 7 tool calls, " in lines[0]
     assert lines[1] == "  a1 lead done: 4 turns, 3 tool calls, 60 tokens untrusted"
-    assert lines[2].startswith("    a2 researcher done: 2 turns, 1 tool calls")
+    assert (
+        lines[2] == "    a2 researcher done: 2 turns, 1 tool call, 30 tokens untrusted"
+    )
     assert lines[-1] == "summary: Objective met."
+
+
+def test_cost_uses_singular_nouns_for_one() -> None:
+    assert _cost(Usage(turns=1, tool_calls=1, input_tokens=1)) == (
+        "1 turn, 1 tool call, 1 token"
+    )
 
 
 def test_render_unfinished(tmp_path: Path) -> None:

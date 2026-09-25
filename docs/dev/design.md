@@ -99,8 +99,11 @@ Sandbox backends: `sandbox-exec` with a generated profile on macOS; `bwrap` on L
 Limits of the macOS backend:
 
 - Reads outside `$HOME` are not restricted, because toolchains live in `/usr`, `/opt`, `/Library` and elsewhere.
+
 - Under `$HOME`, `stat` and `readlink` are allowed, so symlinked toolchains resolve. A command can learn whether a guessed path exists, but not its contents or a directory listing.
+
 - Toolchains under `$HOME` (uv, pyenv, rustup) must be listed as `extra_read`, or commands that use them fail.
+
 - Two fixed-name temp files are writable outside the write roots, because common tools fail without them: `xcrun_db*` in the per-user temp dir (Xcode shims) and `/tmp/sh-thd*` (here-documents; `/bin/sh` is bash 3.2, which ignores `TMPDIR` for them).
 
 ## 4. Tools and roles
@@ -267,7 +270,9 @@ Rules:
 How the rules are enforced:
 
 - Two markers. `origin=net` means web content first-hand; `untrusted` marks anything derived from it, such as the summary of a coder that read research. The wrapper uses both. The approval gate asks only about first-hand web content, once per artifact, so a run does not prompt again for every derived summary.
+
 - The wrapper tag carries a random suffix per rendered task (`<untrusted-3f9a1c ...>`). Content cannot close a tag whose name it cannot predict. Unlike escaping `<`, this keeps code in the content verbatim.
+
 - `web_fetch` refuses non-http(s) URLs, and hosts that resolve to private, loopback or link-local addresses, including after a redirect. Otherwise a researcher could reach services on the user's machine or network, such as a local model server or a cloud metadata endpoint. DNS rebinding between the check and the connection is not prevented.
 
 This lowers the risk but does not remove it. The model can still follow instructions it finds inside quoted data. The capability split in section 4 limits the damage when that happens.
@@ -297,7 +302,9 @@ Delegation limits:
 How delegation passes work:
 
 - `delegate(role, goal, accept, inputs)` takes earlier results by agent id (`inputs: ["a2"]`), not as pasted text. The run attaches each one as an artifact with its real provenance: `origin=net` for a role that has `net`. Pasted text would lose the wrapper and bypass the approval gate.
+
 - The tool result is a JSON line (id, status, untrusted flag, usage), then the child's answer. An untrusted answer is wrapped as in section 6. A child's failure is a result with `is_error` set, not an exception, so the lead can react.
+
 - An agent that receives an untrusted child result is tainted. Its later children start untrusted, because a goal it writes may carry injected instructions. With the approval gate on, such a goal is shown for approval before it reaches a role with `exec` or `fs.write`. The gate is on by default for the `lead` workflow: in a live run, the lead passed research by id and also copied it into the coder's goal, despite a prompt telling it not to.
 
 ## 8. Budgets and termination

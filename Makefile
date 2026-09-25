@@ -6,7 +6,7 @@
 
 .PHONY: all sync build rebuild test lint lint-check format format-check \
         typecheck qa clean distclean wheel sdist dist check publish-test \
-        publish upgrade coverage coverage-html docs release help
+        publish upgrade coverage coverage-html docs diagrams release help
 
 # Default target
 all: build
@@ -42,9 +42,9 @@ format:
 format-check:
 	@uv run ruff format --check src/ tests/
 
-# Type check with mypy
+# Type check with mypy (package and tests)
 typecheck:
-	@uv run mypy src/timu
+	@uv run mypy src/timu tests
 
 # Run a full quality assurance check (non-mutating; mirrors CI)
 qa: lint-check format-check typecheck test
@@ -91,6 +91,10 @@ coverage-html:
 docs:
 	@uv run --with sphinx sphinx-build -b html docs/ docs/_build/html
 
+# Regenerate docs/media/*.svg from their .d2 sources (d2 with the TALA layout engine)
+diagrams:
+	@for f in docs/media/*.d2; do d2 --layout=tala "$$f" "$${f%.d2}.svg" || exit 1; done
+
 # Create a release (bump version, tag, push)
 release:
 	@echo "Current version: $$(grep '^version' pyproject.toml | head -1)"
@@ -128,7 +132,7 @@ help:
 	@echo "  lint-check   - Lint with ruff (check only)"
 	@echo "  format       - Format with ruff"
 	@echo "  format-check - Check formatting without modifying files"
-	@echo "  typecheck    - Type check with mypy"
+	@echo "  typecheck    - Type check the package and tests with mypy"
 	@echo "  qa           - Run full quality assurance (non-mutating: lint-check, format-check, typecheck, test)"
 	@echo "  wheel        - Build wheel distribution"
 	@echo "  sdist        - Build source distribution"
@@ -140,6 +144,7 @@ help:
 	@echo "  coverage     - Run tests with coverage"
 	@echo "  coverage-html - Generate HTML coverage report"
 	@echo "  docs         - Build documentation with Sphinx"
+	@echo "  diagrams     - Regenerate docs/media/*.svg from .d2 sources (d2, TALA)"
 	@echo "  release      - Bump version, tag, and prepare release"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  distclean    - Remove all generated files"

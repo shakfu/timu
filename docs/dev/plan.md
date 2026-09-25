@@ -76,8 +76,7 @@ Each phase ends with `make qa` passing: ruff, format check, `mypy --strict`, and
 
 - Keep `test_has_no_runtime_dependencies`.
 
-- `[project.scripts] timu = "timu.cli:main"` moves to phase 6, when `cli.py`
-  exists. An entry point to a missing module would install a broken command.
+- `[project.scripts] timu = "timu.cli:main"` moves to phase 6, when `cli.py` exists. An entry point to a missing module would install a broken command.
 
 - Replace the placeholder `README.md` with a stub pointing to `docs/dev/design.md`.
 
@@ -121,13 +120,9 @@ Tests:
 
 - A static check that no module-level variable of the package is reassigned (lint, or an AST test).
 
-Phase 1 also adds minimal `tool.py` (`Tool`, `Context` with `workdir`, `cancel`,
-`max_output`) and `role.py` (`Role`, no `validate`). Phase 2 extends both.
-Cancellation uses `threading.Event`; no `CancelToken` class.
+Phase 1 also adds minimal `tool.py` (`Tool`, `Context` with `workdir`, `cancel`, `max_output`) and `role.py` (`Role`, no `validate`). Phase 2 extends both. Cancellation uses `threading.Event`; no `CancelToken` class.
 
-Exit: a scripted 5-turn conversation with 5 tool calls (a batch of 2, and an
-unknown tool the model recovers from) produces the expected `Result`, message
-history and event stream.
+Exit: a scripted 5-turn conversation with 5 tool calls (a batch of 2, and an unknown tool the model recovers from) produces the expected `Result`, message history and event stream.
 
 ### Phase 2: filesystem tools and capability checks
 

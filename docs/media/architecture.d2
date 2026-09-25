@@ -1,0 +1,121 @@
+# timu architecture. Regenerate the SVG with `make diagrams`.
+
+classes: {
+  external: {
+    style: {
+      fill: "#f4f4f4"
+      stroke: "#8a8a8a"
+      stroke-dash: 3
+    }
+  }
+  role: {
+    style: {
+      fill: "#e3edfb"
+      stroke: "#3b6fb6"
+    }
+  }
+  tool: {
+    style: {
+      fill: "#fff6db"
+      stroke: "#b58900"
+    }
+  }
+  guard: {
+    style: {
+      fill: "#fde8e7"
+      stroke: "#c0392b"
+      stroke-width: 2
+    }
+  }
+}
+
+cli: "timu CLI" {
+  run: "timu run"
+  trace: "timu trace"
+}
+
+config: "timu.toml\nmodel, keys, skills,\nsandbox extra_read" {
+  shape: page
+}
+
+workflows: "Workflows" {
+  fix: "fix-review\ncoder then reviewer,\nuntil VERDICT: APPROVE"
+  research: "research-fix-review\nresearcher, then fix-review"
+  lead: "lead\na lead delegates\nto the others"
+}
+
+run: "Run\nshared live budget\napproval gate\ntaint tracking\nresults by agent id" {
+  class: guard
+}
+
+roles: "Roles (data, not subclasses)" {
+  lead: "lead\nfs.read" {class: role}
+  researcher: "researcher\nnet" {class: role}
+  coder: "coder\nfs.read, fs.write, exec" {class: role}
+  reviewer: "reviewer\nfs.read, exec" {class: role}
+}
+
+agent: "Agent loop\ncall the model, run its tools,\nrepeat until an answer or a limit"
+
+provider: "OpenAIProvider\nstreaming, retries,\ntype-checked replies"
+
+tools: "Tools (each needs a capability)" {
+  fs: "read, list, search\nwrite, edit\n(paths checked against roots)" {class: tool}
+  shell: "shell\n(exec)" {class: tool}
+  web: "web_fetch, web_search\n(net; public hosts only)" {class: tool}
+  skill: "load_skill\nread_skill_file" {class: tool}
+  delegate: "delegate\n(results passed by id)" {class: tool}
+}
+
+sandbox: "sandbox-exec\nno network, writes only to\nwrite roots, home dir hidden" {
+  class: guard
+}
+
+model: "Model API\nOpenRouter or llama-server" {
+  class: external
+  shape: cloud
+}
+
+internet: "The web\n(untrusted)" {
+  class: external
+  shape: cloud
+}
+
+workspace: "Workspace\n(the repo)" {
+  class: external
+  shape: package
+}
+
+skills: "SKILL.md directories" {
+  class: external
+  shape: page
+}
+
+observe: "Observability" {
+  console: "Console\nstreamed text, one line per step"
+  jsonl: "JSONL trace\n~/.local/state/timu/runs"
+  replay: "Replay\nrecorded replies, same decisions"
+}
+
+cli.run -> config: reads
+cli.run -> workflows: starts
+workflows -> run: one per run
+run -> agent: "builds one per task:\nrole + remaining budget"
+roles -> agent: "prompt, tools, grants"
+agent -> provider: messages
+provider -> model: HTTPS
+agent -> tools: tool calls
+tools.delegate -> run: "child agent" {
+  style.stroke-dash: 3
+}
+tools.fs -> workspace
+tools.shell -> sandbox
+sandbox -> workspace
+tools.web -> internet: "results marked untrusted" {
+  style.stroke: "#c0392b"
+}
+tools.skill -> skills
+agent -> observe.console: events
+agent -> observe.jsonl: events
+cli.trace -> observe.jsonl: reads
+observe.jsonl -> observe.replay: fixtures

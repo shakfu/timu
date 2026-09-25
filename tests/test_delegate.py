@@ -344,9 +344,12 @@ def test_gate_default(
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     asked: list[str] = []
-    monkeypatch.setattr(
-        "timu.cli.tty_approve", lambda a, r: asked.append(a.name) or True
-    )
+
+    def approve(a: Artifact, r: Role) -> bool:
+        asked.append(a.name)
+        return True
+
+    monkeypatch.setattr("timu.cli.tty_approve", approve)
     toml = tmp_path / "timu.toml"
     toml.write_text('[provider]\nmodel = "m"\napi_key_env = ""\n')
     work = tmp_path / "w"

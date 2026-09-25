@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
 - Agent loop: `Agent(role, provider, sink, workdir).run(task) -> Result`. It stops on a final answer, provider error, refusal, cancel, any `Budget` limit, or 3 identical consecutive tool calls. Design in `docs/dev/design.md`, phases in `docs/dev/plan.md`.
@@ -42,7 +44,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Placeholder `add` and `greet` functions.
 
-## [0.1.0] - 2026-09-24
+## [0.1.0]
 
 ### Added
 

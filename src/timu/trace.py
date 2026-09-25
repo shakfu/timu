@@ -169,7 +169,10 @@ def render(events: Sequence[Event]) -> str:
 
 def _cost(u: Usage) -> str:
     cost = f", ${u.cost_usd:.4f}" if u.cost_usd else ""
-    return f"{u.turns} turns, {u.tool_calls} tool calls, {u.tokens} tokens{cost}"
+    turns = "turn" if u.turns == 1 else "turns"
+    tool_calls = "tool call" if u.tool_calls == 1 else "tool calls"
+    tokens = "token" if u.tokens == 1 else "tokens"
+    return f"{u.turns} {turns}, {u.tool_calls} {tool_calls}, {u.tokens} {tokens}{cost}"
 
 
 def _usage(d: Any) -> Usage:
