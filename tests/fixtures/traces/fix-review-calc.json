@@ -1,0 +1,5 @@
+{
+  "scenario": "fix-review-calc",
+  "model": "openai/gpt-6-luna",
+  "run": "20260925-082522-556e"
+}

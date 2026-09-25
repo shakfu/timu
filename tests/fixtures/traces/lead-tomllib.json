@@ -1,0 +1,5 @@
+{
+  "scenario": "lead-tomllib",
+  "model": "openai/gpt-6-luna",
+  "run": "20260925-082542-b0f8"
+}
