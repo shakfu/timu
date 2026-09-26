@@ -1,4 +1,5 @@
-"""Tests for the built-in roles, report writing, Run budgets and the fix-review pipeline."""
+"""Tests for the built-in roles, report writing, Run budgets, the fix-review pipeline
+and the workflow registry."""
 
 from __future__ import annotations
 
@@ -6,19 +7,28 @@ import dataclasses
 import os
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from timu import Budget, Capability, Event, Role, Task, Usage
+from timu import Budget, Capability, Event, Origin, Role, Task, Usage
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider, call, calls, text
 from timu.report import MAX_REPORT, ReportError, is_gitignored, write_report
 from timu.roles import CODER, REVIEWER, REVIEWER_WRITE, with_skills
-from timu.sandbox import NoSandbox
+from timu.sandbox import NoSandbox, Policy
 from timu.tools.skill import LOAD_SKILL, READ_SKILL_FILE
-from timu.workflow import Run, fix_review, verdict
+from timu.workflow import (
+    WORKFLOWS,
+    Options,
+    Run,
+    check_fix_review,
+    commands,
+    fix_review,
+    verdict,
+)
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 R, W, X = Capability.FS_READ, Capability.FS_WRITE, Capability.EXEC
@@ -184,6 +194,176 @@ def test_wall_budget(tmp_path: Path) -> None:
     assert run._child_budget(Budget(wall_seconds=100)).wall_seconds == 10  # type: ignore[union-attr]
     now[0] = 11
     assert run._child_budget(Budget()) is None
+
+
+def test_runs_in_one_session_share_budget_ids_and_trace(tmp_path: Path) -> None:
+    """Run.at binds the session to another workdir: one budget, id sequence and sink.
+    Delegate inputs and each Run's own usage stay per workdir."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    replies = [text("x", cost=0.25), text("y", cost=0.5)]
+    run, _, events = make_run(tmp_path / "a", replies, budget=Budget(cost_usd=1.0))
+    other = run.at(tmp_path / "b")
+    run.run_agent(PLAIN, Task("t"))
+    other.run_agent(PLAIN, Task("t"))
+    assert other.workdir == Path(os.path.realpath(tmp_path / "b"))
+    assert other.run_id == run.run_id == "r1"
+    assert (run.used.cost_usd, other.used.cost_usd) == (0.25, 0.5)
+    assert run.session.used == Usage(
+        turns=2, input_tokens=20, output_tokens=10, cost_usd=0.75
+    )
+    assert other._child_budget(Budget()).cost_usd == pytest.approx(0.25)  # type: ignore[union-attr]
+    assert [e.agent_id for e in events if e.kind == "start"] == ["a1", "a2"]
+    assert (list(run.results), list(other.results)) == (["a1"], ["a2"])
+
+
+SCRIPTS = {
+    "lead": [
+        calls(
+            call("delegate", id="d1", role="researcher", goal="look"),
+            call("delegate", id="d2", role="coder", goal="fix"),
+            call("delegate", id="d3", role="reviewer", goal="review"),
+        ),
+        text("done"),
+    ],
+    "researcher": [text("facts")],
+    "coder": [text("fixed")],
+    "reviewer": [text("VERDICT: APPROVE")],
+}
+
+
+@pytest.mark.parametrize("name", list(WORKFLOWS))
+def test_workflow_roles_cover_the_roles_it_starts(tmp_path: Path, name: str) -> None:
+    """The CLI checks providers for Workflow.roles before the run; a role missing
+    there would fail halfway instead."""
+    started: list[str] = []
+
+    def provider_for(role: Role) -> FakeProvider:
+        started.append(role.name)
+        return FakeProvider(list(SCRIPTS[role.name]))
+
+    run = Run(tmp_path, provider_for, lambda e: None, sandbox=NoSandbox())
+    by_name: dict[str, dict[str, Any]] = {
+        "commands": {"steps": ["true"]},
+        # fails once, so the fix loop runs, then passes
+        "check-fix-review": {"check": [FAIL_ONCE], "max_rounds": 1},
+        "lead": {},
+    }
+    params = by_name.get(name, {"max_rounds": 1})
+    result = WORKFLOWS[name].run(run, "objective", Options({}, params=params))
+    assert result.status == "done", result.summary
+    assert set(started) == set(WORKFLOWS[name].roles)
+
+
+FAIL_ONCE = "test -e .ran || { touch .ran; exit 1; }"
+
+
+# ---- command steps ----
+
+
+class Recorder:
+    """A sandbox that runs commands unconfined and records each policy."""
+
+    def __init__(self) -> None:
+        self.policies: list[Policy] = []
+
+    def wrap(self, argv: Sequence[str], policy: Policy) -> list[str]:
+        self.policies.append(policy)
+        return list(argv)
+
+
+def test_commands_run_in_order_and_stop_at_a_failure(tmp_path: Path) -> None:
+    run, provider, events = make_run(tmp_path, [])
+    steps = ["echo one", "false", "echo never"]
+    r = commands(run, "build", steps=steps)
+    assert (r.status, r.summary) == ("failed", "`false` failed: exit 1")
+    (log,) = r.artifacts
+    assert log.content == "$ echo one\none\n[exit 0]\n$ false\n\n[exit 1]\n"
+    assert (log.origin, log.untrusted, r.untrusted) == (Origin.AGENT, False, False)
+    assert provider.requests == []  # no model
+    assert [e.data["command"] for e in events if e.kind == "command"] == steps[:2]
+    assert commands(run, "b", steps=["true", "true"]).summary == "2 commands passed"
+
+
+def test_command_policy(tmp_path: Path) -> None:
+    box = Recorder()
+    files = tmp_path / "files" / "lib"
+    files.mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    run = Run(tmp_path, lambda r: FakeProvider([]), lambda e: None, sandbox=box)
+    run = run.session.at(ws, reads=(files,))
+    r = commands(run, "b", steps=["true"], network=True)
+    (policy,) = box.policies
+    w = Path(os.path.realpath(ws))
+    assert policy.network and policy.read_roots == (w, files)
+    assert policy.write_roots[0] == w and len(policy.write_roots) == 2  # + a temp home
+    assert policy.deny_write == (w / "timu.toml", w / ".timu")
+    (log,) = r.artifacts
+    assert (log.origin, log.untrusted, r.untrusted) == (Origin.NET, True, True)
+
+
+def test_commands_get_a_scrubbed_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-secret")
+    run, _, _ = make_run(tmp_path, [])
+    r = commands(run, "b", steps=["env"])
+    env = r.artifacts[0].content
+    assert "sk-secret" not in env
+    home = next(line for line in env.splitlines() if line.startswith("HOME="))
+    assert "/timu-" in home  # a private temp dir, not the user's home
+
+
+def test_command_timeout_and_budget(tmp_path: Path) -> None:
+    run, _, _ = make_run(tmp_path, [])
+    r = commands(run, "b", steps=["sleep 5"], timeout=1)
+    assert (r.status, r.summary) == ("failed", "`sleep 5` failed: timed out after 1s")
+    now = [0.0]
+    run, _, _ = make_run(
+        tmp_path, [], budget=Budget(wall_seconds=10), clock=lambda: now[0]
+    )
+    now[0] = 11
+    r = commands(run, "b", steps=["true"])
+    assert (r.status, r.summary) == (
+        "budget",
+        "workflow budget exhausted before `true`",
+    )
+
+
+def test_commands_need_a_sandbox(tmp_path: Path) -> None:
+    run = Run(tmp_path, lambda r: FakeProvider([]), lambda e: None)
+    r = commands(run, "b", steps=["true"])
+    assert (r.status, r.summary) == ("failed", "command steps need a sandbox")
+
+
+def test_check_fix_review_skips_the_model_when_checks_pass(tmp_path: Path) -> None:
+    run, provider, _ = make_run(tmp_path, [])
+    r = check_fix_review(run, "o", check=["true"])
+    assert (r.status, [a.name for a in r.artifacts]) == ("done", ["log"])
+    assert provider.requests == []
+
+
+def test_check_fix_review_fixes_then_checks_again(tmp_path: Path) -> None:
+    replies = [
+        calls(call("write", path="fixed.txt", content="ok")),
+        text("fixed"),
+        text("VERDICT: APPROVE"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = check_fix_review(run, "make the check pass", check=["test -f fixed.txt"])
+    assert (r.status, r.summary) == ("done", "1 commands passed")
+    assert [a.name for a in r.artifacts] == ["log", "review"]
+    coder_task = provider.requests[0].messages[1].content
+    assert "The checks failed" in coder_task and "[exit 1]" in coder_task
+
+
+def test_check_fix_review_gives_up_after_max_rounds(tmp_path: Path) -> None:
+    replies = [text("tried"), text("VERDICT: APPROVE")]
+    run, _, _ = make_run(tmp_path, replies)
+    r = check_fix_review(run, "o", check=["false"], max_rounds=1)
+    assert r.status == "failed"
+    assert r.summary == "checks still fail after 1 fix rounds: `false` failed: exit 1"
 
 
 # ---- fix_review ----

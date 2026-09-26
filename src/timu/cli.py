@@ -16,26 +16,29 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import FrameType
-from typing import Any, TextIO
+from typing import Any, TextIO, TypeVar
 
-from timu.config import ConfigError, load_config
+from timu.config import Config, ConfigError, load_config
 from timu.events import Event, JsonlSink
+from timu.graph import GraphError, GraphResult, find_projects, load_graph, run_graph
 from timu.provider.base import Provider
 from timu.report import ReportError
 from timu.role import Role, RoleError
-from timu.sandbox import MacSandbox, NoSandbox, Sandbox, detect
+from timu.sandbox import NoSandbox, Sandbox, detect, why_none
+from timu.tool import Tool
 from timu.trace import TraceError, load, render
 from timu.types import Artifact, Result
-from timu.workflow import (
-    WORKFLOW_BUDGET,
-    Run,
-    fix_review,
-    lead,
-    new_run_id,
-    research_fix_review,
-)
+from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Options, Session, new_run_id
 
-EXIT = {"done": 0, "failed": 1, "refused": 1, "budget": 3, "cancelled": 130}
+EXIT = {
+    "done": 0,
+    "failed": 1,
+    "refused": 1,
+    "skipped": 1,
+    "budget": 3,
+    "cancelled": 130,
+}
+T = TypeVar("T")
 USAGE_ERROR = 2
 
 
@@ -66,6 +69,16 @@ class ConsoleSink:
             self._line(f"    {'error: ' if d['is_error'] else ''}{first[:200]}")
         elif e.kind == "warning":
             self._line(f"warning: {d['message']}")
+        elif e.kind == "config":
+            self._line(f"config: {d['source']}")
+        elif e.kind == "command":
+            self._line(f"{who} $ {d['command']}")
+        elif e.kind == "command_result":
+            self._line(f"    {d['result']}")
+        elif e.kind == "node":
+            self._line(f"== node {e.node}: {d['repo']} ({d['workflow']})")
+        elif e.kind == "node_result":
+            self._line(f"== node {d['node']}: {d['status']}: {d['summary']}")
         elif e.kind == "round":
             extra = f": {d['verdict']}" if d.get("verdict") else ""
             self._line(f"== round {d['n']} {d['stage']}{extra}")
@@ -107,30 +120,42 @@ def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="timu", description="A team of specialised agents."
     )
-    sub = ap.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="run a workflow on an objective")
-    run.add_argument("objective", help="what the team should achieve")
-    run.add_argument(
-        "--workflow",
-        choices=["fix-review", "research-fix-review", "lead"],
-        default="fix-review",
-        help="research-fix-review first has a researcher look things up on the web; "
-        "lead has a lead agent delegate to the researcher, coder and reviewer",
-    )
-    run.add_argument(
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
         "--approve-untrusted",
         action=argparse.BooleanOptionalAction,
         help="ask on the terminal before web content, or a goal written after reading "
         "it, reaches the coder. Default: on for lead, off otherwise. With no terminal, "
         "the answer is no",
     )
-    run.add_argument("-C", "--workdir", type=Path, default=Path("."), help="default: .")
-    run.add_argument(
+    common.add_argument(
         "--config",
         type=Path,
-        help="trusted in full. Default: ~/.config/timu/timu.toml, then ./timu.toml "
-        "for models and roles only",
+        help="default: ~/.config/timu/timu.toml. A workspace timu.toml is not read",
     )
+    common.add_argument(
+        "--max-cost", type=float, help="stop the run at this cost in USD"
+    )
+    common.add_argument(
+        "--unsafe-no-sandbox",
+        action="store_true",
+        help="run shell commands without a sandbox; only where none exists",
+    )
+    common.add_argument(
+        "-v", "--verbose", action="store_true", help="show every tool result"
+    )
+    sub = ap.add_subparsers(dest="command", required=True)
+    run = sub.add_parser("run", parents=[common], help="run a workflow on an objective")
+    run.add_argument("objective", help="what the team should achieve")
+    run.add_argument(
+        "--workflow",
+        choices=[w.name for w in WORKFLOWS.values() if not w.graph_only],
+        default="fix-review",
+        help="; ".join(
+            f"{w.name}: {w.help}" for w in WORKFLOWS.values() if not w.graph_only
+        ),
+    )
+    run.add_argument("-C", "--workdir", type=Path, default=Path("."), help="default: .")
     run.add_argument(
         "--report", default="REVIEW.md", help="report path (default: REVIEW.md)"
     )
@@ -141,15 +166,12 @@ def parser() -> argparse.ArgumentParser:
         help="return: timu writes the report (default); write: the reviewer does",
     )
     run.add_argument("--max-rounds", type=int, default=3)
-    run.add_argument("--max-cost", type=float, help="stop the run at this cost in USD")
-    run.add_argument(
-        "--unsafe-no-sandbox",
-        action="store_true",
-        help="run shell commands without a sandbox; only where none exists",
+    graph = sub.add_parser("graph", help="run a graph of workflows across projects")
+    graph_sub = graph.add_subparsers(dest="graph_command", required=True)
+    graph_run = graph_sub.add_parser(
+        "run", parents=[common], help="run every node of a graph file"
     )
-    run.add_argument(
-        "-v", "--verbose", action="store_true", help="show every tool result"
-    )
+    graph_run.add_argument("file", type=Path, help="the graph file (docs/dev/graph.md)")
     show = sub.add_parser("trace", help="show a run's agent tree, status and cost")
     show.add_argument(
         "run", nargs="?", help="a run id or .jsonl path; default: the latest run"
@@ -167,20 +189,13 @@ def main(
     args = parser().parse_args(argv)
     if args.command == "trace":
         return show_trace(args.run, out, err)
-    try:
-        config = load_config(args.config)
-        if provider_for is None:
-            names = ["coder", "reviewer"]
-            if args.workflow != "fix-review":
-                names.append("researcher")
-            if args.workflow == "lead":
-                names.append("lead")
-            for name in names:  # fail before the run, not halfway
-                config.provider(name)
-            provider_for = lambda role: config.provider(role.name)
-    except ConfigError as e:
-        err.write(f"timu: {e}\n")
-        return USAGE_ERROR
+    if args.command == "graph":
+        return run_graph_file(args, provider_for, out, err)
+    workflow = WORKFLOWS[args.workflow]
+    loaded = _load(args, workflow.roles, provider_for, err)
+    if isinstance(loaded, int):
+        return loaded
+    config, provider_for = loaded
     if not args.workdir.is_dir():
         err.write(f"timu: {args.workdir} is not a directory\n")
         return USAGE_ERROR
@@ -188,14 +203,123 @@ def main(
         err.write("timu: --max-rounds must be at least 1\n")
         return USAGE_ERROR
 
+    def body(session: Session) -> Result:
+        run = session.at(args.workdir)
+        search = _search(session, config, workflow.roles)
+        params = {
+            "max_rounds": args.max_rounds,
+            "report_path": args.report,
+            "report_mode": args.report_mode,
+        }
+        options = Options(config.role_skills, search, params)
+        return workflow.run(run, args.objective, options)
+
+    done = _execute(
+        args, config, provider_for, workflow.approve_untrusted, out, err, body
+    )
+    if isinstance(done, int):
+        return done
+    result, trace = done
+    _report(result, trace, err)
+    return EXIT[result.status]
+
+
+def run_graph_file(
+    args: argparse.Namespace,
+    provider_for: Callable[[Role], Provider] | None,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """`timu graph run FILE`: check the graph and find its projects, then run it."""
+    try:
+        graph = load_graph(args.file)
+    except GraphError as e:
+        err.write(f"timu: {e}\n")
+        return USAGE_ERROR
+    workflows = [WORKFLOWS[n.workflow] for n in graph.nodes.values()]
+    roles = tuple(dict.fromkeys(r for w in workflows for r in w.roles))
+    loaded = _load(args, roles, provider_for, err)
+    if isinstance(loaded, int):
+        return loaded
+    config, provider_for = loaded
+    try:
+        projects = find_projects(graph, config.project_roots)
+    except GraphError as e:
+        err.write(f"timu: {e}\n")
+        return USAGE_ERROR
+
+    def body(session: Session) -> GraphResult:
+        options = Options(config.role_skills, _search(session, config, roles))
+        work = trace_dir().parent / "work" / session.run_id
+        return run_graph(session, graph, projects, work, options)
+
+    gate = any(w.approve_untrusted for w in workflows)
+    done = _execute(args, config, provider_for, gate, out, err, body)
+    if isinstance(done, int):
+        return done
+    result, trace = done
+    for nid, r in result.nodes.items():
+        err.write(f"timu: node {nid}: {r.status}: {r.summary}\n")
+        if r.head != r.base:
+            ref = f"{r.branch}:{r.branch}"
+            err.write(f"timu:   git -C {projects[nid]} fetch {r.workdir} {ref}\n")
+    err.write(f"timu: {result.status}; trace {trace}\n")
+    return EXIT[result.status]
+
+
+def _load(
+    args: argparse.Namespace,
+    roles: Sequence[str],
+    provider_for: Callable[[Role], Provider] | None,
+    err: TextIO,
+) -> tuple[Config, Callable[[Role], Provider]] | int:
+    """The config and a provider for each role, checked before the run so it does not
+    fail halfway. A usage error code instead, after reporting it."""
+    try:
+        config = load_config(args.config)
+        if provider_for is None:
+            for name in roles:
+                config.provider(name)
+            provider_for = lambda role: config.provider(role.name)
+    except ConfigError as e:
+        err.write(f"timu: {e}\n")
+        return USAGE_ERROR
+    return config, provider_for
+
+
+def _search(session: Session, config: Config, roles: Sequence[str]) -> Tool | None:
+    """The search tool if a researcher may run; warns when its key is missing."""
+    if "researcher" not in roles:
+        return None
+    search = config.search_tool()
+    if search is None:
+        session.emit(
+            "warning",
+            message=f"{config.search_key_env} is not set; "
+            "the researcher can fetch URLs but not search",
+        )
+    return search
+
+
+def _execute(
+    args: argparse.Namespace,
+    config: Config,
+    provider_for: Callable[[Role], Provider],
+    gate_default: bool,
+    out: TextIO,
+    err: TextIO,
+    body: Callable[[Session], T],
+) -> tuple[T, Path] | int:
+    """Run body in a Session that writes a trace and streams to the console, with
+    Ctrl-C handling. Returns body's result and the trace, or an exit code."""
     sandbox: Sandbox | None = None
     if args.unsafe_no_sandbox:
         sandbox = NoSandbox()
-    elif isinstance(detect(), MacSandbox):
-        sandbox = MacSandbox(extra_read=config.extra_read)
+    elif (sandbox := detect(config.extra_read)) is None:
+        err.write(f"timu: {why_none()}; roles that run commands will not start\n")
     gate = args.approve_untrusted
-    if gate is None:  # a lead can copy injected text into goals (design 7)
-        gate = args.workflow == "lead"
+    if gate is None:
+        gate = gate_default
     run_id = new_run_id()
     trace = trace_dir() / f"{run_id}.jsonl"
     trace.parent.mkdir(parents=True, exist_ok=True)
@@ -216,8 +340,7 @@ def main(
                 jsonl(e)
                 console(e)
 
-            run = Run(
-                args.workdir,
+            session = Session(
                 provider_for,
                 sink,
                 replace(WORKFLOW_BUDGET, cost_usd=args.max_cost),
@@ -226,29 +349,8 @@ def main(
                 approve=tty_approve if gate else None,
                 sandbox=sandbox,
             )
-            fix: dict[str, Any] = {
-                "max_rounds": args.max_rounds,
-                "report_path": args.report,
-                "report_mode": args.report_mode,
-                "skills": config.role_skills,
-            }
-            if args.workflow == "fix-review":
-                result = fix_review(run, args.objective, **fix)
-            else:
-                search = config.search_tool()
-                if search is None:
-                    run.emit(
-                        "warning",
-                        message=f"{config.search_key_env} is not set; "
-                        "the researcher can fetch URLs but not search",
-                    )
-                if args.workflow == "lead":
-                    skills = config.role_skills
-                    result = lead(run, args.objective, search=search, skills=skills)
-                else:
-                    result = research_fix_review(
-                        run, args.objective, search=search, **fix
-                    )
+            session.emit("config", source=config.source)
+            result = body(session)
     except (RoleError, ReportError) as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
@@ -257,8 +359,7 @@ def main(
         return EXIT["cancelled"]
     finally:
         signal.signal(signal.SIGINT, previous)
-    _report(result, trace, err)
-    return EXIT[result.status]
+    return result, trace
 
 
 def tty_approve(artifact: Artifact, role: Role, tty: str = "/dev/tty") -> bool:

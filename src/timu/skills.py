@@ -42,14 +42,13 @@ class Skill:
 
 
 def default_roots(env: Mapping[str, str] = os.environ) -> tuple[Path, ...]:
-    """./.timu/skills, then $XDG_CONFIG_HOME/timu/skills (default ~/.config/...)."""
-    roots = [Path(".timu/skills")]
+    """$XDG_CONFIG_HOME/timu/skills (default ~/.config/...), then ./.timu/skills. The
+    user's skill wins over a workspace skill of the same name; a repo may only add."""
     base = env.get("XDG_CONFIG_HOME") or (
         str(Path(env["HOME"]) / ".config") if env.get("HOME") else ""
     )
-    if base:
-        roots.append(Path(base) / "timu" / "skills")
-    return tuple(roots)
+    user = (Path(base) / "timu" / "skills",) if base else ()
+    return (*user, Path(".timu/skills"))
 
 
 def find(names: Iterable[str], roots: Sequence[Path]) -> tuple[Skill, ...]:

@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- timu no longer reads `./timu.toml`. Config comes only from the user file, `--config` and the environment. The file could still set models, `extra_body` and `[roles]`. On OpenRouter the model id picks the vendor that receives your code, and `extra_body` can change provider routing, so a cloned repo could choose where your code went. The file was also read from the current directory, not from `-C`. The coder could write `timu.toml` in a subdirectory, and a later run started there would load it.
+
+- A user skill now wins over a workspace skill of the same name in `./.timu/skills`. Before, the repo's copy replaced it, so a cloned repo could change the instructions of a skill the user's config named. A repo can still add skills with new names.
+
+### Added
+
+- Each run prints its config sources on one line (`config: <file> + TIMU_MODEL`) and records them in the trace.
+
+- `timu graph run FILE`: a graph of workflows across local projects, found under `[projects] roots`. Each node runs on a `git clone --local` copy, where timu commits its changes on a branch for you to fetch. Agents cannot commit: a node whose `HEAD` moved during its workflow fails. Several nodes may change one project in sequence, each starting from the last one's branch. Declared outputs pass to downstream nodes as schema-checked `params` or as `inputs`. A failed node skips its descendants only. Nodes can have their own budgets, and the graph writes one trace, with each agent tagged by node. This is phases 2 and 3 of `docs/dev/graph.md`.
+
+- Graph workflows `commands` and `check-fix-review`, and `file:GLOB` outputs (graph.md 7.7). They run fixed commands in the sandbox, with network only if the node asks for it. No model runs them, so no agent ever holds a shell and network together. `${node.output}` in a command takes only a file path or a version-like token, shell-quoted: a version string such as `1; rm -rf ~` fails the node. Output from a step with network on is marked untrusted.
+
+- Linux sandbox backend with `bwrap`. It denies network access, hides `$HOME` behind an empty tmpfs, and mounts the filesystem read-only except the role's write roots. It keeps `.git`, `timu.toml` and `.timu` at each write root read-only. timu probes `bwrap` at startup and, where it cannot run, says why. Unlike the macOS profile, it cannot block a path that does not exist yet. So a command may create a new `.git`, `timu.toml` or `.timu`, but may not change existing ones.
+
+### Changed
+
+- Workflows are registered in `WORKFLOWS` (`workflow.py`). The CLI takes its `--workflow` choices, provider checks and approval default from there, not from three hardcoded lists.
+
+- A `Session` holds what the agents of one invocation share: budget, run id, sink, cancel flag and approvals. `Run` binds it to one workdir, and `Run.at(path)` gives another `Run` in the same session. This is phase 1 of `docs/dev/graph.md`.
+
 ## [0.2.0]
 
 ### Security

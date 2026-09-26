@@ -108,6 +108,23 @@ def test_run_without_a_sandbox_flag(tmp_path: Path, repo: Path) -> None:
     assert "warning: shell commands run without a sandbox" in err
 
 
+def test_run_reports_its_config(
+    tmp_path: Path, repo: Path, state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TIMU_MODEL", raising=False)
+    monkeypatch.delenv("TIMU_BASE_URL", raising=False)
+    code, _, err = cli(
+        tmp_path, ["-C", str(repo), "--unsafe-no-sandbox", "fix it"], FIX + REVIEW
+    )
+    assert code == 0, err
+    assert f"config: {tmp_path / 'timu.toml'}\n" in err
+    (trace,) = (state / "timu" / "runs").glob("*.jsonl")
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert {"source": str(tmp_path / "timu.toml")} in [
+        e["data"] for e in events if e["kind"] == "config"
+    ]
+
+
 def test_not_approved_exits_1(tmp_path: Path, repo: Path) -> None:
     replies = [*FIX, text("VERDICT: CHANGES\n- no test for negatives")]
     code, _, err = cli(

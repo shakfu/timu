@@ -27,13 +27,13 @@ Status: proposal. It answers design 15.4 ("Should roles live in Python, or in fi
 | timu | timu's maintainers | yes | yes | yes |
 | Installed plugin package | whoever the user chose to install | yes | yes | yes |
 | `~/.config/timu/` | the user | yes | as a delegating role (4.2) | no |
-| Workspace: `./timu.toml`, `./.timu/` | the repo's author, and the coder in any earlier run | only after `timu allow` (7) | as a delegating role (4.2) | no |
+| Workspace: `./.timu/` | the repo's author, and the coder in any earlier run | no | no | no |
 
 Plugin code runs in the timu process, outside the sandbox. Only `shell` commands run sandboxed. A plugin tool's `needs` is therefore a claim, not a limit. Installing a plugin trusts it as fully as installing timu.
 
 ### 3.1 Workspace `timu.toml`
 
-Fixed; see CHANGELOG, Unreleased. `./timu.toml` may set only models, timeouts, `extra_body` and `[roles]`, overlaid on the user file. Agents cannot write `timu.toml` or `.timu/` at the workspace root. Section 7 remains for workspace role files.
+Removed; see CHANGELOG, Unreleased. timu reads no workspace `timu.toml`: models, roles and request settings belong to the user or the workflow instance, not the repo. Agents still cannot write `timu.toml` or `.timu/` at the workspace root.
 
 ## 4. Roles
 
@@ -62,7 +62,7 @@ The frontmatter maps to `Role` fields. The body is the prompt. The parser suppor
 - `delegates` names other roles. `validate` already requires `delegate` and `delegates` together.
 - `model` stays in `timu.toml` `[roles.<name>]`. The model is a deployment choice, the same for a role wherever it is defined.
 
-Discovery: `~/.config/timu/roles/*.md`, then plugins, then `./.timu/roles/*.md` if allowed. A file's name must equal its `name`, as for skills.
+Discovery: `~/.config/timu/roles/*.md`, then plugins. A workspace cannot define roles (7). A file's name must equal its `name`, as for skills.
 
 Alternative: roles in `timu.toml`, as `[roles.x] prompt_file = "..."`. That takes two files per role and splits one definition across them. Rejected.
 
@@ -101,14 +101,12 @@ class Workflow:
 
 @dataclass(frozen=True)
 class Options:
-    config: Config
+    skills: Mapping[str, tuple[str, ...]]
     search: Tool | None
-    params: Mapping[str, str]   # from -p key=value
+    params: Mapping[str, Any]   # keyword arguments for the workflow
 ```
 
-`WORKFLOWS: dict[str, Workflow]` in `workflow.py` holds the built-ins. `cli.py` builds `--workflow` choices, the provider check and the gate default from it. That removes all three hardcoded places. `--max-rounds`, `--report` and `--report-mode` become params of `fix-review`. They can keep their flags as aliases.
-
-This step changes no behaviour, and the existing tests should pass unchanged. Do it first.
+Done; see CHANGELOG, Unreleased. `WORKFLOWS: dict[str, Workflow]` in `workflow.py` holds the built-ins. `cli.py` builds `--workflow` choices, the provider check and the gate default from it. `--max-rounds`, `--report` and `--report-mode` fill `params`. `Options` carries the role skills, not the whole `Config`: no workflow reads anything else from it. `-p key=value` is not built; graph nodes will set `params` from the graph file (`graph.md` 4.1).
 
 ### 5.2 Adding a workflow
 
@@ -126,22 +124,22 @@ Entry point group `timu.tools`. The value is a `Tool`. Role files may name plugi
 
 Alternative: expose MCP servers as tools (https://modelcontextprotocol.io/). Each server is a separate process, which a sandbox could confine. It needs an MCP client: either a runtime dependency, or a stdlib JSON-RPC client over stdio. Deferred.
 
-## 7. Allowing workspace files
+## 7. Workspace files
 
-The model is direnv (https://direnv.net/). `timu allow` records the SHA-256 of `./timu.toml` and every file under `./.timu/roles/` in `~/.local/state/timu/allowed`. On each run, timu reads a workspace file only if its hash matches. Otherwise it warns and ignores the file. Any edit, including one by the coder, needs a new `allow`.
+A repo cannot choose models, roles or workflows. Those belong to the user, or to the workflow instance that runs on the repo (`graph.md` 3). timu reads no role or config files from the workspace, so there is no `timu allow` step.
 
-`./.timu/skills` stays outside this check. A workspace skill has no more power than other repo files: its text has the same trust as a README the agent reads, and its scripts run in the same sandbox as the repo's tests. The remaining risk is that a workspace skill replaces a user skill of the same name. timu warns when that happens.
+Rejected: role files in `./.timu/roles/`, read after `timu allow` records their SHA-256 (the direnv model, https://direnv.net/). An approved file still lets the repo's author define an agent's prompt, tools and delegates. Each edit would also need a new approval.
+
+`./.timu/skills` is still read. A workspace skill has no more power than other repo files: its text has the same trust as a README the agent reads, and its scripts run in the same sandbox as the repo's tests. A repo may add skills, but a user skill of the same name wins, and timu warns that the repo's copy was ignored.
 
 ## 8. Order of work
 
 1. Add the `Workflow` registry and `Options` (5.1). No behaviour change.
 2. Add role files from `~/.config/timu/roles`, name resolution (4.2), and `--role` (4.3).
 3. Add entry points for workflows, tools and roles.
-4. Add `timu allow` and workspace role files (7).
 
 ## 9. Open questions
 
 1. Should a role file set its own budget, or should workflows own budgets?
 2. Should `-p key=value` params be typed, with a schema per workflow, or left as strings for each workflow to parse?
-3. With name resolution, should a workspace role be allowed to override a built-in at all, even after `allow`?
-4. Should `timu roles` and `timu workflows` list everything found, with its source? This is cheap, and it makes section 3 visible.
+3. Should `timu roles` and `timu workflows` list everything found, with its source? This is cheap, and it makes section 3 visible.

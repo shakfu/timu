@@ -10,6 +10,7 @@ import pytest
 
 from timu import Agent, Capability, Context, Role, RoleError, Task
 from timu.provider.fake import FakeProvider, call, calls, text
+from timu.role import make_context
 from timu.skills import SkillError, default_roots, find, parse, prompt_section
 from timu.tools.fs import READ, WRITE
 from timu.tools.skill import LOAD_SKILL, READ_SKILL_FILE
@@ -181,11 +182,30 @@ def test_find_errors(tmp_path: Path) -> None:
 
 def test_default_roots() -> None:
     assert default_roots({"HOME": "/h"}) == (
-        Path(".timu/skills"),
         Path("/h/.config/timu/skills"),
+        Path(".timu/skills"),
     )
-    assert default_roots({"XDG_CONFIG_HOME": "/x"})[1] == Path("/x/timu/skills")
+    assert default_roots({"XDG_CONFIG_HOME": "/x"})[0] == Path("/x/timu/skills")
     assert default_roots({}) == (Path(".timu/skills"),)
+
+
+def test_workspace_skill_cannot_replace_a_user_skill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repo may add skills, but not change the instructions of one the user named."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    ws, user = tmp_path / "ws", tmp_path / "xdg" / "timu" / "skills"
+    skill(
+        ws / ".timu" / "skills", "alpha", "---\nname: alpha\ndescription: repo\n---\n"
+    )
+    skill(user, "alpha", "---\nname: alpha\ndescription: user\n---\n")
+    skill(ws / ".timu" / "skills", "beta")
+    role = Role("r", "p", (LOAD_SKILL,), skills=("alpha", "beta"))
+    ctx = make_context(role, ws, threading.Event())
+    assert [(s.name, s.description) for s in ctx.skills] == [
+        ("alpha", "user"),
+        ("beta", "Does beta."),
+    ]
 
 
 # ---- tools ----

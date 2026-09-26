@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from timu.report import ReportError, file_root
-from timu.sandbox import Sandbox, detect
+from timu.sandbox import Sandbox, detect, why_none
 from timu.skills import SkillError, default_roots, find
 from timu.tool import Context, Tool
 from timu.types import Budget, Capability
@@ -88,7 +88,7 @@ def make_context(
         sandbox = None
     elif sandbox is None and (sandbox := detect()) is None:
         raise RoleError(
-            f"{role.name}: exec needs a sandbox, and this platform has none; "
+            f"{role.name}: exec needs a sandbox, and {why_none()}; "
             "pass NoSandbox() to run commands unconfined"
         )
     work = Path(os.path.realpath(workdir))

@@ -12,17 +12,17 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from timu.events import Event
+from timu.events import Event, as_dict
 from timu.provider.base import Reply, ToolCall
 from timu.provider.fake import FakeProvider
 from timu.tool import Context, Tool, ToolOutput
 from timu.types import Capability, Usage
 
-IGNORED = frozenset({"model_delta", "warning"})  # streaming chunks; environment notices
+IGNORED = frozenset({"model_delta", "warning", "config"})  # chunks; environment notices
 
 
 class TraceError(ValueError):
@@ -55,6 +55,9 @@ def load(path: str | Path) -> list[Event]:
         ts = d.get("ts")
         if not isinstance(ts, int | float) or isinstance(ts, bool):
             raise TraceError(f"{path}:{n}: not an event")
+        node = d.get("node", "")
+        if not isinstance(node, str):
+            raise TraceError(f"{path}:{n}: not an event")
         events.append(
             Event(
                 d["kind"],
@@ -63,6 +66,7 @@ def load(path: str | Path) -> list[Event]:
                 d["role"],
                 float(ts),
                 d["data"],
+                node,
             )
         )
     return events
@@ -100,7 +104,7 @@ def substitute(
 
 def save(events: Sequence[Event], path: str | Path) -> None:
     Path(path).write_text(
-        "".join(json.dumps(asdict(e)) + "\n" for e in events), encoding="utf-8"
+        "".join(json.dumps(as_dict(e)) + "\n" for e in events), encoding="utf-8"
     )
 
 
@@ -117,6 +121,7 @@ class Node:
     usage: Usage = field(default_factory=Usage)
     untrusted: bool = False
     children: list[Node] = field(default_factory=list)
+    graph_node: str = ""
 
 
 def tree(events: Sequence[Event]) -> list[Node]:
@@ -126,6 +131,7 @@ def tree(events: Sequence[Event]) -> list[Node]:
     for e in events:
         if e.kind == "start":
             node = Node(e.agent_id, e.role, str(e.data.get("goal", "")))
+            node.graph_node = e.node
             nodes[e.agent_id] = node
             parent = nodes.get(e.parent_id)
             (parent.children if parent else roots).append(node)
@@ -139,7 +145,8 @@ def tree(events: Sequence[Event]) -> list[Node]:
 
 
 def render(events: Sequence[Event]) -> str:
-    """The agent tree, one agent per line, under a line for the run."""
+    """The agent tree, one agent per line, under a line for the run. In a graph run,
+    each top-level agent is prefixed with its node."""
     roots = tree(events)
     total = Usage()
     stack = list(roots)
@@ -154,8 +161,10 @@ def render(events: Sequence[Event]) -> str:
 
     def walk(node: Node, depth: int) -> None:
         mark = " untrusted" if node.untrusted else ""
+        where = f"[{node.graph_node}] " if depth == 1 and node.graph_node else ""
         lines.append(
-            f"{'  ' * depth}{node.agent_id} {node.role} {node.status}: {_cost(node.usage)}{mark}"
+            f"{'  ' * depth}{where}{node.agent_id} {node.role} {node.status}: "
+            f"{_cost(node.usage)}{mark}"
         )
         for child in node.children:
             walk(child, depth + 1)

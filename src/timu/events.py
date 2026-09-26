@@ -22,6 +22,16 @@ class Event:
     role: str
     ts: float
     data: Mapping[str, Any] = field(default_factory=dict)
+    node: str = ""  # the graph node whose Run emitted it; "" outside a graph
+
+
+def as_dict(event: Event) -> dict[str, Any]:
+    """event as a trace line; node only in a graph run, so other traces keep their
+    format."""
+    d = asdict(event)
+    if not d["node"]:
+        del d["node"]
+    return d
 
 
 class JsonlSink:
@@ -31,7 +41,7 @@ class JsonlSink:
         self._file: IO[str] = open(path, "a", encoding="utf-8")  # noqa: SIM115 - closed by close()
 
     def __call__(self, event: Event) -> None:
-        self._file.write(json.dumps(asdict(event), separators=(",", ":")) + "\n")
+        self._file.write(json.dumps(as_dict(event), separators=(",", ":")) + "\n")
         self._file.flush()
 
     def close(self) -> None:

@@ -94,7 +94,7 @@ The prompt does not enforce a denied capability. Leaving a tool out does not enf
 | `exec` | Subprocess in a sandbox. It writes only the write roots and a private temp dir, never `.git`. Under `$HOME` it reads only the read roots and configured toolchain paths; elsewhere reads are allowed. No network. The environment is scrubbed, and `HOME` is the temp dir. |
 | `net` | Only the `web_fetch` / `web_search` tools, or an exec sandbox with network on. |
 
-Sandbox backends: `sandbox-exec` with a generated profile on macOS; `bwrap` on Linux (not yet built). If no backend is available, a role with `exec` fails at startup unless the caller passes `NoSandbox()` explicitly. It must not run with network access by mistake.
+Sandbox backends: `sandbox-exec` with a generated profile on macOS; `bwrap` on Linux. The `sandbox.py` module docstring lists where the two differ. If no backend is available, a role with `exec` fails at startup unless the caller passes `NoSandbox()` explicitly. It must not run with network access by mistake.
 
 Limits of the macOS backend:
 
