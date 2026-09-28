@@ -91,7 +91,7 @@ The prompt does not enforce a denied capability. Leaving a tool out does not enf
 |-|-|
 | `fs.read` | Path check against allowed roots, after resolving symlinks. |
 | `fs.write` | Same, plus atomic writes. Never inside `.git`, where hooks and config can run commands. |
-| `exec` | Subprocess in a sandbox. It writes only the write roots and a private temp dir, never `.git`. Under `$HOME` it reads only the read roots and configured toolchain paths; elsewhere reads are allowed. No network. The environment is scrubbed, and `HOME` is the temp dir. |
+| `exec` | Subprocess in a sandbox. It writes only the write roots and a private temp dir, never `.git`. Under `$HOME` it reads only the read roots and configured toolchain paths; elsewhere reads are allowed, except the host socket directories that `sandbox.py` lists. No network. The environment is scrubbed, and `HOME` is the temp dir. |
 | `net` | Only the `web_fetch` / `web_search` tools, or an exec sandbox with network on. |
 
 Sandbox backends: `sandbox-exec` with a generated profile on macOS; `bwrap` on Linux. The `sandbox.py` module docstring lists where the two differ. If no backend is available, a role with `exec` fails at startup unless the caller passes `NoSandbox()` explicitly. It must not run with network access by mistake.
@@ -266,6 +266,8 @@ Rules:
 - Untrusted Artifacts reach other agents as quoted data in a fixed wrapper, never as the Task goal.
 
 - A workflow may require a human to approve an untrusted Artifact before a role with `exec` or `fs.write` receives it.
+
+- The same gate asks before a task an agent wrote reaches a role with `net`: its goal and every input. An agent with `fs.read` and untrusted input could otherwise send workspace data out through the researcher, which is the trifecta above spread over two roles.
 
 How the rules are enforced:
 

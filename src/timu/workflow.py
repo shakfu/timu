@@ -57,7 +57,8 @@ class Session:
         max_depth: int = 2,
     ) -> None:
         """approve, if given, is asked before web content first reaches a role that can
-        run commands or write files (design 6)."""
+        run commands or write files, and before a task an agent wrote reaches a role
+        with net (design 6)."""
         self.provider_for = provider_for
         self.sink = sink
         self.budget = budget
@@ -177,7 +178,7 @@ class Run:
         inherited = (
             parent_id in self._tainted
         )  # the task was written after reading web content
-        if refused := self._gate(role, task, inherited):
+        if refused := self._gate(role, task, inherited, parent_id):
             return Result("refused", refused, (), Usage(), agent_id, True)
         budget, scope = self._limit(task.budget or role.budget)
         if budget is None:
@@ -256,21 +257,26 @@ class Run:
 
         return delegate
 
-    def _gate(self, role: Role, task: Task, inherited: bool) -> str | None:
-        """Why role may not receive task, or None. Asks about first-hand web content,
-        and about a goal written by an agent that has read web content."""
+    def _gate(
+        self, role: Role, task: Task, inherited: bool, parent_id: str
+    ) -> str | None:
+        """Why role may not receive task, or None. For a role that can run commands or
+        write files, asks about first-hand web content and a goal written by an agent
+        that has read web content. For a role with net, asks about a task an agent
+        wrote: its goal and inputs can carry workspace data out (design 6)."""
         approve, approved = self.session.approve, self.session.approved
-        if approve is None or not role.grants & {
-            Capability.EXEC,
-            Capability.FS_WRITE,
-        }:
+        outbound = Capability.NET in role.grants and bool(parent_id)
+        risky = role.grants & {Capability.EXEC, Capability.FS_WRITE}
+        if approve is None or not (outbound or risky):
             return None
         pending = [
-            a for a in task.inputs if a.origin is Origin.NET and a not in approved
+            a
+            for a in task.inputs
+            if (outbound or a.origin is Origin.NET) and a not in approved
         ]
-        if inherited:
+        if inherited or outbound:
             pending.append(
-                Artifact("goal", task.goal, "goal", Origin.AGENT, untrusted=True)
+                Artifact("goal", task.goal, "goal", Origin.AGENT, parent_id, True)
             )
         for a in pending:
             ok = approve(a, role)
@@ -569,8 +575,9 @@ def check_fix_review(
     **fix: Any,
 ) -> Result:
     """Run check; while it fails, fix_review with the log as an input and run check
-    again, up to max_rounds times (graph.md 7.7). The coder has no network; check
-    rebuilds whatever needs it."""
+    again, up to max_rounds times (graph.md 7.7). network applies to the first run
+    only: later runs execute code the coder wrote, so they run offline and reuse what
+    the first run fetched."""
     status, summary, log = run_steps(run, check, network, timeout)
     review: Artifact | None = None
     goal = f"{objective}\n\nThe checks failed. Their output is the log input; make them pass."
@@ -590,7 +597,7 @@ def check_fix_review(
         if fixed.status != "done":
             status, summary = fixed.status, f"fix round {n}: {fixed.summary}"
             break
-        status, summary, log = run_steps(run, check, network, timeout)
+        status, summary, log = run_steps(run, check, False, timeout)
     else:
         if status == "failed":
             summary = f"checks still fail after {max_rounds} fix rounds: {summary}"

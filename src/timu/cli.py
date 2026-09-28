@@ -125,8 +125,9 @@ def parser() -> argparse.ArgumentParser:
         "--approve-untrusted",
         action=argparse.BooleanOptionalAction,
         help="ask on the terminal before web content, or a goal written after reading "
-        "it, reaches the coder. Default: on for lead, off otherwise. With no terminal, "
-        "the answer is no",
+        "it, reaches the coder, and before a task the lead writes reaches the "
+        "researcher. Default: on for lead, off otherwise. With no terminal, the answer "
+        "is no",
     )
     common.add_argument(
         "--config",

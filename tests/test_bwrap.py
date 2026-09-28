@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from timu.sandbox import (
+    MASKED,
     BwrapSandbox,
     Policy,
     _bwrap_problem,
@@ -48,7 +49,10 @@ def test_args_order_and_namespaces(tmp_path: Path) -> None:
     assert args[:3] == ["--ro-bind", "/", "/"]
     assert "--unshare-net" in args and "--new-session" in args
     s = " ".join(args)
+    masks = [f"--tmpfs {p}" for p in MASKED if p.exists()]
+    assert masks and all(m in s for m in masks)
     order = [
+        *masks,
         f"--tmpfs {home}",
         f"--ro-bind {ws} {ws}",
         f"--ro-bind {toolchain} {toolchain}",
@@ -66,6 +70,23 @@ def test_network_policy(tmp_path: Path) -> None:
     assert "--unshare-net" not in bwrap_args(policy, None)
     assert "(deny network*)" not in mac_profile(policy, None)
     assert "(deny network*)" in mac_profile(Policy((), (tmp_path,)), None)
+
+
+def test_resolv_conf_under_a_mask_is_kept_for_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    stub = run_dir / "systemd" / "resolve" / "stub-resolv.conf"
+    stub.parent.mkdir(parents=True)
+    stub.write_text("nameserver 127.0.0.53\n")
+    link = tmp_path / "resolv.conf"
+    link.symlink_to(stub)
+    monkeypatch.setattr("timu.sandbox.MASKED", (run_dir,))
+    monkeypatch.setattr("timu.sandbox.RESOLV", link)
+    bind = f"--ro-bind {stub} {stub}"
+    online = " ".join(bwrap_args(Policy((), (), network=True), None))
+    assert online.index(f"--tmpfs {run_dir}") < online.index(bind)
+    assert bind not in " ".join(bwrap_args(Policy((), ()), None))
 
 
 def test_wrap(tmp_path: Path) -> None:
@@ -110,7 +131,7 @@ def test_writes(ws: Path, tmp_path: Path) -> None:
     (ws / "timu.toml").write_text("")
     assert run(box, policy, "echo x > f.txt", ws) == 0
     assert (ws / "f.txt").read_text() == "x\n"
-    assert run(box, policy, f"echo x > {tmp_path / 'outside.txt'}", ws) != 0
+    run(box, policy, f"echo x > {tmp_path / 'outside.txt'}", ws)  # /tmp is a tmpfs
     assert run(box, policy, "echo x >> .git/config", ws) != 0
     assert run(box, policy, "echo x > timu.toml", ws) != 0
     assert not (tmp_path / "outside.txt").exists()
@@ -134,3 +155,18 @@ def test_network(ws: Path, tmp_path: Path) -> None:
     cmd = f"/bin/bash -c '{probe}'"
     assert run(box, Policy((ws,), (ws,)), cmd, ws) != 0
     assert run(box, Policy((ws,), (ws,), network=True), cmd, ws) == 0
+
+
+@bwrap_only
+def test_host_unix_sockets_are_hidden(ws: Path, tmp_path: Path) -> None:
+    """A new network namespace does not isolate path-bound Unix sockets, such as the
+    session bus or docker.sock; the MASKED tmpfs mounts hide them."""
+    path = tmp_path / "host.sock"
+    with socket.socket(socket.AF_UNIX) as srv:
+        srv.bind(str(path))
+        srv.listen(1)
+        box = BwrapSandbox(home=tmp_path / "home")
+        connect = f"import socket; socket.socket(socket.AF_UNIX).connect({str(path)!r})"
+        cmd = f'python3 -c "{connect}"'
+        assert run(box, Policy((ws,), (ws,)), cmd, ws) != 0
+        assert run(box, Policy((ws, tmp_path), (ws,)), cmd, ws) == 0  # a read root

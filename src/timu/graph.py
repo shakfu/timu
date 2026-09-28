@@ -35,7 +35,7 @@ GITHUB = re.compile(
 )
 NODE_KEYS = frozenset(
     {"repo", "workflow", "objective", "needs", "ref", "params", "inputs", "outputs"}
-    | {"budget"}
+    | {"budget", "trust_upstream"}
 )
 SEVERITY = ("done", "skipped", "refused", "failed", "budget", "cancelled")
 MAX_OUTPUT = 256 * 1024  # bytes, for one extracted output
@@ -78,6 +78,7 @@ class Node:
     inputs: tuple[tuple[str, str], ...] = ()  # (node, output)
     outputs: Mapping[str, str] = field(default_factory=dict)  # name -> extractor
     budget: Budget | None = None
+    trust_upstream: bool = False  # network on despite model nodes upstream
 
 
 @dataclass(frozen=True)
@@ -139,7 +140,36 @@ def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
         TopologicalSorter({n.id: n.needs for n in nodes.values()}).prepare()
     except CycleError as e:
         raise GraphError(f"{src}: cycle: {' -> '.join(e.args[1])}") from None
-    return Graph(nodes)
+    graph = Graph(nodes)
+    for nid, models in model_ancestors(graph).items():
+        node = nodes[nid]
+        if models and node.params.get("network") is True and not node.trust_upstream:
+            raise GraphError(
+                f"{src}: nodes.{nid}: network is on, and {', '.join(models)} ran a "
+                "model upstream, so its commands could run code a coder wrote with "
+                "network access; set trust_upstream = true to allow it"
+            )
+    return graph
+
+
+def _ancestors(graph: Graph) -> dict[str, set[str]]:
+    deps = {n.id: n.needs for n in graph.nodes.values()}
+    ancestors: dict[str, set[str]] = {}
+    for nid in TopologicalSorter(deps).static_order():
+        ancestors[nid] = set().union(*({d} | ancestors[d] for d in deps[nid]))
+    return ancestors
+
+
+def model_ancestors(graph: Graph) -> dict[str, list[str]]:
+    """Each node's ancestors that run a model. A coder's changes reach a descendant
+    through a chained branch or a file output, on any project."""
+    ancestors = _ancestors(graph)
+    return {
+        nid: sorted(
+            a for a in ancestors[nid] if WORKFLOWS[graph.nodes[a].workflow].roles
+        )
+        for nid in graph.nodes
+    }
 
 
 def _node(
@@ -227,6 +257,11 @@ def _node(
         except ValueError as e:
             raise GraphError(f"{where}: params.{k} {e}") from None
 
+    trust = t.get("trust_upstream", False)
+    if not isinstance(trust, bool):
+        raise GraphError(f"{where}: trust_upstream must be true or false")
+    if trust and params.get("network") is not True:
+        raise GraphError(f"{where}: trust_upstream needs network = true")
     budget = _budget(t, where) or default_budget
     return Node(
         nid,
@@ -239,6 +274,7 @@ def _node(
         tuple(inputs),
         outputs,
         budget,
+        trust,
     )
 
 
@@ -305,10 +341,7 @@ def chains(graph: Graph, projects: Mapping[str, Path]) -> dict[str, str | None]:
     or None. Nodes on one project that neither needs get separate branches. Raises
     GraphError if a node has two such ancestors that do not need each other, or sets
     ref while starting from an ancestor."""
-    ancestors: dict[str, set[str]] = {}
-    deps = {n.id: n.needs for n in graph.nodes.values()}
-    for nid in TopologicalSorter(deps).static_order():
-        ancestors[nid] = set().union(*({d} | ancestors[d] for d in deps[nid]))
+    ancestors = _ancestors(graph)
     parents: dict[str, str | None] = {}
     for nid, node in graph.nodes.items():
         same = {a for a in ancestors[nid] if projects[a] == projects[nid]}
@@ -586,6 +619,9 @@ def _run_node(
     reads = tuple(sorted({files / d for d in node.needs if (files / d).is_dir()}))
     run = session.at(ws, node=node.id, budget=node.budget, reads=reads)
     run.emit("node", repo=node.repo, project=str(project), workflow=node.workflow)
+    if node.trust_upstream:
+        message = f"node {node.id} runs commands with network on code models changed"
+        run.emit("warning", message=message)
     if dirty and not parent:
         message = f"{src} has uncommitted changes; node {node.id} starts from {ref}"
         run.emit("warning", message=message)

@@ -227,7 +227,7 @@ Consequences:
 Replaces the `builder` role, the `installer` role and `bump-dep` above. Built in phase 4.
 
 - **`commands` workflow.** Runs a list of commands from the graph file in the node's copy, in the sandbox, with no model. `network = true` turns network on. Each command has its own timeout. A command that exits non-zero fails the node, and its output tail becomes the node's `log` result.
-- **`check-fix-review` workflow.** Runs `check` commands. If they pass, the node is done. If not, it runs `fix_review` with the failure log as an input, then runs the checks again, up to `max_rounds`. The coder still has no network. The check commands, run outside any model, rebuild whatever needs it.
+- **`check-fix-review` workflow.** Runs `check` commands. If they pass, the node is done. If not, it runs `fix_review` with the failure log as an input, then runs the checks again, up to `max_rounds`. The coder still has no network. Only the first check run has network, if the node asks for it. Later runs execute code the coder wrote, so they run offline and reuse what the first run fetched into the copy.
 - **File outputs.** `file:GLOB` must match exactly one file in the copy. The engine copies it to `work/<run id>/files/<node>/` and the output's value is that path. A dependent's sandbox gets read access to that directory.
 - **Substitution into commands.** `${node.output}` may appear anywhere in a command, for a declared output of a node in `needs`. At run time the value must be a file output's path or a version-like token (`[A-Za-z0-9][A-Za-z0-9._+!~-]*`), or the node fails. The value is shell-quoted. `${NAME}` without a dot is shell syntax and is left alone.
 
@@ -244,6 +244,7 @@ repo = "cyllama"
 needs = ["lib"]
 workflow = "commands"
 params = { steps = ["make wheel"], network = true, timeout = 3600 }
+trust_upstream = true
 outputs = { wheel = "file:dist/*.whl" }
 
 [nodes.app]
@@ -252,12 +253,13 @@ needs = ["wheel"]
 workflow = "check-fix-review"
 objective = "Make the app build and pass its tests against the new cyllama wheel"
 params = { check = ["CYLLAMA_SOURCE=${wheel.wheel} bash scripts/build-python-env.sh", "make test"], network = true, timeout = 3600 }
+trust_upstream = true
 inputs = ["lib.review"]
 ```
 
 `wheel` starts from `lib`'s branch (7.3), so it builds the changed library.
 
-Risk that remains: a command step runs code a coder wrote, such as a changed build script, with network on. The sandbox limits writes and hides `$HOME` and the environment, but the workspace's own contents could still be sent out. On Linux this needs `bwrap` (TODO.md) or `--unsafe-no-sandbox`.
+Risk that remains: `wheel` and `app` run code `lib`'s coder wrote, such as a changed build script, with network on. The sandbox limits writes and hides `$HOME` and the environment, but the workspace's own contents could still be sent out. A node with `network = true` below a node that runs a model therefore fails to load unless it sets `trust_upstream = true`, as both do here.
 
 ## 8. Phases
 

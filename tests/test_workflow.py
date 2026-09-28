@@ -358,6 +358,20 @@ def test_check_fix_review_fixes_then_checks_again(tmp_path: Path) -> None:
     assert "The checks failed" in coder_task and "[exit 1]" in coder_task
 
 
+def test_check_fix_review_checks_the_coders_code_offline(tmp_path: Path) -> None:
+    box = Recorder()
+    replies = [
+        calls(call("write", path="fixed.txt", content="ok")),
+        text("fixed"),
+        text("VERDICT: APPROVE"),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    run.session.sandbox = box
+    r = check_fix_review(run, "o", check=["test -f fixed.txt"], network=True)
+    assert r.status == "done"
+    assert [p.network for p in box.policies] == [True, False]
+
+
 def test_check_fix_review_gives_up_after_max_rounds(tmp_path: Path) -> None:
     replies = [text("tried"), text("VERDICT: APPROVE")]
     run, _, _ = make_run(tmp_path, replies)

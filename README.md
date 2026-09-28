@@ -108,7 +108,7 @@ Useful flags:
 
 - `--max-cost USD` stops the run at a spending limit. All agents share one budget.
 
-- `--approve-untrusted` asks on the terminal before web content reaches the coder. It is on by default for `lead`. Without a terminal the answer is no; pass `--no-approve-untrusted` for unattended runs.
+- `--approve-untrusted` asks on the terminal before web content reaches the coder, and before a task the lead writes reaches the researcher. It is on by default for `lead`. Without a terminal the answer is no; pass `--no-approve-untrusted` for unattended runs.
 
 - `-v` shows every tool result.
 
@@ -152,7 +152,7 @@ timu graph run graph.toml
 - Outputs: `toml:FILE#KEY`, `file:GLOB`, `changelog:latest` (the first released section of `CHANGELOG.md`) and `git:diff`. A node also exposes its workflow's results, such as `a.review` or `a.log`.
 - `file:GLOB` must match one file. timu copies it out of the copy, and the output is the copy's path. Nodes that need it may read it.
 - `${node.output}` may appear only in `params`, and each param is checked against the workflow's schema. Free text reaches a node only through `inputs`.
-- Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review with the failure log as an input and checks again, up to `max_rounds`. Both take `network = true` and `timeout` in seconds per command. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
+- Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review with the failure log as an input and checks again, up to `max_rounds`. Both take `network = true` and `timeout` in seconds per command. `check-fix-review` uses network for its first `check` run only; re-checks run coder-written code, so they run offline. A node with `network = true` below a node that runs a model fails to load unless it sets `trust_upstream = true`. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
 
   ```toml
   [nodes.wheel]

@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - timu no longer reads `./timu.toml`. Config comes only from the user file, `--config` and the environment. The file could still set models, `extra_body` and `[roles]`. On OpenRouter the model id picks the vendor that receives your code, and `extra_body` can change provider routing, so a cloned repo could choose where your code went. The file was also read from the current directory, not from `-C`. The coder could write `timu.toml` in a subdirectory, and a later run started there would load it.
 
+- The Linux sandbox hides `/run`, `/tmp` and `/var/tmp` behind empty tmpfs mounts. A new network namespace does not isolate Unix sockets bound to a path, and a read-only mount does not stop `connect()`. So a command could reach the session D-Bus, ssh-agent, gpg-agent or `docker.sock`, and through them run code outside the sandbox. With network on, the sandbox keeps `/etc/resolv.conf` when it points into `/run`.
+
+- With `--approve-untrusted`, a task that an agent writes for a role with `net` now needs approval: its goal and every input. The lead reads the workspace, gitignored files included, and the researcher can put text into a URL. So a lead steered by injected text could send workspace secrets out. The `lead` workflow now prompts before each researcher task.
+
+- A graph node with `network = true` fails to load if a node upstream of it runs a model, unless it sets `trust_upstream = true`. A coder's changes reach later nodes through a chained branch or a file output, so their commands could run coder-written code with network access. `check-fix-review` now turns network on for its first `check` run only; re-checks after the coder run offline.
+
 - A user skill now wins over a workspace skill of the same name in `./.timu/skills`. Before, the repo's copy replaced it, so a cloned repo could change the instructions of a skill the user's config named. A repo can still add skills with new names.
 
 ### Added

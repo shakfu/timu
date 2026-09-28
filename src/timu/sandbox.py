@@ -9,8 +9,10 @@ readable.
 - macOS (sandbox-exec): metadata (stat, readlink) stays allowed under home, so
   symlinked toolchains and cd work. It denies writes to any path named `.git` and to
   deny_write paths, even ones that do not exist yet.
-- Linux (bwrap): home is an empty tmpfs with the readable paths bound into it. It
-  protects `.git` at each write root and deny_write paths that exist when the command
+- Linux (bwrap): home and MASKED are empty tmpfs mounts with the readable paths
+  bound into them; writes elsewhere in them are discarded. MASKED holds the host's
+  Unix sockets (session bus, ssh-agent, docker), which a new network namespace does
+  not isolate. It protects `.git` at each write root and deny_write paths that exist when the command
   starts; bwrap mounts only existing paths, so a command can create a new one.
 """
 
@@ -27,6 +29,8 @@ from pathlib import Path
 from typing import Protocol
 
 MAC_SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+MASKED = (Path("/run"), Path("/tmp"), Path("/var/tmp"))  # bwrap: emptied, like home
+RESOLV = Path("/etc/resolv.conf")
 
 
 @dataclass(frozen=True)
@@ -174,13 +178,20 @@ def bwrap_args(
     policy: Policy, home: Path | None, extra_read: tuple[Path, ...] = ()
 ) -> list[str]:
     """bwrap options for policy. Later mounts cover earlier ones, so the order is:
-    everything read-only, home emptied, readable paths, writable paths, then the
-    read-only exceptions inside them."""
+    everything read-only, MASKED and home emptied, readable paths, writable paths,
+    then the read-only exceptions inside them."""
     args = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
     args += ["--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts"]
     args += ["--unshare-cgroup-try", "--new-session", "--die-with-parent"]
     if not policy.network:
         args.append("--unshare-net")
+    for p in MASKED:
+        if p.exists():
+            args += ["--tmpfs", str(p)]
+    resolv = Path(os.path.realpath(RESOLV))
+    masked = any(resolv.is_relative_to(p) for p in MASKED)
+    if masked and policy.network and resolv.exists():
+        args += ["--ro-bind", str(resolv), str(resolv)]  # systemd-resolved's stub
     if home is not None and home != Path("/"):
         args += ["--tmpfs", str(home)]
     for p in (*policy.read_roots, *extra_read):

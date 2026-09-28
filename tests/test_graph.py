@@ -702,6 +702,51 @@ def test_a_file_output_cannot_leave_the_workspace(tmp_path: Path) -> None:
     assert not (tmp_path / "work" / "files" / "lib").exists()
 
 
+# A model node, a model-free build of its output, and a node with network on.
+NETWORK = BASE + (
+    '[nodes.w]\nrepo = "w"\nneeds = ["a"]\nworkflow = "commands"\nobjective = "o"\n'
+    'params = { steps = ["true"] }\n'
+    '[nodes.n]\nrepo = "n"\nneeds = ["w"]\nworkflow = "commands"\nobjective = "o"\n'
+    'params = { steps = ["true"], network = true }\n'
+)
+
+
+def test_network_downstream_of_a_model_is_refused() -> None:
+    """a's coder could have written what n runs, through w's output (graph.md 7.7)."""
+    with pytest.raises(GraphError, match="nodes.n: network is on, and a ran a model"):
+        graph(NETWORK)
+    assert graph(NETWORK + "trust_upstream = true\n").nodes["n"].trust_upstream
+    no_model = NETWORK.replace(
+        'workflow = "fix-review"',
+        'workflow = "commands"\nparams = { steps = ["true"] }',
+        1,
+    )
+    assert not graph(no_model).nodes["n"].trust_upstream
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ("trust_upstream = 1\n", "trust_upstream must be true or false"),
+        ("trust_upstream = true\n", "trust_upstream needs network = true"),
+    ],
+)
+def test_trust_upstream_errors(extra: str, message: str) -> None:
+    with pytest.raises(GraphError, match=message):
+        graph(BASE + extra)
+
+
+def test_trust_upstream_warns(tmp_path: Path) -> None:
+    for name in ("a", "w", "n"):
+        project(tmp_path / "projects", name)
+    g = graph(NETWORK + "trust_upstream = true\n")
+    replies = [text("done"), text("VERDICT: APPROVE")]
+    result, _, events, _ = engine(tmp_path, g, replies)
+    assert result.status == "done", result.nodes
+    warnings = [e.data["message"] for e in events if e.kind == "warning"]
+    assert "node n runs commands with network on code models changed" in warnings
+
+
 def test_graph_only_workflows_are_not_offered_to_run(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         main(["run", "--workflow", "commands", "x"], err=io.StringIO())
