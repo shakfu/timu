@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -124,22 +126,22 @@ def test_read_only_workspace_redirects_caches(dirs: tuple[Path, Path, Path]) -> 
 
 
 def test_timeout_kills_grandchildren(dirs: tuple[Path, Path, Path]) -> None:
-    pidfile = dirs[1] / "pid"
+    sleeper = _unique_sleep()
     start = time.monotonic()
-    out = sh(ctx_for(dirs), f"sh -c 'sleep 30 & echo $! > {pidfile}; wait'", timeout=1)
+    out = sh(ctx_for(dirs), f"sh -c '{sleeper} & wait'", timeout=1)
     assert time.monotonic() - start < 4
     assert out.is_error
     assert "timed out after 1s; killed" in out.text
-    _assert_dead(int(pidfile.read_text()))
+    _assert_gone(sleeper)
 
 
 def test_background_job_does_not_block(dirs: tuple[Path, Path, Path]) -> None:
-    pidfile = dirs[1] / "pid"
+    sleeper = _unique_sleep()
     start = time.monotonic()
-    out = sh(ctx_for(dirs), f"sleep 30 & echo $! > {pidfile}; echo hi")
+    out = sh(ctx_for(dirs), f"{sleeper} & echo hi")
     assert time.monotonic() - start < 3
     assert out.text == "hi\n[exit 0]"
-    _assert_dead(int(pidfile.read_text()))
+    _assert_gone(sleeper)
 
 
 def test_cancel_stops_within_a_second(dirs: tuple[Path, Path, Path]) -> None:
@@ -158,14 +160,17 @@ def test_timeout_argument(dirs: tuple[Path, Path, Path]) -> None:
     assert "timed out after 1s" in sh(ctx, "sleep 5", timeout=0).text
 
 
-def _assert_dead(pid: int) -> None:
+def _unique_sleep() -> str:
+    return f"sleep 30.{uuid.uuid4().int % 10**9}"
+
+
+def _assert_gone(cmdline: str) -> None:
+    # Match by command line: under bwrap --unshare-pid, $! is a namespace pid.
     for _ in range(20):  # the kernel may take a moment to reap
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if subprocess.run(["pgrep", "-f", cmdline], capture_output=True).returncode:
             return
         time.sleep(0.05)
-    pytest.fail(f"process {pid} survived")
+    pytest.fail(f"{cmdline!r} survived")
 
 
 # ---- the macOS sandbox ----
