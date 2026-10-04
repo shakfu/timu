@@ -7,8 +7,8 @@
     timeout = 600                        # seconds, optional
     extra_body = { cache_control = { type = "ephemeral" } }   # optional
 
-    [roles.reviewer]
-    model = "<cheaper model id>"
+    [roles.reviewer]                     # also coder, researcher, lead,
+    model = "<cheaper model id>"         # validator and verifier
     skills = ["code-review"]             # optional
 
     [search]

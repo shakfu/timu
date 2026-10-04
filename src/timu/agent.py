@@ -164,6 +164,10 @@ class Agent:
                         stop = ("cancelled", "cancelled")
                     elif usage.tool_calls >= budget.tool_calls:
                         stop = ("budget", "budget reached (tool_calls)")
+                    elif (outer := self._outer_limit and self._outer_limit()) and (
+                        outer.endswith("tool_calls")  # a child may have spent them
+                    ):
+                        stop = ("budget", f"budget reached ({outer})")
                     elif streak[1] >= REPEAT_LIMIT:
                         stop = (
                             "failed",

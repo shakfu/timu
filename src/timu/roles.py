@@ -50,6 +50,12 @@ REVIEWER_WRITE = replace(
     grants=REVIEWER.grants | {W},
 )
 
+# review-validate-fix: the reviewer reports findings; the validator and verifier judge them.
+# All three have the reviewer's tools and grants.
+FINDER = replace(REVIEWER, prompt=prompt("finder"))
+VALIDATOR = replace(REVIEWER, name="validator", prompt=prompt("validator"))
+VERIFIER = replace(REVIEWER, name="verifier", prompt=prompt("verifier"))
+
 
 LEAD = Role(
     "lead",

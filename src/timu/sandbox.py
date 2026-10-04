@@ -8,7 +8,10 @@ readable.
 
 - macOS (sandbox-exec): metadata (stat, readlink) stays allowed under home, so
   symlinked toolchains and cd work. It denies writes to any path named `.git` and to
-  deny_write paths, even ones that do not exist yet.
+  deny_write paths, even ones that do not exist yet. It denies LaunchServices opens,
+  Apple events and signals to processes outside the sandbox. It cannot stop a command
+  reading the arguments and environment of the user's other processes
+  (KERN_PROCARGS2), so secrets in timu's environment are readable.
 - Linux (bwrap): home and MASKED are empty tmpfs mounts with the readable paths
   bound into them; writes elsewhere in them are discarded. MASKED holds the host's
   Unix sockets (session bus, ssh-agent, docker), which a new network namespace does
@@ -155,6 +158,11 @@ def mac_profile(
     lines = [
         "(version 1)",
         "(allow default)",
+        # launchd runs what LaunchServices or Apple events start outside the sandbox.
+        "(deny lsopen)",
+        "(deny appleevent-send)",
+        "(deny signal)",
+        "(allow signal (target same-sandbox))",
         *([] if policy.network else ["(deny network*)"]),
         "(deny file-write*)",
         f"(allow file-write* {writes} {dev})",

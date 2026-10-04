@@ -92,7 +92,7 @@ needs = ["a"]
 workflow = "fix-review"
 objective = "update"
 ref = "main"
-params = { max_rounds = "${a.rounds}", report_path = "R.md" }
+params = { review_to_fix = "${a.rounds}", report_path = "R.md" }
 inputs = ["a.notes", "a.review"]
 budget = { turns = 5 }
 """
@@ -104,7 +104,7 @@ def test_parse() -> None:
     assert list(g.nodes) == ["a", "b"]
     assert a.budget == Budget(**{**WORKFLOW_BUDGET.__dict__, "cost_usd": 2.0})
     assert b.budget == Budget(**{**WORKFLOW_BUDGET.__dict__, "turns": 5})
-    assert b.params == {"max_rounds": Ref("a", "rounds"), "report_path": "R.md"}
+    assert b.params == {"review_to_fix": Ref("a", "rounds"), "report_path": "R.md"}
     assert b.inputs == (("a", "notes"), ("a", "review"))
     assert (b.needs, b.ref) == (("a",), "main")
 
@@ -153,9 +153,9 @@ BASE = '[nodes.a]\nrepo = "a"\nworkflow = "fix-review"\nobjective = "o"\n'
         (
             (
                 '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\n'
-                "params={ max_rounds = 0 }\n"
+                "params={ review_to_fix = -1 }\n"
             ),
-            "params.max_rounds must be a positive integer",
+            "params.review_to_fix must be a non-negative integer",
         ),
         (
             (
@@ -374,6 +374,17 @@ def test_extract(tmp_path: Path) -> None:
         extract("toml:pyproject.toml#project", ws, "")
 
 
+def test_file_outputs_with_one_name_stay_apart(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    for d, body in (("a", "A\n"), ("b", "B\n")):
+        (ws / d).mkdir(parents=True)
+        (ws / d / "x.txt").write_text(body)
+    files = tmp_path / "files"
+    one, two = (extract(f"file:{d}/x.txt", ws, "", files) for d in ("a", "b"))
+    assert one != two
+    assert (Path(one).read_text(), Path(two).read_text()) == ("A\n", "B\n")
+
+
 def test_extract_stays_in_the_workspace(tmp_path: Path) -> None:
     """An agent could point pyproject.toml at a secret; the engine must not read it."""
     ws = tmp_path / "ws"
@@ -435,7 +446,7 @@ repo = "b"
 needs = ["a"]
 workflow = "fix-review"
 objective = "update"
-params = { max_rounds = "${a.rounds}" }
+params = { review_to_fix = "${a.rounds}" }
 inputs = ["a.notes", "a.review"]
 """
 
@@ -498,7 +509,7 @@ def test_a_bad_bound_param_fails_the_node(tmp_path: Path) -> None:
     ]
     result, *_ = engine(tmp_path, graph(AB), bad)
     assert result.nodes["b"].status == "failed"
-    assert "params.max_rounds from a.rounds: must be a positive integer" in (
+    assert "params.review_to_fix from a.rounds: must be a non-negative integer" in (
         result.nodes["b"].summary
     )
 
@@ -652,7 +663,9 @@ def test_a_file_output_reaches_a_command(tmp_path: Path) -> None:
     assert result.status == "done", result.nodes
     wheel = result.nodes["lib"].outputs["wheel"]
     assert wheel.kind == "file"
-    assert wheel.content == str(tmp_path / "work" / "files" / "lib" / "lib-1.0.whl")
+    assert wheel.content == str(
+        tmp_path / "work" / "files" / "lib" / "dist" / "lib-1.0.whl"
+    )
     app = result.nodes["app"].workdir
     assert app is not None
     assert (app / "got.txt").read_text() == "built\n"

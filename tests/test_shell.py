@@ -380,3 +380,30 @@ def test_here_documents_work(dirs: tuple[Path, Path, Path]) -> None:
     )
     assert sh(ctx, "echo x > /private/tmp/timu-not-allowed").is_error
     assert not Path("/private/tmp/timu-not-allowed").exists()
+
+
+@mac_only
+def test_sandbox_cannot_launch_apps(dirs: tuple[Path, Path, Path]) -> None:
+    """launchd would run an app started through LaunchServices unsandboxed."""
+    ws, _, outside = dirs
+    exe = ws / "x.app" / "Contents" / "MacOS" / "x"
+    exe.parent.mkdir(parents=True)
+    exe.write_text(f"#!/bin/sh\necho x > {outside}/escaped\n")
+    exe.chmod(0o755)
+    (ws / "x.app" / "Contents" / "Info.plist").write_text(
+        '<?xml version="1.0"?><plist version="1.0"><dict>'
+        "<key>CFBundleExecutable</key><string>x</string>"
+        "<key>CFBundleIdentifier</key><string>test.timu.escape</string>"
+        "</dict></plist>"
+    )
+    assert sh(ctx_for(dirs), "/usr/bin/open -g -j ./x.app").is_error
+    time.sleep(2)  # a launched app would write asynchronously
+    assert not (outside / "escaped").exists()
+
+
+@mac_only
+def test_sandbox_signals_only_its_own_processes(dirs: tuple[Path, Path, Path]) -> None:
+    ctx = ctx_for(dirs)
+    assert sh(ctx, f"kill -0 {os.getpid()}").is_error
+    out = sh(ctx, "sleep 5 & kill $!; wait $!; echo killed")
+    assert out.text.endswith("killed\n[exit 0]"), out.text

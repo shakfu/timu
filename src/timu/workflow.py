@@ -4,6 +4,7 @@ the agents it starts; a Run binds it to one workdir. WORKFLOWS holds the built-i
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -20,7 +21,17 @@ from timu.events import Event, EventSink
 from timu.provider.base import Provider
 from timu.report import ReportError, file_root, is_gitignored, write_report
 from timu.role import Role
-from timu.roles import CODER, LEAD, REVIEWER, REVIEWER_WRITE, researcher, with_skills
+from timu.roles import (
+    CODER,
+    FINDER,
+    LEAD,
+    REVIEWER,
+    REVIEWER_WRITE,
+    VALIDATOR,
+    VERIFIER,
+    researcher,
+    with_skills,
+)
 from timu.sandbox import Policy, Sandbox
 from timu.tool import PROTECTED, DelegateError, Tool
 from timu.tools.shell import run_sh, scrubbed_env
@@ -29,7 +40,9 @@ from timu.types import Artifact, Budget, Capability, Origin, Result, Status, Tas
 
 WORKFLOW_BUDGET = Budget(turns=200, tool_calls=400, tokens=2_000_000, wall_seconds=3600)
 URL = re.compile(r"https?://[^\s<>()\[\]\"']+")
-VERDICT = re.compile(r"^[\s*#>`_]*VERDICT:\s*(APPROVE|CHANGES)\b", re.IGNORECASE)
+VERDICT = re.compile(
+    r"^[\s*#>`_]*VERDICT[*`_]*:[\s*`_]*(APPROVE|CHANGES)\b", re.IGNORECASE
+)
 ReportMode = Literal["return", "write"]
 
 
@@ -329,13 +342,14 @@ def fix_review(
     run: Run,
     objective: str,
     *,
-    max_rounds: int = 3,
+    review_to_fix: int = 0,
     report_path: str = "REVIEW.md",
     report_mode: ReportMode = "return",
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
 ) -> Result:
-    """Code, then review, until the reviewer approves or max_rounds pass. The report
+    """Code, then review. On CHANGES, the report goes back to the coder, at most
+    review_to_fix times. The report
     reaches report_path by the workflow (mode "return") or the reviewer ("write").
     inputs go to the coder in every round. Raises ReportError if report_path fails
     the checks in design 4.3."""
@@ -359,7 +373,8 @@ def fix_review(
         return Result(status, summary, artifacts, run.used, run.run_id, tainted)
 
     findings: Artifact | None = None
-    for n in range(1, max_rounds + 1):
+    rounds = review_to_fix + 1
+    for n in range(1, rounds + 1):
         goal = objective
         if findings:
             goal += (
@@ -423,7 +438,7 @@ def fix_review(
             return done(
                 "failed", f"the review in round {n} has no VERDICT line", findings
             )
-    return done("failed", f"not approved after {max_rounds} rounds", findings)
+    return done("failed", f"not approved after {rounds} rounds", findings)
 
 
 def research_fix_review(
@@ -569,26 +584,27 @@ def check_fix_review(
     check: Sequence[str],
     network: bool = False,
     timeout: float = 600,
-    max_rounds: int = 3,
+    check_to_fix: int = 0,
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
     **fix: Any,
 ) -> Result:
-    """Run check; while it fails, fix_review with the log as an input and run check
-    again, up to max_rounds times (graph.md 7.7). network applies to the first run
+    """Run check; if it fails, fix_review with the log as an input and run check
+    again. A failing re-check goes back to fix_review at most check_to_fix times
+    (graph.md 7.7). fix takes fix_review's other keyword arguments. network applies to the first run
     only: later runs execute code the coder wrote, so they run offline and reuse what
     the first run fetched."""
     status, summary, log = run_steps(run, check, network, timeout)
     review: Artifact | None = None
     goal = f"{objective}\n\nThe checks failed. Their output is the log input; make them pass."
-    for n in range(1, max_rounds + 1):
+    rounds = check_to_fix + 1
+    for n in range(1, rounds + 1):
         if status != "failed":
             break
         run.emit("round", n=n, stage="fix")
         fixed = fix_review(
             run,
             goal,
-            max_rounds=max_rounds,
             skills=skills,
             inputs=(*inputs, log),
             **fix,
@@ -600,11 +616,241 @@ def check_fix_review(
         status, summary, log = run_steps(run, check, False, timeout)
     else:
         if status == "failed":
-            summary = f"checks still fail after {max_rounds} fix rounds: {summary}"
+            summary = f"checks still fail after {rounds} fix rounds: {summary}"
     run.emit("workflow_result", status=status, summary=summary)
     artifacts = (log, review) if review else (log,)
     untrusted = network or any(a.tainted for a in (*inputs, *artifacts))
     return Result(status, summary, artifacts, run.used, run.run_id, untrusted)
+
+
+SEVERITY = ("critical", "high", "medium", "low")
+FINDING_FIELDS = ("id", "severity", "location", "claim", "evidence")
+JSON_BLOCK = re.compile(r"```json[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
+
+
+class ProtocolError(ValueError):
+    """An agent's reply lacks the json block its step needs, or the block is wrong."""
+
+
+@dataclass(frozen=True)
+class Finding:
+    id: str
+    severity: str
+    location: str
+    claim: str
+    evidence: str
+
+
+def json_items(text: str, key: str, fields: Sequence[str]) -> list[dict[str, str]]:
+    """The objects under key in the last json block of text, each with string fields.
+    Raises ProtocolError."""
+    blocks = JSON_BLOCK.findall(text)
+    if not blocks:
+        raise ProtocolError("no json block")
+    try:
+        data = json.loads(blocks[-1])
+    except json.JSONDecodeError as e:
+        raise ProtocolError(f"invalid json: {e}") from None
+    items = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise ProtocolError(f"no {key} list")
+    for i in items:
+        if not isinstance(i, dict) or not all(
+            isinstance(i.get(f), str) for f in fields
+        ):
+            raise ProtocolError(
+                f"each of {key} needs string fields {', '.join(fields)}"
+            )
+    return items
+
+
+def parse_findings(text: str) -> tuple[Finding, ...]:
+    """The findings in a review. Raises ProtocolError."""
+    items = json_items(text, "findings", FINDING_FIELDS)
+    findings = tuple(Finding(*(i[f] for f in FINDING_FIELDS)) for i in items)
+    for f in findings:
+        if f.severity not in SEVERITY:
+            raise ProtocolError(
+                f"{f.id}: severity must be one of {', '.join(SEVERITY)}"
+            )
+    if len({f.id for f in findings}) != len(findings):
+        raise ProtocolError("finding ids are not unique")
+    return findings
+
+
+def parse_verdicts(
+    text: str, ids: Sequence[str], statuses: Sequence[str]
+) -> dict[str, tuple[str, str]]:
+    """id -> (status, evidence), one for each of ids. Raises ProtocolError."""
+    verdicts: dict[str, tuple[str, str]] = {}
+    for v in json_items(text, "verdicts", ("id", "status", "evidence")):
+        if v["status"] not in statuses:
+            raise ProtocolError(f"{v['id']}: status must be {' or '.join(statuses)}")
+        if v["id"] in verdicts:
+            raise ProtocolError(f"{v['id']} has two verdicts")
+        verdicts[v["id"]] = (v["status"], v["evidence"])
+    if set(verdicts) != set(ids):
+        raise ProtocolError(f"need one verdict for each of {', '.join(ids)}")
+    return verdicts
+
+
+def render_findings(
+    findings: Sequence[Finding], notes: Mapping[str, Mapping[str, tuple[str, str]]]
+) -> str:
+    """Each finding, then what each step found about it."""
+    parts = []
+    for f in findings:
+        lines = [
+            f"{f.id} [{f.severity}] {f.location}",
+            f"Claim: {f.claim}",
+            f"Evidence: {f.evidence}",
+        ]
+        for stage, (status, evidence) in notes.get(f.id, {}).items():
+            lines.append(f"{stage.capitalize()}: {status}. {evidence}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+def review_validate_fix(
+    run: Run,
+    objective: str,
+    *,
+    verify_to_fix: int = 0,
+    report_path: str = "REVIEW.md",
+    skills: Mapping[str, tuple[str, ...]] | None = None,
+    inputs: tuple[Artifact, ...] = (),
+) -> Result:
+    """Review, validate each finding, fix the confirmed ones, most severe first, then
+    verify each fix. Unfixed findings go back to the coder at most verify_to_fix
+    times. The report lists every finding with each step's verdict. inputs go to the
+    reviewer and the coder. Raises ReportError if report_path fails design 4.3."""
+    file_root(run.workdir, report_path)
+    if is_gitignored(run.workdir, report_path) is False:
+        run.emit("warning", message=f"{report_path} is not gitignored")
+    skills = skills or {}
+    finder, validator, coder, verifier = (
+        with_skills(r, skills.get(r.name, ()))
+        for r in (FINDER, VALIDATOR, CODER, VERIFIER)
+    )
+    findings: tuple[Finding, ...] = ()
+    notes: dict[str, dict[str, tuple[str, str]]] = {}
+    results: list[Result] = []
+
+    def tainted() -> bool:
+        return any(a.tainted for a in inputs) or any(r.untrusted for r in results)
+
+    def done(status: Status, summary: str) -> Result:
+        report = f"# Review\n\n{summary}\n\n{render_findings(findings, notes)}\n"
+        try:
+            write_report(run.workdir, report_path, report)
+        except ReportError as e:
+            status, summary = "failed", f"cannot write the report: {e}"
+        run.emit("workflow_result", status=status, summary=summary)
+        art = Artifact("review", report, "report", Origin.AGENT, run.run_id, tainted())
+        return Result(status, summary, (art,), run.used, run.run_id, tainted())
+
+    def step(stage: str, role: Role, task: Task, n: int = 1) -> Result:
+        run.emit("round", n=n, stage=stage)
+        results.append(run.run_agent(role, task))
+        return results[-1]
+
+    def given(todo: Sequence[Finding], source: Result) -> Artifact:
+        return Artifact(
+            "findings",
+            render_findings(todo, notes),
+            "findings",
+            Origin.AGENT,
+            source.trace_id,
+            tainted(),
+        )
+
+    reviewed = step("review", finder, Task(objective, inputs))
+    if reviewed.status != "done":
+        return done(reviewed.status, f"reviewer stopped: {reviewed.summary}")
+    try:
+        findings = parse_findings(reviewed.summary)
+    except ProtocolError as e:
+        return done("failed", f"the review: {e}")
+    if not findings:
+        return done("done", "no findings")
+
+    validated = step(
+        "validate",
+        validator,
+        Task(
+            f"Validate each finding of a review for this goal:\n\n{objective}",
+            (given(findings, reviewed),),
+        ),
+    )
+    if validated.status != "done":
+        return done(validated.status, f"validator stopped: {validated.summary}")
+    try:
+        verdicts = parse_verdicts(
+            validated.summary, [f.id for f in findings], ("confirmed", "rejected")
+        )
+    except ProtocolError as e:
+        return done("failed", f"the validation: {e}")
+    for fid, v in verdicts.items():
+        notes[fid] = {"validation": v}
+    todo = sorted(
+        (f for f in findings if verdicts[f.id][0] == "confirmed"),
+        key=lambda f: SEVERITY.index(f.severity),
+    )
+    confirmed = len(todo)
+    if not todo:
+        return done("done", f"no confirmed findings ({len(findings)} rejected)")
+
+    rounds = verify_to_fix + 1
+    for n in range(1, rounds + 1):
+        coded = step(
+            "fix",
+            coder,
+            Task(
+                f"{objective}\n\nFix each finding in the findings input, in the order "
+                "given: most severe first. Say which you fixed and which you did not.",
+                (*inputs, given(todo, validated)),
+                "Each finding is fixed and the tests pass.",
+            ),
+            n,
+        )
+        if coded.status != "done":
+            return done(coded.status, f"coder stopped in round {n}: {coded.summary}")
+        work = Artifact(
+            "coder-summary",
+            coded.summary,
+            "text",
+            Origin.AGENT,
+            coded.trace_id,
+            coded.untrusted,
+        )
+        verified = step(
+            "verify",
+            verifier,
+            Task(
+                "Check whether each finding in the findings input is fixed.",
+                (given(todo, coded), work),
+            ),
+            n,
+        )
+        if verified.status != "done":
+            return done(
+                verified.status, f"verifier stopped in round {n}: {verified.summary}"
+            )
+        try:
+            checks = parse_verdicts(
+                verified.summary, [f.id for f in todo], ("fixed", "unfixed")
+            )
+        except ProtocolError as e:
+            return done("failed", f"the verification in round {n}: {e}")
+        for fid, v in checks.items():
+            notes[fid]["verification"] = v
+        todo = [f for f in todo if checks[f.id][0] == "unfixed"]
+        if not todo:
+            return done("done", f"fixed {confirmed} confirmed findings in round {n}")
+    return done(
+        "failed",
+        f"{len(todo)} of {confirmed} confirmed findings unfixed after {rounds} rounds",
+    )
 
 
 @dataclass(frozen=True)
@@ -632,6 +878,13 @@ class Workflow:
     params: Mapping[str, Param] = field(default_factory=dict)
     artifacts: tuple[str, ...] = ()  # names of the artifacts a Result may carry
     graph_only: bool = False  # needs params that only a graph file can set
+
+
+def non_negative_int(v: Any) -> int:
+    n = int(v) if isinstance(v, str) and v.isdigit() else v
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise ValueError("must be a non-negative integer")
+    return n
 
 
 def positive_int(v: Any) -> int:
@@ -676,7 +929,7 @@ class Commands:
 COMMANDS = Commands()
 
 FIX_PARAMS: Mapping[str, Param] = {
-    "max_rounds": positive_int,
+    "review_to_fix": non_negative_int,
     "report_path": string,
     "report_mode": report_mode,
 }
@@ -707,6 +960,17 @@ WORKFLOWS = {
             ("review", "research", "sources"),
         ),
         Workflow(
+            "review-validate-fix",
+            "review, validate each finding, fix the confirmed ones, verify each fix",
+            ("reviewer", "validator", "coder", "verifier"),
+            False,
+            lambda run, obj, o: review_validate_fix(
+                run, obj, skills=o.skills, inputs=o.inputs, **o.params
+            ),
+            {"verify_to_fix": non_negative_int, "report_path": string},
+            ("review",),
+        ),
+        Workflow(
             "commands",
             "fixed commands in the sandbox, with no model",
             (),
@@ -726,6 +990,7 @@ WORKFLOWS = {
             ),
             {
                 **FIX_PARAMS,
+                "check_to_fix": non_negative_int,
                 "check": COMMANDS,
                 "network": boolean,
                 "timeout": positive_int,

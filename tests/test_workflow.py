@@ -4,6 +4,7 @@ and the workflow registry."""
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shutil
 import subprocess
@@ -17,7 +18,15 @@ from timu import Budget, Capability, Event, Origin, Role, Task, Usage
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider, call, calls, text
 from timu.report import MAX_REPORT, ReportError, is_gitignored, write_report
-from timu.roles import CODER, REVIEWER, REVIEWER_WRITE, with_skills
+from timu.roles import (
+    CODER,
+    FINDER,
+    REVIEWER,
+    REVIEWER_WRITE,
+    VALIDATOR,
+    VERIFIER,
+    with_skills,
+)
 from timu.sandbox import NoSandbox, Policy
 from timu.tools.skill import LOAD_SKILL, READ_SKILL_FILE
 from timu.workflow import (
@@ -27,6 +36,7 @@ from timu.workflow import (
     check_fix_review,
     commands,
     fix_review,
+    review_validate_fix,
     verdict,
 )
 
@@ -89,6 +99,10 @@ def test_with_skills() -> None:
         ("VERDICT: APPROVE\nall good", "APPROVE"),
         ("verdict: changes\n- bug", "CHANGES"),
         ("# Review\n\n**VERDICT: APPROVE**\n", "APPROVE"),
+        ("**VERDICT:** APPROVE", "APPROVE"),
+        ("**Verdict**: changes", "CHANGES"),
+        ("VERDICT: **APPROVE**", "APPROVE"),
+        ("`VERDICT`: `CHANGES`", "CHANGES"),
         ("Here is my review.\nVERDICT: CHANGES", "CHANGES"),
         ("a\nb\nc\nVERDICT: APPROVE", None),  # not in the first three lines
         ("VERDICT: APPROVED-ish", None),
@@ -217,6 +231,23 @@ def test_runs_in_one_session_share_budget_ids_and_trace(tmp_path: Path) -> None:
     assert (list(run.results), list(other.results)) == (["a1"], ["a2"])
 
 
+F1 = {
+    "id": "F1",
+    "severity": "high",
+    "location": "calc.py:2",
+    "claim": "add subtracts",
+    "evidence": "test_add fails",
+}
+
+
+def block(**data: Any) -> str:
+    return "```json\n" + json.dumps(data) + "\n```"
+
+
+def verdict_for(fid: str, status: str) -> dict[str, str]:
+    return {"id": fid, "status": status, "evidence": f"{fid} is {status}"}
+
+
 SCRIPTS = {
     "lead": [
         calls(
@@ -228,7 +259,10 @@ SCRIPTS = {
     ],
     "researcher": [text("facts")],
     "coder": [text("fixed")],
-    "reviewer": [text("VERDICT: APPROVE")],
+    # a verdict for fix-review and a finding for review-validate-fix
+    "reviewer": [text("VERDICT: APPROVE\n" + block(findings=[F1]))],
+    "validator": [text(block(verdicts=[verdict_for("F1", "confirmed")]))],
+    "verifier": [text(block(verdicts=[verdict_for("F1", "fixed")]))],
 }
 
 
@@ -246,10 +280,9 @@ def test_workflow_roles_cover_the_roles_it_starts(tmp_path: Path, name: str) -> 
     by_name: dict[str, dict[str, Any]] = {
         "commands": {"steps": ["true"]},
         # fails once, so the fix loop runs, then passes
-        "check-fix-review": {"check": [FAIL_ONCE], "max_rounds": 1},
-        "lead": {},
+        "check-fix-review": {"check": [FAIL_ONCE]},
     }
-    params = by_name.get(name, {"max_rounds": 1})
+    params = by_name.get(name, {})
     result = WORKFLOWS[name].run(run, "objective", Options({}, params=params))
     assert result.status == "done", result.summary
     assert set(started) == set(WORKFLOWS[name].roles)
@@ -372,12 +405,21 @@ def test_check_fix_review_checks_the_coders_code_offline(tmp_path: Path) -> None
     assert [p.network for p in box.policies] == [True, False]
 
 
-def test_check_fix_review_gives_up_after_max_rounds(tmp_path: Path) -> None:
+def test_check_fix_review_does_not_loop_unless_asked(tmp_path: Path) -> None:
     replies = [text("tried"), text("VERDICT: APPROVE")]
     run, _, _ = make_run(tmp_path, replies)
-    r = check_fix_review(run, "o", check=["false"], max_rounds=1)
+    r = check_fix_review(run, "o", check=["false"])
     assert r.status == "failed"
     assert r.summary == "checks still fail after 1 fix rounds: `false` failed: exit 1"
+
+
+def test_check_to_fix_loops_only_the_check_edge(tmp_path: Path) -> None:
+    """Each edge has its own limit: two check rounds, one review each (E2)."""
+    replies = [text("tried"), text("VERDICT: APPROVE")] * 3
+    run, provider, _ = make_run(tmp_path, replies)
+    r = check_fix_review(run, "o", check=["false"], check_to_fix=1)
+    assert r.summary == "checks still fail after 2 fix rounds: `false` failed: exit 1"
+    assert len(provider.requests) == 4
 
 
 # ---- fix_review ----
@@ -416,7 +458,7 @@ def test_findings_reach_the_next_coder(tmp_path: Path) -> None:
     run, provider, _ = make_run(
         tmp_path, [*coder_turn(), text(CHANGES), *coder_turn(), text(APPROVE)]
     )
-    result = fix_review(run, "fix the bug")
+    result = fix_review(run, "fix the bug", review_to_fix=1)
     assert result.summary == "approved in round 2"
     second_coder_task = provider.requests[3].messages[1].content
     assert "The reviewer asked for changes" in second_coder_task
@@ -424,10 +466,10 @@ def test_findings_reach_the_next_coder(tmp_path: Path) -> None:
     assert "still subtracts" in second_coder_task
 
 
-def test_stops_at_max_rounds(tmp_path: Path) -> None:
+def test_review_to_fix_bounds_the_loop(tmp_path: Path) -> None:
     replies = [*coder_turn(), text(CHANGES)] * 3
     run, provider, _ = make_run(tmp_path, replies)
-    result = fix_review(run, "fix", max_rounds=2)
+    result = fix_review(run, "fix", review_to_fix=1)
     assert (result.status, result.summary) == ("failed", "not approved after 2 rounds")
     assert len(provider.requests) == 6
     assert result.artifacts[0].content == CHANGES
@@ -538,3 +580,154 @@ def test_skills_from_config(tmp_path: Path) -> None:
     assert "load_skill" not in provider.requests[0].tools  # the coder has no skills
     assert "load_skill" in provider.requests[2].tools
     assert "<name>house-style</name>" in provider.requests[2].messages[0].content
+
+
+# ---- review_validate_fix ----
+
+
+def finding(fid: str, severity: str) -> dict[str, str]:
+    return {**F1, "id": fid, "severity": severity, "claim": f"claim {fid}"}
+
+
+def verdicts(**status: str) -> Reply:
+    return text(
+        "Done.\n" + block(verdicts=[verdict_for(k, v) for k, v in status.items()])
+    )
+
+
+THREE = text(
+    "Report.\n"
+    + block(
+        findings=[
+            finding("F1", "low"),
+            finding("F2", "critical"),
+            finding("F3", "medium"),
+        ]
+    )
+)
+
+
+def test_review_validate_fix_roles_judge_but_do_not_write() -> None:
+    assert FINDER.name == "reviewer"  # [roles.reviewer] model applies
+    for role in (FINDER, VALIDATOR, VERIFIER):
+        assert (role.tools, role.grants) == (REVIEWER.tools, REVIEWER.grants)
+    assert (VALIDATOR.name, VERIFIER.name) == ("validator", "verifier")
+
+
+def test_review_validate_fix_fixes_confirmed_findings_most_severe_first(
+    tmp_path: Path,
+) -> None:
+    replies = [
+        THREE,
+        verdicts(F1="confirmed", F2="confirmed", F3="rejected"),
+        *coder_turn(),
+        verdicts(F1="fixed", F2="fixed"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review calc.py")
+    assert (r.status, r.summary) == ("done", "fixed 2 confirmed findings in round 1")
+    coder_task = provider.requests[2].messages[1].content
+    assert coder_task.index("F2 [critical]") < coder_task.index("F1 [low]")
+    assert "F3" not in coder_task
+    report = (tmp_path / "REVIEW.md").read_text()
+    assert r.artifacts[0].content == report
+    assert "F3 [medium] calc.py:2\nClaim: claim F3" in report
+    assert "Validation: rejected. F3 is rejected" in report
+    assert "Verification: fixed. F2 is fixed" in report
+
+
+@pytest.mark.parametrize(
+    ("replies", "summary"),
+    [
+        ([text(block(findings=[]))], "no findings"),
+        (
+            [THREE, verdicts(F1="rejected", F2="rejected", F3="rejected")],
+            "no confirmed findings (3 rejected)",
+        ),
+    ],
+)
+def test_review_validate_fix_stops_early(
+    tmp_path: Path, replies: list[Reply], summary: str
+) -> None:
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review")
+    assert (r.status, r.summary) == ("done", summary)
+    assert len(provider.requests) == len(replies)
+
+
+def test_review_validate_fix_does_not_loop_unless_asked(tmp_path: Path) -> None:
+    replies = [
+        THREE,
+        verdicts(F1="confirmed", F2="rejected", F3="rejected"),
+        *coder_turn(),
+        verdicts(F1="unfixed"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review")
+    assert (r.status, r.summary) == (
+        "failed",
+        "1 of 1 confirmed findings unfixed after 1 rounds",
+    )
+    assert len(provider.requests) == 5
+
+
+def test_verify_to_fix_sends_back_only_unfixed_findings(tmp_path: Path) -> None:
+    replies = [
+        THREE,
+        verdicts(F1="confirmed", F2="confirmed", F3="rejected"),
+        *coder_turn(),
+        verdicts(F1="fixed", F2="unfixed"),
+        *coder_turn(),
+        verdicts(F2="fixed"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review", verify_to_fix=1)
+    assert (r.status, r.summary) == ("done", "fixed 2 confirmed findings in round 2")
+    second_coder_task = provider.requests[5].messages[1].content
+    assert "F1" not in second_coder_task
+    assert "Verification: unfixed. F2 is unfixed" in second_coder_task
+
+
+@pytest.mark.parametrize(
+    ("replies", "summary"),
+    [
+        ([text("no block")], "the review: no json block"),
+        ([text("```json\n{bad\n```")], "the review: invalid json"),
+        (
+            [text(block(findings=[finding("F1", "severe")]))],
+            "the review: F1: severity must be one of critical, high, medium, low",
+        ),
+        (
+            [text(block(findings=[finding("F1", "low"), finding("F1", "high")]))],
+            "the review: finding ids are not unique",
+        ),
+        (
+            [text(block(findings=[{"id": "F1"}]))],
+            "the review: each of findings needs string fields",
+        ),
+        (
+            [THREE, verdicts(F1="confirmed", F2="confirmed")],
+            "the validation: need one verdict for each of F1, F2, F3",
+        ),
+        (
+            [THREE, verdicts(F1="confirmed", F2="maybe", F3="rejected")],
+            "the validation: F2: status must be confirmed or rejected",
+        ),
+        (
+            [
+                THREE,
+                verdicts(F1="confirmed", F2="rejected", F3="rejected"),
+                *coder_turn(),
+                verdicts(F1="fixed", F2="fixed"),
+            ],
+            "the verification in round 1: need one verdict for each of F1",
+        ),
+    ],
+)
+def test_review_validate_fix_protocol_errors_fail_the_run(
+    tmp_path: Path, replies: list[Reply], summary: str
+) -> None:
+    run, _, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review")
+    assert r.status == "failed"
+    assert r.summary.startswith(summary), r.summary

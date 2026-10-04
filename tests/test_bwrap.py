@@ -4,6 +4,7 @@ bwrap can create namespaces; see why_none."""
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -98,7 +99,9 @@ def test_wrap(tmp_path: Path) -> None:
 
 
 def test_probe_reports_a_failing_bwrap() -> None:
-    assert _bwrap_problem("/bin/false") == "exit 1"
+    false = shutil.which("false")  # /usr/bin/false on macOS
+    assert false is not None
+    assert _bwrap_problem(false) == "exit 1"
 
 
 def test_why_none_without_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:

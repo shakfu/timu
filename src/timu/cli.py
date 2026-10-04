@@ -40,6 +40,13 @@ EXIT = {
 }
 T = TypeVar("T")
 USAGE_ERROR = 2
+# workflow param -> `timu run` argument; a workflow gets the ones it declares
+RUN_PARAMS = {
+    "review_to_fix": "review_to_fix",
+    "verify_to_fix": "verify_to_fix",
+    "report_path": "report",
+    "report_mode": "report_mode",
+}
 
 
 class ConsoleSink:
@@ -166,7 +173,19 @@ def parser() -> argparse.ArgumentParser:
         default="return",
         help="return: timu writes the report (default); write: the reviewer does",
     )
-    run.add_argument("--max-rounds", type=int, default=3)
+    run.add_argument(
+        "--review-to-fix",
+        type=int,
+        default=0,
+        help="how many times a CHANGES verdict goes back to the coder (default: 0)",
+    )
+    run.add_argument(
+        "--verify-to-fix",
+        type=int,
+        default=0,
+        help="review-validate-fix: how many times unfixed findings go back to the coder "
+        "(default: 0)",
+    )
     graph = sub.add_parser("graph", help="run a graph of workflows across projects")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     graph_run = graph_sub.add_parser(
@@ -200,19 +219,25 @@ def main(
     if not args.workdir.is_dir():
         err.write(f"timu: {args.workdir} is not a directory\n")
         return USAGE_ERROR
-    if args.max_rounds < 1:
-        err.write("timu: --max-rounds must be at least 1\n")
-        return USAGE_ERROR
+    defaults = parser().parse_args(["run", "x"])
+    given = {}
+    for param, attr in RUN_PARAMS.items():
+        value, flag = getattr(args, attr), "--" + attr.replace("_", "-")
+        if param not in workflow.params:
+            if value != getattr(defaults, attr):
+                err.write(f"timu: {flag} does not apply to {workflow.name}\n")
+                return USAGE_ERROR
+            continue
+        try:
+            given[param] = workflow.params[param](value)
+        except ValueError as e:
+            err.write(f"timu: {flag} {e}\n")
+            return USAGE_ERROR
 
     def body(session: Session) -> Result:
         run = session.at(args.workdir)
         search = _search(session, config, workflow.roles)
-        params = {
-            "max_rounds": args.max_rounds,
-            "report_path": args.report,
-            "report_mode": args.report_mode,
-        }
-        options = Options(config.role_skills, search, params)
+        options = Options(config.role_skills, search, given)
         return workflow.run(run, args.objective, options)
 
     done = _execute(

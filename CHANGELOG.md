@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A user skill now wins over a workspace skill of the same name in `./.timu/skills`. Before, the repo's copy replaced it, so a cloned repo could change the instructions of a skill the user's config named. A repo can still add skills with new names.
 
+- The macOS sandbox denies LaunchServices opens, Apple events, and signals to processes outside the sandbox. A command could build an `.app` in the workspace and start it with `open`. launchd ran it unsandboxed, with full file and network access. A command could also kill timu. The profile still starts from `(allow default)`. A command can still read the environment of the user's other processes through `sysctl(KERN_PROCARGS2)`, API keys included. No SBPL rule tested on macOS 26 blocks this.
+
 ### Added
 
 - Each run prints its config sources on one line (`config: <file> + TIMU_MODEL`) and records them in the trace.
@@ -28,11 +30,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Linux sandbox backend with `bwrap`. It denies network access, hides `$HOME` behind an empty tmpfs, and mounts the filesystem read-only except the role's write roots. It keeps `.git`, `timu.toml` and `.timu` at each write root read-only. timu probes `bwrap` at startup and, where it cannot run, says why. Unlike the macOS profile, it cannot block a path that does not exist yet. So a command may create a new `.git`, `timu.toml` or `.timu`, but may not change existing ones.
 
+- `review-validate-fix` workflow: a reviewer reports findings as JSON, a validator confirms or rejects each, the coder fixes the confirmed ones most severe first, and a verifier checks each fix. Each step is its own role, so `[roles.validator]` and `[roles.verifier]` can set a model. A missing or malformed JSON block fails the run.
+
+  ```sh
+  timu run --workflow review-validate-fix --verify-to-fix 1 "review src/ for correctness"
+  ```
+
 ### Changed
+
+- No workflow step repeats unless asked. A loop is a back-edge with its own limit, default 0: `review_to_fix` (`--review-to-fix`) for fix-review, and `check_to_fix` for check-fix-review. They replace `max_rounds` and `--max-rounds`, which defaulted to 3. check-fix-review passed its `max_rounds` to the inner fix-review too, so the default allowed up to 9 coder runs.
+
+- `timu run` passes a workflow only the flags it declares. Setting one it does not declare, such as `--report` with `lead`, is a usage error.
 
 - Workflows are registered in `WORKFLOWS` (`workflow.py`). The CLI takes its `--workflow` choices, provider checks and approval default from there, not from three hardcoded lists.
 
 - A `Session` holds what the agents of one invocation share: budget, run id, sink, cancel flag and approvals. `Run` binds it to one workdir, and `Run.at(path)` gives another `Run` in the same session. This is phase 1 of `docs/dev/graph.md`.
+
+### Fixed
+
+- An agent stops a turn's remaining tool calls once the workflow's tool-call limit is spent. Before, it checked only its own count, so a lead whose child spent the limit kept calling tools.
+
+- A verdict line with Markdown inside it, such as `**VERDICT:** APPROVE`, is accepted. Before, the run failed with "no VERDICT line".
+
+- A `file:` output is copied to its path in the workspace, under the node's files directory. Before, it was copied by base name, so two outputs named `x.txt` overwrote each other and both returned the last file.
 
 ## [0.2.0]
 

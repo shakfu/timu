@@ -238,7 +238,8 @@ def test_gate_asks_once_per_artifact(tmp_path: Path) -> None:
     run, _, _ = make_run(
         tmp_path, [*RESEARCH, *CODE, *changes, *CODE, *APPROVE], approve=allow
     )
-    assert research_fix_review(run, "x", fetch=FETCH).status == "done"
+    result = research_fix_review(run, "x", fetch=FETCH, review_to_fix=1)
+    assert result.status == "done"
     assert asked == ["research"]  # round 2 and the reviewer's derived input do not ask
 
 

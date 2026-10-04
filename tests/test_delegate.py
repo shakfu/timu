@@ -237,6 +237,28 @@ def test_children_spend_the_leads_budget(tmp_path: Path) -> None:
     assert run.used.turns == 4
 
 
+def test_children_spend_the_leads_tool_calls_mid_turn(tmp_path: Path) -> None:
+    """A turn's later calls stop once a child has spent the workflow's tool calls."""
+    run, provider, _ = make_run(
+        tmp_path,
+        [
+            calls(
+                call("delegate", role="coder", goal="x"),
+                *[call("list", path=f"d{i}") for i in range(5)],
+            ),
+            calls(*[call("write", path=f"f{i}", content="1") for i in range(3)]),
+            text("done"),  # the coder used 3; delegate makes it 4 of 4
+            text("never sent"),
+        ],
+        budget=Budget(tool_calls=4),
+    )
+    result = lead(run, "x", fetch=FETCH)
+    assert result.status == "budget"
+    assert "workflow tool_calls" in result.summary
+    assert run.used.tool_calls == 4
+    assert len(provider.requests) == 3
+
+
 def test_gate_asks_about_goals_from_a_tainted_lead(tmp_path: Path) -> None:
     asked: list[tuple[str, str]] = []
 

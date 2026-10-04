@@ -510,8 +510,8 @@ def _read(ws: Path, rel: str) -> str:
 
 
 def _export(ws: Path, pattern: str, files: Path) -> Path:
-    """Copy the one file in ws that matches pattern into files. Symlinks are
-    resolved first, so a match outside ws is refused."""
+    """Copy the one file in ws that matches pattern into files, at its path in ws.
+    Symlinks are resolved first, so a match outside ws is refused."""
     try:
         found = sorted({Path(os.path.realpath(p)) for p in ws.glob(pattern)})
     except (ValueError, NotImplementedError) as e:
@@ -526,8 +526,8 @@ def _export(ws: Path, pattern: str, files: Path) -> Path:
     src = found[0]
     if not src.is_relative_to(ws) or not src.is_file():
         raise GraphError(f"{pattern} is not a file in the workspace")
-    files.mkdir(parents=True, exist_ok=True)
-    dest = files / src.name
+    dest = files / src.relative_to(ws)  # outputs sharing a basename stay apart
+    dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dest)
     return dest
 

@@ -129,11 +129,11 @@ def test_not_approved_exits_1(tmp_path: Path, repo: Path) -> None:
     replies = [*FIX, text("VERDICT: CHANGES\n- no test for negatives")]
     code, _, err = cli(
         tmp_path,
-        ["-C", str(repo), "--unsafe-no-sandbox", "--max-rounds", "1", "x"],
+        ["-C", str(repo), "--unsafe-no-sandbox", "x"],
         replies,
     )
     assert code == 1
-    assert "not approved after 1 rounds" in err
+    assert "not approved after 1 rounds" in err  # no loop unless asked for
 
 
 def test_budget_exits_3(tmp_path: Path, repo: Path) -> None:
@@ -153,7 +153,12 @@ def test_budget_exits_3(tmp_path: Path, repo: Path) -> None:
     ("argv", "message"),
     [
         (["-C", "/nonexistent", "x"], "is not a directory"),
-        (["--max-rounds", "0", "x"], "--max-rounds must be at least 1"),
+        (["--review-to-fix", "-1", "x"], "--review-to-fix must be a non-negative"),
+        (["--workflow", "lead", "--report", "R.md", "x"], "does not apply to lead"),
+        (
+            ["--workflow", "review-validate-fix", "--review-to-fix", "1", "x"],
+            "does not apply",
+        ),
     ],
 )
 def test_usage_errors(tmp_path: Path, argv: list[str], message: str) -> None:
