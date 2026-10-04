@@ -167,7 +167,9 @@ def _unique_sleep() -> str:
 def _assert_gone(cmdline: str) -> None:
     # Match by command line: under bwrap --unshare-pid, $! is a namespace pid.
     for _ in range(20):  # the kernel may take a moment to reap
-        if subprocess.run(["pgrep", "-f", cmdline], capture_output=True).returncode:
+        if subprocess.run(
+            ["pgrep", "-f", cmdline], capture_output=True, check=False
+        ).returncode:
             return
         time.sleep(0.05)
     pytest.fail(f"{cmdline!r} survived")
