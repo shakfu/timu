@@ -252,8 +252,7 @@ SCRIPTS = {
     "lead": [
         calls(
             call("delegate", id="d1", role="researcher", goal="look"),
-            call("delegate", id="d2", role="coder", goal="fix"),
-            call("delegate", id="d3", role="reviewer", goal="review"),
+            call("delegate", id="d2", role="coder", goal="fix"),  # then a review
         ),
         text("done"),
     ],
@@ -286,6 +285,9 @@ def test_workflow_roles_cover_the_roles_it_starts(tmp_path: Path, name: str) -> 
     result = WORKFLOWS[name].run(run, "objective", Options({}, params=params))
     assert result.status == "done", result.summary
     assert set(started) == set(WORKFLOWS[name].roles)
+    checks = [r for i, r in enumerate(started[1:]) if started[i] == "coder"]
+    assert len(checks) == started.count("coder")  # no coder run is the last
+    assert set(checks) <= {"reviewer", "verifier"}  # every fix is checked
 
 
 FAIL_ONCE = "test -e .ran || { touch .ran; exit 1; }"
@@ -691,27 +693,30 @@ def test_verify_to_fix_sends_back_only_unfixed_findings(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("replies", "summary"),
     [
-        ([text("no block")], "the review: no json block"),
-        ([text("```json\n{bad\n```")], "the review: invalid json"),
+        ([text("no block")], "reviewer stopped: unusable final answer: no json block"),
+        (
+            [text("```json\n{bad\n```")],
+            "reviewer stopped: unusable final answer: invalid json",
+        ),
         (
             [text(block(findings=[finding("F1", "severe")]))],
-            "the review: F1: severity must be one of critical, high, medium, low",
+            "reviewer stopped: unusable final answer: F1: severity must be one of critical, high, medium, low",
         ),
         (
             [text(block(findings=[finding("F1", "low"), finding("F1", "high")]))],
-            "the review: finding ids are not unique",
+            "reviewer stopped: unusable final answer: finding ids are not unique",
         ),
         (
             [text(block(findings=[{"id": "F1"}]))],
-            "the review: each of findings needs string fields",
+            "reviewer stopped: unusable final answer: each of findings needs string fields",
         ),
         (
             [THREE, verdicts(F1="confirmed", F2="confirmed")],
-            "the validation: need one verdict for each of F1, F2, F3",
+            "validator stopped: unusable final answer: need one verdict for each of F1, F2, F3",
         ),
         (
             [THREE, verdicts(F1="confirmed", F2="maybe", F3="rejected")],
-            "the validation: F2: status must be confirmed or rejected",
+            "validator stopped: unusable final answer: F2: status must be confirmed or rejected",
         ),
         (
             [
@@ -720,14 +725,31 @@ def test_verify_to_fix_sends_back_only_unfixed_findings(tmp_path: Path) -> None:
                 *coder_turn(),
                 verdicts(F1="fixed", F2="fixed"),
             ],
-            "the verification in round 1: need one verdict for each of F1",
+            "verifier stopped in round 1: unusable final answer: need one verdict for each of F1",
         ),
     ],
 )
 def test_review_validate_fix_protocol_errors_fail_the_run(
     tmp_path: Path, replies: list[Reply], summary: str
 ) -> None:
-    run, _, _ = make_run(tmp_path, replies)
+    """The agent is told what is wrong and tries once more; it repeats the error."""
+    run, provider, events = make_run(tmp_path, [*replies, replies[-1]])
     r = review_validate_fix(run, "review")
     assert r.status == "failed"
     assert r.summary.startswith(summary), r.summary
+    retry = provider.requests[-1].messages[-1].content
+    assert retry.startswith("Your final answer cannot be used: ")
+    assert any(e.kind == "warning" for e in events)
+
+
+def test_review_validate_fix_recovers_from_a_bad_block(tmp_path: Path) -> None:
+    replies = [
+        text("Two bugs, I think."),  # no block: asked again
+        THREE,
+        verdicts(F1="rejected", F2="rejected", F3="rejected"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review")
+    assert (r.status, r.summary) == ("done", "no confirmed findings (3 rejected)")
+    retry = provider.requests[1].messages[-1].content
+    assert "no json block; end with the json block" in retry

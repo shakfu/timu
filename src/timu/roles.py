@@ -81,3 +81,14 @@ def with_skills(role: Role, names: tuple[str, ...]) -> Role:
         return role
     tools = tuple(t for t in role.tools if t not in (LOAD_SKILL, READ_SKILL_FILE))
     return replace(role, tools=(*tools, LOAD_SKILL, READ_SKILL_FILE), skills=names)
+
+
+# The role names timu.toml may configure under [roles.<name>].
+ROLE_NAMES = (
+    CODER.name,
+    REVIEWER.name,
+    VALIDATOR.name,
+    VERIFIER.name,
+    LEAD.name,
+    researcher().name,
+)

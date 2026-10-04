@@ -191,3 +191,21 @@ def test_lead_needs_research_and_code(
     exec((repo / "facts.py").read_text(), namespace)  # noqa: S102 - our own test fixture
     assert namespace["tomllib_added"]() == "3.11"  # type: ignore[operator]
     assert "[lead a1] delegate researcher:" in err
+
+
+def test_review_validate_fix_finds_and_fixes_a_bug(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review-validate-fix (live): the reviewer finds a bug no test covers, the
+    validator confirms it, the coder fixes it and the verifier checks the fix. Also
+    measures whether the model keeps to the json block protocol."""
+    code, err, repo = run_scenario(
+        "review-validate-fix-stats", tmp_path, monkeypatch, "--verify-to-fix", "1"
+    )
+    assert code == 0, err
+    namespace: dict[str, object] = {}
+    exec((repo / "stats.py").read_text(), namespace)  # noqa: S102 - our own test fixture
+    assert namespace["mean"]([1, 2, 3]) == 2  # type: ignore[operator]
+    report = (repo / "REVIEW.md").read_text()
+    assert "Validation: confirmed." in report
+    assert "Verification: fixed." in report

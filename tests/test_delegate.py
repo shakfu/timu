@@ -105,10 +105,7 @@ LEAD_SCRIPT = [
         call("write", path="calc.py", content="def add(a, b):\n    return a + b\n")
     ),  # coder a3
     text("fixed add()"),
-    calls(
-        call("delegate", role="reviewer", goal="Review the fix to add() in calc.py.")
-    ),
-    text("VERDICT: APPROVE\nadd() is correct."),  # reviewer a4
+    text("VERDICT: APPROVE\nadd() is correct."),  # reviewer a4, run by the delegation
     text("Objective met: add() fixed and approved."),  # lead
 ]
 
@@ -125,7 +122,7 @@ def test_lead_delegates_research_code_review(tmp_path: Path) -> None:
     )
     assert (tmp_path / "calc.py").read_text().endswith("a + b\n")
     assert result.trace_id == run.run_id
-    assert result.usage.turns == 9
+    assert result.usage.turns == 8
 
     starts = {e.agent_id: (e.role, e.parent_id) for e in events if e.kind == "start"}
     assert starts == {
@@ -150,6 +147,12 @@ def test_lead_delegates_research_code_review(tmp_path: Path) -> None:
     assert re.search(
         r'<untrusted-[0-9a-f]+ name="result-a2" kind="result" origin="net">', coder_task
     )
+    # The coder's result reaches the lead with its review.
+    to_lead = tool_results(provider, 7)[-1]
+    header = json.loads(to_lead.splitlines()[0])
+    assert (header["id"], header["role"], header["status"]) == ("a4", "coder", "done")
+    assert "coder result a3:\nfixed add()" in to_lead
+    assert "reviewer result a4:\nVERDICT: APPROVE" in to_lead
     # Everything downstream of the web is untrusted, the lead included.
     untrusted = {e.agent_id: e.data["untrusted"] for e in events if e.kind == "result"}
     assert untrusted == {"a2": True, "a3": True, "a4": True, "a1": True}
@@ -169,6 +172,40 @@ def test_child_failure_is_a_tool_result(tmp_path: Path) -> None:
     msg = next(m for m in provider.requests[2].messages if m.role == "tool")
     assert msg.is_error
     assert json.loads(msg.content.splitlines()[0])["status"] == "refused"
+
+
+def test_a_coders_work_is_always_reviewed(tmp_path: Path) -> None:
+    run, provider, events = make_run(
+        tmp_path,
+        [
+            calls(call("delegate", role="coder", goal="fix calc.py")),
+            text("fixed"),
+            text("VERDICT: CHANGES\n- no test"),  # the review the delegation runs
+            text("the reviewer wants a test"),
+        ],
+    )
+    assert lead(run, "x", fetch=FETCH).status == "done"
+    starts = [(e.role, e.parent_id) for e in events if e.kind == "start"]
+    assert starts == [("lead", ""), ("coder", "a1"), ("reviewer", "a1")]
+    review_task = provider.requests[2].messages[1].content
+    assert review_task.startswith(
+        "Review the coder's work on this goal:\n\nfix calc.py"
+    )
+    msg = next(m for m in provider.requests[3].messages if m.role == "tool")
+    assert msg.is_error  # not approved
+    assert json.loads(msg.content.splitlines()[0])["status"] == "failed"
+    assert "reviewer result a3:\nVERDICT: CHANGES" in msg.content
+
+
+def test_a_run_without_a_reviewer_may_not_start_a_coder(tmp_path: Path) -> None:
+    run, provider, _ = make_run(
+        tmp_path, [calls(call("delegate", role="coder", goal="x")), text("ok")]
+    )
+    run.roles["coder"] = CODER
+    run.run_agent(LEAD, Task("x"))
+    out = tool_results(provider, 1)[0]
+    assert "coder changes files, so the run needs a reviewer to check it" in out
+    assert len(provider.requests) == 2  # the coder never ran
 
 
 @pytest.mark.parametrize(
@@ -220,21 +257,20 @@ def test_children_spend_the_leads_budget(tmp_path: Path) -> None:
         [
             calls(call("delegate", role="coder", goal="x")),  # lead turn 1
             calls(call("write", path="f", content="1")),  # coder turn 1
-            text("done"),  # coder turn 2; the run has used 3 of 4
-            calls(call("delegate", role="reviewer", goal="y")),  # lead turn 2: 4 of 4
+            text("done"),  # coder turn 2; the run has used 3 of 3
             text("never sent"),
         ],
-        budget=Budget(turns=4),
+        budget=Budget(turns=3),
     )
     result = lead(run, "x", fetch=FETCH)
     assert result.status == "budget"
     assert "workflow turns" in result.summary
-    assert len(provider.requests) == 4
+    assert len(provider.requests) == 3
     last = [
         e.data["text"] for e in events if e.kind == "tool_result" and e.agent_id == "a1"
     ][-1]
-    assert "workflow budget exhausted" in last  # the reviewer never started
-    assert run.used.turns == 4
+    assert "workflow budget exhausted" in last  # the review never started
+    assert run.used.turns == 3
 
 
 def test_children_spend_the_leads_tool_calls_mid_turn(tmp_path: Path) -> None:
@@ -247,7 +283,8 @@ def test_children_spend_the_leads_tool_calls_mid_turn(tmp_path: Path) -> None:
                 *[call("list", path=f"d{i}") for i in range(5)],
             ),
             calls(*[call("write", path=f"f{i}", content="1") for i in range(3)]),
-            text("done"),  # the coder used 3; delegate makes it 4 of 4
+            text("done"),  # the coder used 3
+            text("VERDICT: APPROVE"),  # the review; delegate makes it 4 of 4
             text("never sent"),
         ],
         budget=Budget(tool_calls=4),
@@ -256,7 +293,7 @@ def test_children_spend_the_leads_tool_calls_mid_turn(tmp_path: Path) -> None:
     assert result.status == "budget"
     assert "workflow tool_calls" in result.summary
     assert run.used.tool_calls == 4
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 4
 
 
 def test_gate_asks_about_goals_from_a_tainted_lead(tmp_path: Path) -> None:
@@ -324,11 +361,17 @@ def test_untrusted_child_taints_later_siblings(tmp_path: Path) -> None:
 def test_trusted_lead_children_stay_trusted(tmp_path: Path) -> None:
     run, _, events = make_run(
         tmp_path,
-        [calls(call("delegate", role="coder", goal="x")), text("fixed"), text("done")],
+        [
+            calls(call("delegate", role="coder", goal="x")),
+            text("fixed"),
+            text("VERDICT: APPROVE"),
+            text("done"),
+        ],
     )
     lead(run, "x", fetch=FETCH)
     assert {e.agent_id: e.data["untrusted"] for e in events if e.kind == "result"} == {
         "a2": False,
+        "a3": False,
         "a1": False,
     }
 
@@ -346,6 +389,7 @@ def test_cli_lead(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         [
             calls(call("delegate", role="coder", goal="x")),
             text("fixed"),
+            text("VERDICT: APPROVE"),
             text("all done"),
         ]
     )
@@ -379,6 +423,7 @@ RESEARCH_THEN_CODE = [
     calls(call("delegate", role="coder", goal="fix it", inputs=["a2"])),
     calls(call("write", path="f", content="1")),
     text("fixed"),
+    text("VERDICT: APPROVE"),
     text("done"),
 ]
 

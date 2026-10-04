@@ -95,15 +95,12 @@ docs:
 diagrams:
 	@for f in docs/media/*.d2; do d2 --layout=tala "$$f" "$${f%.d2}.svg" || exit 1; done
 
-# Create a release (bump version, tag, push)
+# Bump the version in pyproject.toml; committing and tagging are left to you
 release:
 	@echo "Current version: $$(grep '^version' pyproject.toml | head -1)"
 	@read -p "New version: " version; \
 	sed "s/^version = .*/version = \"$$version\"/" pyproject.toml > pyproject.toml.tmp && mv pyproject.toml.tmp pyproject.toml; \
-	git add pyproject.toml; \
-	git commit -m "Bump version to $$version"; \
-	git tag -a "v$$version" -m "Release $$version"; \
-	echo "Tagged v$$version. Run 'git push && git push --tags' to publish."
+	echo "Set $$version. Review, commit and tag v$$version yourself."
 
 # Clean build artifacts
 clean:
@@ -145,7 +142,7 @@ help:
 	@echo "  coverage-html - Generate HTML coverage report"
 	@echo "  docs         - Build documentation with Sphinx"
 	@echo "  diagrams     - Regenerate docs/media/*.svg from .d2 sources (d2, TALA)"
-	@echo "  release      - Bump version, tag, and prepare release"
+	@echo "  release      - Bump the version in pyproject.toml"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  distclean    - Remove all generated files"
 	@echo "  help         - Show this help message"

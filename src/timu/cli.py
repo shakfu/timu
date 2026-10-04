@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -123,6 +124,17 @@ def trace_dir(env: dict[str, str] | os._Environ[str] = os.environ) -> Path:
     return Path(base) / "timu" / "runs"
 
 
+def usd(v: str) -> float:
+    """A positive, finite amount; nan would disable the limit."""
+    try:
+        x = float(v)
+    except ValueError:
+        x = math.nan
+    if not math.isfinite(x) or x <= 0:
+        raise argparse.ArgumentTypeError(f"{v!r} is not a positive amount")
+    return x
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="timu", description="A team of specialised agents."
@@ -141,9 +153,7 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         help="default: ~/.config/timu/timu.toml. A workspace timu.toml is not read",
     )
-    common.add_argument(
-        "--max-cost", type=float, help="stop the run at this cost in USD"
-    )
+    common.add_argument("--max-cost", type=usd, help="stop the run at this cost in USD")
     common.add_argument(
         "--unsafe-no-sandbox",
         action="store_true",
@@ -306,6 +316,8 @@ def _load(
         if provider_for is None:
             for name in roles:
                 config.provider(name)
+            if "researcher" in roles:
+                config.search_tool()  # a bad key file fails here, not mid-run
             provider_for = lambda role: config.provider(role.name)
     except ConfigError as e:
         err.write(f"timu: {e}\n")

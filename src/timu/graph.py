@@ -615,7 +615,7 @@ def _run_node(
         base, dirty = provision(src, ws, ref, branch)
     except GraphError as e:
         return NodeResult("failed", str(e))
-    files = work / "files"
+    files = work / "_files"  # no node id starts with _
     reads = tuple(sorted({files / d for d in node.needs if (files / d).is_dir()}))
     run = session.at(ws, node=node.id, budget=node.budget, reads=reads)
     run.emit("node", repo=node.repo, project=str(project), workflow=node.workflow)

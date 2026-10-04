@@ -31,6 +31,7 @@ classes: {
 
 cli: "timu CLI" {
   run: "timu run"
+  graph: "timu graph run\nworkflows across projects"
   trace: "timu trace"
 }
 
@@ -39,12 +40,14 @@ config: "timu.toml\nmodel, keys, skills,\nsandbox extra_read" {
 }
 
 workflows: "Workflows" {
-  fix: "fix-review\ncoder then reviewer,\nuntil VERDICT: APPROVE"
+  fix: "fix-review\ncoder, then reviewer"
   research: "research-fix-review\nresearcher, then fix-review"
+  rvf: "review-validate-fix\nreviewer, validator,\ncoder, verifier"
+  checks: "commands, check-fix-review\ngraph only; fixed commands"
   lead: "lead\na lead delegates\nto the others"
 }
 
-run: "Run\nshared live budget\napproval gate\ntaint tracking\nresults by agent id" {
+run: "Run\nshared live budget\napproval gate\ntaint tracking\nresults by agent id\nreviews every coder run" {
   class: guard
 }
 
@@ -52,7 +55,7 @@ roles: "Roles (data, not subclasses)" {
   lead: "lead\nfs.read" {class: role}
   researcher: "researcher\nnet" {class: role}
   coder: "coder\nfs.read, fs.write, exec" {class: role}
-  reviewer: "reviewer\nfs.read, exec" {class: role}
+  reviewer: "reviewer, validator,\nverifier\nfs.read, exec" {class: role}
 }
 
 agent: "Agent loop\ncall the model, run its tools,\nrepeat until an answer or a limit"
@@ -67,7 +70,7 @@ tools: "Tools (each needs a capability)" {
   delegate: "delegate\n(results passed by id)" {class: tool}
 }
 
-sandbox: "sandbox-exec\nno network, writes only to\nwrite roots, home dir hidden" {
+sandbox: "sandbox-exec or bwrap\nno network, writes only to\nwrite roots, home dir hidden" {
   class: guard
 }
 
@@ -99,6 +102,7 @@ observe: "Observability" {
 
 cli.run -> config: reads
 cli.run -> workflows: starts
+cli.graph -> workflows: "one per node"
 workflows -> run: one per run
 run -> agent: "builds one per task:\nrole + remaining budget"
 roles -> agent: "prompt, tools, grants"

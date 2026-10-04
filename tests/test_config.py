@@ -95,6 +95,13 @@ def test_keyless_server() -> None:
         ("provider = 1\n", "provider must be a table"),
         ("[roles]\nreviewer = 'x'\n", "reviewer must be a table"),
         ("[provider\n", "timu.toml"),
+        ("[provider]\nmodle = 'x'\n", "provider: unknown keys: modle"),
+        ("[project]\nroots = []\n", "unknown keys: project"),
+        ("[search]\nkey = 'k'\n", "search: unknown keys: key"),
+        ("[roles.reviewr]\nmodel = 'x'\n", "unknown role reviewr; roles: coder,"),
+        ("[roles.reviewer]\nmodle = 'x'\n", "roles.reviewer: unknown keys: modle"),
+        ("[provider]\ntimeout = 0\n", "timeout must be positive"),
+        ("[provider]\ntimeout = -5\n", "timeout must be positive"),
     ],
 )
 def test_invalid(tmp_path: Path, text: str, message: str) -> None:
@@ -144,3 +151,52 @@ def test_explicit_config_is_trusted(tmp_path: Path) -> None:
     text = '[provider]\nbase_url = "http://h/v1"\n[sandbox]\nextra_read = ["/opt"]\n'
     config = load_config(write(tmp_path, text), env={})
     assert config.base_url == "http://h/v1"
+
+
+def key_file(tmp_path: Path, text: str = "sk-file\n", mode: int = 0o600) -> Path:
+    path = tmp_path / "openrouter.key"
+    path.write_text(text)
+    path.chmod(mode)
+    return path
+
+
+def test_key_file_wins_over_the_environment(tmp_path: Path) -> None:
+    key = key_file(tmp_path)
+    config = load_config(
+        write(tmp_path, f'[provider]\nmodel = "m"\napi_key_file = "{key}"\n'), env={}
+    )
+    assert config.api_key_file == key
+    provider = config.provider("coder", env={"OPENROUTER_API_KEY": "sk-env"})
+    assert provider._key == "sk-file"
+
+
+@pytest.mark.parametrize(
+    ("text", "mode", "message"),
+    [
+        ("sk\n", 0o644, "open to other users; run chmod 600"),
+        ("  \n", 0o600, "is empty"),
+    ],
+)
+def test_bad_key_files(tmp_path: Path, text: str, mode: int, message: str) -> None:
+    config = Config(model="m", api_key_file=key_file(tmp_path, text, mode))
+    with pytest.raises(ConfigError, match=message):
+        config.provider("coder", env={})
+
+
+def test_missing_key_file(tmp_path: Path) -> None:
+    config = Config(model="m", api_key_file=tmp_path / "none.key")
+    with pytest.raises(ConfigError, match="cannot read key file"):
+        config.provider("coder", env={})
+
+
+def test_search_key_file(tmp_path: Path) -> None:
+    key = key_file(tmp_path, "brave-1\n")
+    config = load_config(write(tmp_path, f'[search]\napi_key_file = "{key}"\n'), env={})
+    assert config.search_tool(env={}) is not None
+    with pytest.raises(ConfigError, match="open to other users"):
+        Config(search_key_file=key_file(tmp_path, mode=0o640)).search_tool(env={})
+
+
+def test_key_file_path_expands_home(tmp_path: Path) -> None:
+    config = load_config(write(tmp_path, '[provider]\napi_key_file = "~/k"\n'), env={})
+    assert config.api_key_file == Path.home() / "k"

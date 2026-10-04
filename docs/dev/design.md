@@ -1,6 +1,6 @@
 # timu design
 
-Status: draft, 2026-09-25. Nothing here is implemented yet.
+Status: implemented, except where section 15 lists an open question. CHANGELOG records what was built and when.
 
 timu runs a team of specialised agents toward one objective. Each agent has a role. A role fixes the agent's system prompt, tools, skills and capabilities. A workflow decides which agents run, in what order, and what passes between them.
 
@@ -230,6 +230,8 @@ The coder's shell has no network access, so dependency installs (`uv sync`, `pip
 
 6. `REVIEWER` and `REVIEWER_WRITE` differ only in `write`, `fs.write`, the report write root and the prompt's final instruction.
 
+Workflows hold one more invariant: every run of a role that can write the workspace is followed by a check. Pipelines run a reviewer or verifier after the coder. A lead's delegation to such a role runs the reviewer itself (`Run._check`), so the check does not depend on the lead's prompt. `test_workflow_roles_cover_the_roles_it_starts` checks it for every built-in workflow.
+
 ## 5. Hand-offs
 
 Agents do not share message history. Each agent starts with its role prompt and its Task. Only the Result goes back to the caller.
@@ -363,7 +365,7 @@ A role names its skills; each must exist when the agent is built. A role with sk
 
 ## 12. Dependencies
 
-The package has no runtime dependencies today, and `tests/test_timu.py::test_has_no_runtime_dependencies` checks this. Everything above works with the standard library except web search, which needs a search API reached over `urllib`. Which search API to use is an open question.
+The package has no runtime dependencies today, and `tests/test_package.py::test_has_no_runtime_dependencies` checks this. Everything above works with the standard library except web search, which needs a search API reached over `urllib`. Which search API to use is an open question.
 
 ## 13. Testing
 

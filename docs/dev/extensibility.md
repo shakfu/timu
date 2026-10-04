@@ -1,6 +1,6 @@
 # Extensibility
 
-Status: proposal. It answers design 15.4 ("Should roles live in Python, or in files that users can add without code?") and extends it to workflows and tools.
+Status: partly built; each section says whether it is done. It answers design 15.4 ("Should roles live in Python, or in files that users can add without code?") and extends it to workflows and tools.
 
 ## 1. Current state
 
@@ -106,7 +106,7 @@ class Options:
     params: Mapping[str, Any]   # keyword arguments for the workflow
 ```
 
-Done; see CHANGELOG, Unreleased. `WORKFLOWS: dict[str, Workflow]` in `workflow.py` holds the built-ins. `cli.py` builds `--workflow` choices, the provider check and the gate default from it. `--review-to-fix`, `--verify-to-fix`, `--report` and `--report-mode` fill `params`; a workflow gets only the params it declares. `Options` carries the role skills, not the whole `Config`: no workflow reads anything else from it. `-p key=value` is not built; graph nodes will set `params` from the graph file (`graph.md` 4.1).
+Done; see CHANGELOG, Unreleased. `WORKFLOWS: dict[str, Workflow]` in `workflow.py` holds the built-ins. `cli.py` builds `--workflow` choices, the provider check and the gate default from it. `--review-to-fix`, `--verify-to-fix`, `--report` and `--report-mode` fill `params`; a workflow gets only the params it declares. `Options` carries the role skills, not the whole `Config`: no workflow reads anything else from it. `-p key=value` is not built; graph nodes set `params` from the graph file (`graph.md` 4.1).
 
 ### 5.2 Adding a workflow
 

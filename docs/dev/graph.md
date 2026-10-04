@@ -228,7 +228,7 @@ Replaces the `builder` role, the `installer` role and `bump-dep` above. Built in
 
 - **`commands` workflow.** Runs a list of commands from the graph file in the node's copy, in the sandbox, with no model. `network = true` turns network on. Each command has its own timeout. A command that exits non-zero fails the node, and its output tail becomes the node's `log` result.
 - **`check-fix-review` workflow.** Runs `check` commands. If they pass, the node is done. If not, it runs `fix_review` with the failure log as an input, then runs the checks again. A failing re-check goes back to `fix_review` at most `check_to_fix` times (default 0). The coder still has no network. Only the first check run has network, if the node asks for it. Later runs execute code the coder wrote, so they run offline and reuse what the first run fetched into the copy.
-- **File outputs.** `file:GLOB` must match exactly one file in the copy. The engine copies it to `work/<run id>/files/<node>/` and the output's value is that path. A dependent's sandbox gets read access to that directory.
+- **File outputs.** `file:GLOB` must match exactly one file in the copy. The engine copies it to `work/<run id>/_files/<node>/` and the output's value is that path. A dependent's sandbox gets read access to that directory.
 - **Substitution into commands.** `${node.output}` may appear anywhere in a command, for a declared output of a node in `needs`. At run time the value must be a file output's path or a version-like token (`[A-Za-z0-9][A-Za-z0-9._+!~-]*`), or the node fails. The value is shell-quoted. `${NAME}` without a dot is shell syntax and is left alone.
 
 The validate graph for the reference case:
@@ -266,7 +266,7 @@ Risk that remains: `wheel` and `app` run code `lib`'s coder wrote, such as a cha
 1. Session/Run split and the workflow registry. No behaviour change; existing tests pass unchanged. Done; see CHANGELOG, Unreleased.
 2. Graph file, projects roots and local projects only (7.1), sequential scheduler, extractors, node results, node budgets, skip-on-fail, one trace. Done; see CHANGELOG, Unreleased. The example in section 4 uses `bump-dep`, which 7.7 replaces; 7.7 has a runnable example.
 3. Commits in the copy, branch hand-back, and several nodes on one project (7.2.1). Done; see CHANGELOG, Unreleased.
-4. `commands` and `check-fix-review` workflows, and file outputs (7.7). Done; see CHANGELOG, Unreleased. The Linux `bwrap` backend is built too (`docs/dev/bwrap.md`). Command steps with network need a sandbox with network on. Only the macOS backend exists; on Linux they need `bwrap` (TODO.md) or `--unsafe-no-sandbox`.
+4. `commands` and `check-fix-review` workflows, and file outputs (7.7). Done; see CHANGELOG, Unreleased. The Linux `bwrap` backend is built too (`docs/dev/bwrap.md`). Command steps with network need a sandbox with network on: `sandbox-exec` on macOS, `bwrap` on Linux, or `--unsafe-no-sandbox`.
 5. GitHub clones for projects with no local copy (7.2).
 6. Effect nodes behind `--allow-effects`.
 7. Parallel scheduling. `--resume <run id>` skips nodes whose spec and input values hash to a previous `done` result.

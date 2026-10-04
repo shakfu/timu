@@ -91,6 +91,7 @@ class Agent:
         start = self._clock()
         last_text = ""
         streak: tuple[str, int] = ("", 0)  # signature of the last call, times in a row
+        retried = False  # an unusable final answer gets one more try
         self._emit("start", goal=task.goal)
         if isinstance(ctx.sandbox, NoSandbox):
             self._emit("warning", message="shell commands run without a sandbox")
@@ -145,7 +146,22 @@ class Agent:
                     "failed", with_last("reply hit the length limit", last_text)
                 )
             if not reply.tool_calls:
-                return finish("done", reply.text)
+                problem = unusable(reply.text, task)
+                if problem is None:
+                    return finish("done", reply.text)
+                if retried:
+                    return finish("failed", f"unusable final answer: {problem}")
+                retried = True
+                self._emit("warning", message=f"asked again: {problem}")
+                messages += [
+                    Message("assistant", reply.text, extra=reply.extra),
+                    Message(
+                        "user",
+                        f"Your final answer cannot be used: {problem}. "
+                        "Reply again with the complete final answer.",
+                    ),
+                ]
+                continue
 
             tool_calls = tuple(
                 c if c.id else replace(c, id=f"call_{usage.turns}_{i}")
@@ -219,6 +235,13 @@ class Agent:
                 kind, self.agent_id, self.parent_id, self.role.name, time.time(), data
             )
         )
+
+
+def unusable(text: str, task: Task) -> str | None:
+    """Why text cannot be task's final answer, or None."""
+    if not text.strip():
+        return "it is empty"
+    return task.check(text) if task.check else None
 
 
 def render_task(task: Task, nonce: str | None = None) -> str:

@@ -1,6 +1,6 @@
 # timu implementation plan
 
-Status: draft, 2026-09-25. Implements `docs/dev/design.md`; section numbers below ("design 3") refer to it.
+Status: historical. This was the build plan for 0.1 and 0.2; CHANGELOG records what was built. Some details below no longer hold: for example, timu no longer reads `./timu.toml`, and the Linux `bwrap` backend exists. Section numbers below ("design 3") refer to `docs/dev/design.md`.
 
 ## Scope
 

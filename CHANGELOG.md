@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- `[provider] api_key_file` and `[search] api_key_file` read a key from a file instead of the environment. On macOS, a sandboxed command can read the environment of the user's processes, keys included. It cannot read files under `$HOME`. timu refuses a key file that other users can read.
+
 - timu no longer reads `./timu.toml`. Config comes only from the user file, `--config` and the environment. The file could still set models, `extra_body` and `[roles]`. On OpenRouter the model id picks the vendor that receives your code, and `extra_body` can change provider routing, so a cloned repo could choose where your code went. The file was also read from the current directory, not from `-C`. The coder could write `timu.toml` in a subdirectory, and a later run started there would load it.
 
 - The Linux sandbox hides `/run`, `/tmp` and `/var/tmp` behind empty tmpfs mounts. A new network namespace does not isolate Unix sockets bound to a path, and a read-only mount does not stop `connect()`. So a command could reach the session D-Bus, ssh-agent, gpg-agent or `docker.sock`, and through them run code outside the sandbox. With network on, the sandbox keeps `/etc/resolv.conf` when it points into `/run`.
@@ -30,23 +32,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Linux sandbox backend with `bwrap`. It denies network access, hides `$HOME` behind an empty tmpfs, and mounts the filesystem read-only except the role's write roots. It keeps `.git`, `timu.toml` and `.timu` at each write root read-only. timu probes `bwrap` at startup and, where it cannot run, says why. Unlike the macOS profile, it cannot block a path that does not exist yet. So a command may create a new `.git`, `timu.toml` or `.timu`, but may not change existing ones.
 
-- `review-validate-fix` workflow: a reviewer reports findings as JSON, a validator confirms or rejects each, the coder fixes the confirmed ones most severe first, and a verifier checks each fix. Each step is its own role, so `[roles.validator]` and `[roles.verifier]` can set a model. A missing or malformed JSON block fails the run.
+- `review-validate-fix` workflow: a reviewer reports findings as JSON, a validator confirms or rejects each, the coder fixes the confirmed ones most severe first, and a verifier checks each fix. Each step is its own role, so `[roles.validator]` and `[roles.verifier]` can set a model. An agent whose JSON block is missing or malformed is told what is wrong and gets one more try; a second bad block fails the run.
 
   ```sh
   timu run --workflow review-validate-fix --verify-to-fix 1 "review src/ for correctness"
   ```
 
+- CI (`.github/workflows/ci.yml`) runs the tests on Ubuntu and macOS, on CPython 3.11-3.14 and PyPy 3.11. On Ubuntu, it lifts the user-namespace restriction so the bwrap tests run instead of skipping.
+
 ### Changed
 
 - No workflow step repeats unless asked. A loop is a back-edge with its own limit, default 0: `review_to_fix` (`--review-to-fix`) for fix-review, and `check_to_fix` for check-fix-review. They replace `max_rounds` and `--max-rounds`, which defaulted to 3. check-fix-review passed its `max_rounds` to the inner fix-review too, so the default allowed up to 9 coder runs.
 
+- In `lead`, delegating to the coder also runs the reviewer on its work, and the lead gets both results. The result is done only on `VERDICT: APPROVE`. Before, only the lead's prompt asked it to request a review, so a lead could finish with unreviewed changes. Every workflow now checks every fix in code. With `--approve-untrusted`, a lead that has read web content now gets one more prompt per coder task, for the review goal.
+
+- An agent whose final answer is empty, or fails its task's check, is told why and gets one more try. A second unusable answer fails it. `review-validate-fix` checks each JSON block this way. In live runs on a local 9B model, the lead and the validator each ended once with an empty reply, which passed as done.
+
 - `timu run` passes a workflow only the flags it declares. Setting one it does not declare, such as `--report` with `lead`, is a usage error.
+
+- `timu.__version__` comes from the installed package metadata, so `pyproject.toml` is the one place that sets it. `make release` only bumps that version; it no longer runs `git add` or `git commit`.
 
 - Workflows are registered in `WORKFLOWS` (`workflow.py`). The CLI takes its `--workflow` choices, provider checks and approval default from there, not from three hardcoded lists.
 
 - A `Session` holds what the agents of one invocation share: budget, run id, sink, cancel flag and approvals. `Run` binds it to one workdir, and `Run.at(path)` gives another `Run` in the same session. This is phase 1 of `docs/dev/graph.md`.
 
 ### Fixed
+
+- `timu.toml` rejects unknown tables, keys and role names, and a `timeout` that is not positive. Before, a typo such as `[roles.reviewr]` was ignored, and that role ran on the default model.
+
+- `--max-cost` rejects `nan`, `inf`, zero and negative amounts as usage errors. `nan` passed every budget check, so the run had no spending limit.
+
+- A graph node named `files` no longer collides with the directory for file outputs. That directory is now `_files`, which no node id can name.
 
 - An agent stops a turn's remaining tool calls once the workflow's tool-call limit is spent. Before, it checked only its own count, so a lead whose child spent the limit kept calling tools.
 

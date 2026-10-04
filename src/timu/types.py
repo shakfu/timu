@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -102,6 +103,8 @@ class Task:
     inputs: tuple[Artifact, ...] = ()
     accept: str = ""
     budget: Budget | None = None
+    # Why a final answer cannot be used, or None. The agent gets one more try.
+    check: Callable[[str], str | None] | None = None
 
 
 Status = Literal["done", "failed", "budget", "refused", "cancelled"]

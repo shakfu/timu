@@ -3,6 +3,7 @@
     [provider]
     base_url = "https://openrouter.ai/api/v1"
     api_key_env = "OPENROUTER_API_KEY"   # "" for a local server without a key
+    api_key_file = "~/.config/timu/openrouter.key"   # optional; wins over api_key_env
     model = "<model id>"
     timeout = 600                        # seconds, optional
     extra_body = { cache_control = { type = "ephemeral" } }   # optional
@@ -13,6 +14,7 @@
 
     [search]
     api_key_env = "BRAVE_API_KEY"        # Brave Search; the default (plan D3)
+    api_key_file = "~/.config/timu/brave.key"        # optional; wins over api_key_env
 
     [sandbox]
     extra_read = ["~/.local/share/uv"]   # toolchains under $HOME (interim, design 15.8)
@@ -24,18 +26,23 @@ The user file is $XDG_CONFIG_HOME/timu/timu.toml (default ~/.config/timu/timu.to
 or the file passed with --config. A workspace timu.toml is never read: models, roles
 and request settings are the user's choice, not the repo's. TIMU_BASE_URL and
 TIMU_MODEL override the file.
+
+A sandboxed command can read the environment of the user's processes on macOS
+(sandbox.py), but not files under $HOME. A key file there, mode 600, keeps the key
+from commands; a key in the environment does not.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from timu.provider.openai import OpenAIProvider
+from timu.roles import ROLE_NAMES
 from timu.tool import Tool
 from timu.tools.web import web_search_tool
 
@@ -51,6 +58,7 @@ class ConfigError(ValueError):
 class Config:
     base_url: str = DEFAULT_BASE_URL
     api_key_env: str = DEFAULT_KEY_ENV
+    api_key_file: Path | None = None
     model: str = ""
     timeout: float = 600
     extra_body: Mapping[str, Any] = field(default_factory=dict)
@@ -59,6 +67,7 @@ class Config:
     extra_read: tuple[Path, ...] = ()
     project_roots: tuple[Path, ...] = ()
     search_key_env: str = "BRAVE_API_KEY"
+    search_key_file: Path | None = None
     source: str = "defaults"  # the file and env overrides read
 
     def model_for(self, role: str) -> str:
@@ -74,7 +83,9 @@ class Config:
                 f"{self.source}: no model; set provider.model or TIMU_MODEL"
             )
         key = ""
-        if self.api_key_env:
+        if self.api_key_file:
+            key = read_key(self.api_key_file)
+        elif self.api_key_env:
             key = env.get(self.api_key_env, "")
             if not key:
                 raise ConfigError(
@@ -86,9 +97,27 @@ class Config:
         )
 
     def search_tool(self, env: Mapping[str, str] = os.environ) -> Tool | None:
-        """web_search if its key is set, else None."""
+        """web_search if its key is set, else None. Raises ConfigError for a bad key
+        file."""
+        if self.search_key_file:
+            return web_search_tool(read_key(self.search_key_file))
         key = env.get(self.search_key_env, "") if self.search_key_env else ""
         return web_search_tool(key) if key else None
+
+
+def read_key(path: Path) -> str:
+    """The key in path. Raises ConfigError if path is unreadable, empty, or open to
+    other users."""
+    try:
+        mode = path.stat().st_mode
+        key = path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        raise ConfigError(f"cannot read key file: {e}") from None
+    if mode & 0o077:
+        raise ConfigError(f"{path} is open to other users; run chmod 600 {path}")
+    if not key:
+        raise ConfigError(f"{path} is empty")
+    return key
 
 
 def user_config_path(env: Mapping[str, str] = os.environ) -> Path | None:
@@ -106,13 +135,27 @@ def load_config(
     """Read path, else the user file. Then apply env overrides. Raises ConfigError."""
     path = path or user_config_path(env)
     raw, src = (_read(path), str(path)) if path else ({}, "defaults")
+    _only(raw, KEYS, src)
     prov = _table(raw, "provider", src)
     roles = _table(raw, "roles", src)
+    for table, keys in KEYS.items():
+        if table != "roles":
+            _only(_table(raw, table, src), keys, f"{src}: {table}")
+    for name in roles:
+        if name not in ROLE_NAMES:
+            raise ConfigError(
+                f"{src}: unknown role {name}; roles: {', '.join(ROLE_NAMES)}"
+            )
+        _only(_table(roles, name, src), KEYS["roles"], f"{src}: roles.{name}")
+    timeout = float(_get(prov, "timeout", (int, float), 600, src))
+    if timeout <= 0:
+        raise ConfigError(f"{src}: timeout must be positive")
     config = Config(
         base_url=_get(prov, "base_url", str, DEFAULT_BASE_URL, src),
         api_key_env=_get(prov, "api_key_env", str, DEFAULT_KEY_ENV, src),
+        api_key_file=_path(prov, "api_key_file", src),
         model=_get(prov, "model", str, "", src),
-        timeout=float(_get(prov, "timeout", (int, float), 600, src)),
+        timeout=timeout,
         extra_body=_table(prov, "extra_body", src),
         role_models={
             name: _get(_table(roles, name, src), "model", str, "", src)
@@ -132,6 +175,7 @@ def load_config(
         search_key_env=_get(
             _table(raw, "search", src), "api_key_env", str, "BRAVE_API_KEY", src
         ),
+        search_key_file=_path(_table(raw, "search", src), "api_key_file", src),
         source=src,
     )
     if url := env.get("TIMU_BASE_URL"):
@@ -141,6 +185,28 @@ def load_config(
     if model := env.get("TIMU_MODEL"):
         config = replace(config, model=model, source=f"{config.source} + TIMU_MODEL")
     return config
+
+
+# The keys of each table; for roles, the keys of each [roles.<name>].
+KEYS = {
+    "provider": {
+        "base_url",
+        "api_key_env",
+        "api_key_file",
+        "model",
+        "timeout",
+        "extra_body",
+    },
+    "roles": {"model", "skills"},
+    "search": {"api_key_env", "api_key_file"},
+    "sandbox": {"extra_read"},
+    "projects": {"roots"},
+}
+
+
+def _only(t: Mapping[str, Any], allowed: Iterable[str], where: str) -> None:
+    if extra := sorted(set(t) - set(allowed)):
+        raise ConfigError(f"{where}: unknown keys: {', '.join(extra)}")
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -162,6 +228,11 @@ def _strings(raw: Mapping[str, Any], key: str, src: str) -> tuple[str, ...]:
     if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
         raise ConfigError(f"{src}: {key} must be a list of strings")
     return tuple(v)
+
+
+def _path(raw: Mapping[str, Any], key: str, src: str) -> Path | None:
+    v = _get(raw, key, str, "", src)
+    return Path(os.path.expanduser(v)) if v else None
 
 
 def _get(raw: Mapping[str, Any], key: str, kind: Any, default: Any, src: str) -> Any:

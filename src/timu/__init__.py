@@ -1,5 +1,7 @@
 """timu - a team of specialised LLM agents. See docs/dev/design.md."""
 
+from importlib.metadata import version
+
 from timu.agent import Agent
 from timu.events import Event, EventSink, JsonlSink
 from timu.role import Role, RoleError
@@ -24,4 +26,4 @@ __all__ = [
     "ToolOutput",
     "Usage",
 ]
-__version__ = "0.2.0"
+__version__ = version("timu")  # pyproject.toml is the one source

@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,6 +39,7 @@ from timu.tools.shell import run_sh, scrubbed_env
 from timu.tools.web import WEB_FETCH
 from timu.types import Artifact, Budget, Capability, Origin, Result, Status, Task, Usage
 
+CHECKER = "reviewer"  # the role a lead's delegation runs after any role that writes
 WORKFLOW_BUDGET = Budget(turns=200, tool_calls=400, tokens=2_000_000, wall_seconds=3600)
 URL = re.compile(r"https?://[^\s<>()\[\]\"']+")
 VERDICT = re.compile(
@@ -252,6 +254,12 @@ class Run:
                 )
             if name not in self.roles:
                 raise DelegateError(f"role {name} is not available in this run")
+            target = self.roles[name]
+            writes = Capability.FS_WRITE in target.grants and name != CHECKER
+            if writes and CHECKER not in self.roles:
+                raise DelegateError(
+                    f"{name} changes files, so the run needs a {CHECKER} to check it"
+                )
             inputs = []
             for i in input_ids:
                 if i not in self.results:
@@ -266,9 +274,39 @@ class Run:
                     )
                 )
             task = Task(goal, tuple(inputs), accept)
-            return self.run_agent(self.roles[name], task, agent_id, depth + 1)
+            result = self.run_agent(target, task, agent_id, depth + 1)
+            if not writes or result.status != "done":
+                return result
+            return self._check(name, goal, result, agent_id, depth)
 
         return delegate
+
+    def _check(
+        self, name: str, goal: str, coded: Result, parent_id: str, depth: int
+    ) -> Result:
+        """Review the work of a role that changed files: every fix is checked. Done
+        only on APPROVE; the summary holds both results and their ids."""
+        work = Artifact(
+            "coder-summary",
+            coded.summary,
+            "text",
+            Origin.AGENT,
+            coded.trace_id,
+            coded.untrusted,
+        )
+        task = Task(f"Review the {name}'s work on this goal:\n\n{goal}", (work,))
+        reviewed = self.run_agent(self.roles[CHECKER], task, parent_id, depth + 1)
+        status = reviewed.status
+        if status == "done" and verdict(reviewed.summary) != "APPROVE":
+            status = "failed"
+        return replace(
+            reviewed,
+            status=status,
+            summary=f"{name} result {coded.trace_id}:\n{coded.summary}\n\n"
+            f"{CHECKER} result {reviewed.trace_id}:\n{reviewed.summary}",
+            usage=coded.usage + reviewed.usage,
+            untrusted=coded.untrusted or reviewed.untrusted,
+        )
 
     def _gate(
         self, role: Role, task: Task, inherited: bool, parent_id: str
@@ -625,6 +663,8 @@ def check_fix_review(
 
 SEVERITY = ("critical", "high", "medium", "low")
 FINDING_FIELDS = ("id", "severity", "location", "claim", "evidence")
+VALIDATIONS = ("confirmed", "rejected")
+VERIFICATIONS = ("fixed", "unfixed")
 JSON_BLOCK = re.compile(r"```json[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
 
 
@@ -692,6 +732,19 @@ def parse_verdicts(
     if set(verdicts) != set(ids):
         raise ProtocolError(f"need one verdict for each of {', '.join(ids)}")
     return verdicts
+
+
+def protocol(parse: Callable[[str], object]) -> Callable[[str], str | None]:
+    """A Task.check that names what parse rejects, so the agent can try again."""
+
+    def check(text: str) -> str | None:
+        try:
+            parse(text)
+        except ProtocolError as e:
+            return f"{e}; end with the json block your instructions describe"
+        return None
+
+    return check
 
 
 def render_findings(
@@ -764,7 +817,9 @@ def review_validate_fix(
             tainted(),
         )
 
-    reviewed = step("review", finder, Task(objective, inputs))
+    reviewed = step(
+        "review", finder, Task(objective, inputs, check=protocol(parse_findings))
+    )
     if reviewed.status != "done":
         return done(reviewed.status, f"reviewer stopped: {reviewed.summary}")
     try:
@@ -774,20 +829,20 @@ def review_validate_fix(
     if not findings:
         return done("done", "no findings")
 
+    ids = [f.id for f in findings]
     validated = step(
         "validate",
         validator,
         Task(
             f"Validate each finding of a review for this goal:\n\n{objective}",
             (given(findings, reviewed),),
+            check=protocol(partial(parse_verdicts, ids=ids, statuses=VALIDATIONS)),
         ),
     )
     if validated.status != "done":
         return done(validated.status, f"validator stopped: {validated.summary}")
     try:
-        verdicts = parse_verdicts(
-            validated.summary, [f.id for f in findings], ("confirmed", "rejected")
-        )
+        verdicts = parse_verdicts(validated.summary, ids, VALIDATIONS)
     except ProtocolError as e:
         return done("failed", f"the validation: {e}")
     for fid, v in verdicts.items():
@@ -823,12 +878,16 @@ def review_validate_fix(
             coded.trace_id,
             coded.untrusted,
         )
+        todo_ids = [f.id for f in todo]
         verified = step(
             "verify",
             verifier,
             Task(
                 "Check whether each finding in the findings input is fixed.",
                 (given(todo, coded), work),
+                check=protocol(
+                    partial(parse_verdicts, ids=todo_ids, statuses=VERIFICATIONS)
+                ),
             ),
             n,
         )
@@ -837,9 +896,7 @@ def review_validate_fix(
                 verified.status, f"verifier stopped in round {n}: {verified.summary}"
             )
         try:
-            checks = parse_verdicts(
-                verified.summary, [f.id for f in todo], ("fixed", "unfixed")
-            )
+            checks = parse_verdicts(verified.summary, todo_ids, VERIFICATIONS)
         except ProtocolError as e:
             return done("failed", f"the verification in round {n}: {e}")
         for fid, v in checks.items():

@@ -35,7 +35,7 @@ The built-in workflows for `timu run`, in `src/timu/workflow.py`:
 | `fix-review` (default) | pipeline | Coder, then reviewer. The report's first line is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. |
 | `research-fix-review` | pipeline | Researcher first. Its findings and source URLs go to the coder as untrusted inputs. Then `fix-review`. |
 | `review-validate-fix` | pipeline | Reviewer, validator, coder, verifier. The reviewer reports findings. The validator confirms or rejects each one. The coder fixes the confirmed ones, most severe first. The verifier checks each fix. `--verify-to-fix N` sends unfixed findings back to the coder up to N times. The report lists every finding with each step's verdict. |
-| `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Delegation depth is at most 2. |
+| `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Every coder result includes a review, which timu runs, not the lead. Delegation depth is at most 2. |
 
 No step repeats unless a loop flag asks for it. Each loop flag names one back-edge, such as review to fix, and caps how many times it is taken.
 
@@ -95,7 +95,7 @@ extra_read = ["~/.local/share/uv/python"]  # toolchains under $HOME
 
 timu does not read a `timu.toml` in the workspace or the current directory. Models, roles and request settings are yours to choose, not a cloned repo's. `--config PATH` replaces the user file. Each run prints the config it used, for example `config: ~/.config/timu/timu.toml + TIMU_MODEL`. Agents cannot write `timu.toml` or `.timu/` in the workspace.
 
-The API key comes from `OPENROUTER_API_KEY`, or the variable `api_key_env` names. `TIMU_MODEL` and `TIMU_BASE_URL` override the file. `src/timu/config.py` documents every key, including per-role models, skills and the search key.
+The API key comes from `OPENROUTER_API_KEY`, or the variable `api_key_env` names. Prefer `api_key_file = "~/.config/timu/openrouter.key"` with mode 600: on macOS a sandboxed command can read the environment of your processes, but not files under `$HOME`. `TIMU_MODEL` and `TIMU_BASE_URL` override the file. `src/timu/config.py` documents every key, including per-role models, skills and the search key.
 
 The sandbox hides `$HOME` from commands. List any toolchain that lives there, such as uv's Python, in `extra_read`, or commands that use it fail.
 

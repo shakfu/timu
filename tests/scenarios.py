@@ -48,6 +48,23 @@ SCENARIOS = {
         "https://docs.python.org/3/library/tomllib.html rather than relying on memory.",
         {"facts.py": 'def tomllib_added() -> str:\n    return "TODO"\n'},
     ),
+    # A bug the tests do not cover, so only the review can find it.
+    "review-validate-fix-stats": Scenario(
+        "review-validate-fix",
+        "Review stats.py for correctness bugs.",
+        {
+            "stats.py": (
+                "def mean(xs):\n    return sum(xs) / (len(xs) - 1)\n\n\n"
+                "def clamp(x, lo, hi):\n    return max(lo, min(x, hi))\n"
+            ),
+            "test_stats.py": (
+                "import unittest\nfrom stats import clamp\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_clamp(self):\n        self.assertEqual(clamp(5, 0, 3), 3)\n"
+            ),
+            "Makefile": "test:\n\tpython3 -m unittest -q\n",
+        },
+    ),
 }
 
 

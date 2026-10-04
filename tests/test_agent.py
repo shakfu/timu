@@ -316,3 +316,31 @@ def test_render_task() -> None:
         "Acceptance criteria:\ntests pass\n\n"
         '<input name="notes&quot;&lt;x&gt;" kind="text" origin="agent">\nbody\n</input>'
     )
+
+
+def test_an_empty_answer_is_asked_for_again(make_agent: MakeAgent) -> None:
+    """A local model ended a live run with an empty reply; the run must not pass it
+    on as done."""
+    agent, provider, events = make_agent([text(""), text("the answer")])
+    result = agent.run(TASK)
+    assert (result.status, result.summary) == ("done", "the answer")
+    retry = provider.requests[1].messages
+    assert [m.role for m in retry[-2:]] == ["assistant", "user"]
+    assert retry[-1].content.startswith("Your final answer cannot be used: it is empty")
+    assert [e.data["message"] for e in events if e.kind == "warning"] == [
+        "asked again: it is empty"
+    ]
+
+
+def test_a_second_unusable_answer_fails(make_agent: MakeAgent) -> None:
+    def check(answer: str) -> str | None:
+        return None if answer.startswith("OK") else "it does not start with OK"
+
+    agent, _, _ = make_agent([text("no"), text("still no")])
+    result = agent.run(Task("x", check=check))
+    assert (result.status, result.summary) == (
+        "failed",
+        "unusable final answer: it does not start with OK",
+    )
+    agent, _, _ = make_agent([text("no"), text("OK now")])
+    assert agent.run(Task("x", check=check)).summary == "OK now"

@@ -57,8 +57,7 @@ LEAD_SCRIPT = [
     calls(call("read", path="facts.py")),
     calls(call("edit", path="facts.py", old_string='"TODO"', new_string='"3.11"')),
     text("done"),
-    calls(call("delegate", role="reviewer", goal="review facts.py")),
-    calls(call("shell", command="cat facts.py")),
+    calls(call("shell", command="cat facts.py")),  # the review after the coder
     text("VERDICT: APPROVE"),
     text("Objective met."),
 ]
@@ -154,8 +153,8 @@ def test_tree_and_render(tmp_path: Path) -> None:
         ("a4", "reviewer"),
     ]
     lines = render(trace).splitlines()
-    assert lines[0].startswith("run ") and " done: 11 turns, 7 tool calls, " in lines[0]
-    assert lines[1] == "  a1 lead done: 4 turns, 3 tool calls, 60 tokens untrusted"
+    assert lines[0].startswith("run ") and " done: 10 turns, 6 tool calls, " in lines[0]
+    assert lines[1] == "  a1 lead done: 3 turns, 2 tool calls, 45 tokens untrusted"
     assert (
         lines[2] == "    a2 researcher done: 2 turns, 1 tool call, 30 tokens untrusted"
     )

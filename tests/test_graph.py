@@ -664,7 +664,7 @@ def test_a_file_output_reaches_a_command(tmp_path: Path) -> None:
     wheel = result.nodes["lib"].outputs["wheel"]
     assert wheel.kind == "file"
     assert wheel.content == str(
-        tmp_path / "work" / "files" / "lib" / "dist" / "lib-1.0.whl"
+        tmp_path / "work" / "_files" / "lib" / "dist" / "lib-1.0.whl"
     )
     app = result.nodes["app"].workdir
     assert app is not None
@@ -672,6 +672,19 @@ def test_a_file_output_reaches_a_command(tmp_path: Path) -> None:
     assert (app / "v.txt").read_text() == "1.0 x\n"  # ${HOME+x} is shell syntax
     assert provider.requests == []  # no model in either node
     assert "dist" not in git(result.nodes["lib"].workdir, "show", "--name-only", "HEAD")
+
+
+def test_a_node_may_be_named_files(tmp_path: Path) -> None:
+    """File outputs have their own directory, which no node id can name."""
+    lib_and_app(tmp_path / "projects")
+    result, _, _, _ = engine(
+        tmp_path, graph(LIB_APP.replace("nodes.app", "nodes.files")), []
+    )
+    assert result.status == "done", result.nodes
+    copy = result.nodes["files"].workdir
+    assert copy is not None
+    assert (copy / "got.txt").read_text() == "built\n"
+    assert not (copy / "lib").exists()  # no export landed in the node's copy
 
 
 def test_free_text_may_not_enter_a_command(tmp_path: Path) -> None:
@@ -712,7 +725,7 @@ def test_a_file_output_cannot_leave_the_workspace(tmp_path: Path) -> None:
     result, *_ = engine(tmp_path, g, [])
     assert result.nodes["lib"].status == "failed"
     assert "is not a file in the workspace" in result.nodes["lib"].summary
-    assert not (tmp_path / "work" / "files" / "lib").exists()
+    assert not (tmp_path / "work" / "_files" / "lib").exists()
 
 
 # A model node, a model-free build of its output, and a node with network on.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from importlib.metadata import requires
+from importlib.metadata import requires, version
 from pathlib import Path
 
 SRC = Path(__file__).parent.parent / "src" / "timu"
@@ -24,3 +24,9 @@ def test_no_global_rebinding() -> None:
         if isinstance(node, ast.Global | ast.Nonlocal)
     ]
     assert offenders == []
+
+
+def test_version_comes_from_the_distribution() -> None:
+    import timu
+
+    assert timu.__version__ == version("timu")

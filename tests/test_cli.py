@@ -235,3 +235,13 @@ def test_console_sink() -> None:
         "[coder a1] edit a.py\n"
         "[coder a1] done: 2 turns, 6 tokens\n"
     )
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "lots"])
+def test_max_cost_must_be_a_positive_amount(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as e:
+        main(["run", "--max-cost", value, "x"])
+    assert e.value.code == 2
+    assert "is not a positive amount" in capsys.readouterr().err
