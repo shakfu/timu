@@ -144,6 +144,15 @@ def test_background_job_does_not_block(dirs: tuple[Path, Path, Path]) -> None:
     _assert_gone(sleeper)
 
 
+def test_work_after_closing_the_output_still_runs(
+    dirs: tuple[Path, Path, Path],
+) -> None:
+    """EOF on the pipe does not mean sh has exited."""
+    out = sh(ctx_for(dirs), "exec >/dev/null 2>&1; sleep 0.3; touch done; exit 3")
+    assert out.text == "[exit 3]"
+    assert (dirs[0] / "done").exists()
+
+
 def test_cancel_stops_within_a_second(dirs: tuple[Path, Path, Path]) -> None:
     cancel = threading.Event()
     threading.Timer(0.3, cancel.set).start()

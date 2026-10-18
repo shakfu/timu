@@ -235,8 +235,8 @@ class _Stream:
 
     def absorb(self, chunk: dict[str, Any]) -> None:
         self.events += 1
-        if "error" in chunk:
-            self.error = json.dumps(chunk["error"])
+        if error := chunk.get("error"):  # some servers send "error": null
+            self.error = json.dumps(error)
             return
         if isinstance(usage := chunk.get("usage"), dict):
             self.usage = usage
@@ -327,6 +327,7 @@ class _Stream:
                 cost_usd=_num(self.usage.get("cost")),  # OpenRouter reports it
             ),
             extra={"reasoning_details": self.details} if self.details else {},
+            cost_known="cost" in self.usage,
         )
 
 

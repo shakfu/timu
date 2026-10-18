@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 from conftest import MakeAgent
 from timu import Event, JsonlSink, Task
 from timu.provider.fake import text
+
+
+def test_jsonl_sink_is_private(tmp_path: Path) -> None:
+    old = os.umask(0o022)
+    try:
+        with JsonlSink(tmp_path / "trace.jsonl"):
+            pass
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / "trace.jsonl").stat().st_mode) == 0o600
 
 
 def test_jsonl_sink_appends_lines(tmp_path: Path) -> None:

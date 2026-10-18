@@ -221,6 +221,25 @@ def test_write_new_file_with_parents(ws: Path, run: Run) -> None:
     assert (ws / "new/dir/f.txt").read_text() == "hi"
 
 
+def test_atomic_write_leaves_a_file_created_after_its_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "f.txt"
+    stat = Path.stat
+
+    def racing_stat(self: Path, **kw: Any) -> os.stat_result:
+        if self == target:
+            target.write_text("theirs\n")  # another writer, between check and open
+            raise FileNotFoundError(self)
+        return stat(self, **kw)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    with pytest.raises(FileExistsError):
+        fs.atomic_write(target, b"ours\n")
+    monkeypatch.undo()
+    assert target.read_text() == "theirs\n"
+
+
 def test_write_replaces_and_keeps_mode(ws: Path, run: Run) -> None:
     target = ws / "a.txt"
     target.chmod(0o640)

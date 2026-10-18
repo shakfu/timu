@@ -60,9 +60,12 @@ class Usage:
             self.cost_usd + other.cost_usd,
         )
 
-    def exceeds(self, budget: Budget, elapsed: float) -> str | None:
-        """The name of the first limit reached, or None."""
-        if self.turns >= budget.turns:
+    def exceeds(
+        self, budget: Budget, elapsed: float, *, turns: bool = True
+    ) -> str | None:
+        """The name of the first limit reached, or None. turns=False skips the turn
+        limit, so the tools of the last allowed turn still run."""
+        if turns and self.turns >= budget.turns:
             return "turns"
         if self.tool_calls >= budget.tool_calls:
             return "tool_calls"

@@ -3,11 +3,15 @@ untrusted (design 6).
 
 web_fetch refuses non-http(s) URLs and, unless built with allow_private, hosts that
 resolve to private, loopback or link-local addresses, so a researcher cannot reach
-services on the user's machine or network. Redirects are checked the same way.
+services on the user's machine or network. Redirects are checked the same way, and
+a direct connection goes to an address that passed the check, so a DNS answer that
+changes after the check is not followed. Through a proxy, only the check applies: the
+proxy resolves the host again (proxy_warning).
 """
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import re
@@ -43,18 +47,76 @@ def check_url(url: str, allow_private: bool = False) -> None:
         )
     if not parts.hostname:
         raise WebError("URL has no host")
-    if allow_private:
-        return
+    if not allow_private:
+        _public(parts.hostname, parts.port or 443)
+
+
+def proxy_warning() -> str | None:
+    """A warning for the user when urllib would use a proxy for web requests."""
+    if any(k in urllib.request.getproxies() for k in ("http", "https")):
+        return "a proxy is set; web_fetch cannot stop it reaching private addresses"
+    return None
+
+
+def _public(host: str, port: int) -> list[str]:
+    """The addresses host resolves to. Raises WebError if any is not public."""
     try:
-        infos = socket.getaddrinfo(
-            parts.hostname, parts.port or 443, proto=socket.IPPROTO_TCP
-        )
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError) as e:
-        raise WebError(f"cannot resolve {parts.hostname}: {e}") from None
+        raise WebError(f"cannot resolve {host}: {e}") from None
+    addrs = []
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if not ip.is_global or ip.is_multicast:
-            raise WebError(f"{parts.hostname} resolves to a non-public address ({ip})")
+            raise WebError(f"{host} resolves to a non-public address ({ip})")
+        addrs.append(str(ip))
+    return addrs
+
+
+def _connect(
+    address: tuple[str, int],
+    timeout: Any = socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]
+    source_address: tuple[str, int] | None = None,
+) -> socket.socket:
+    """socket.create_connection to an address of host that _public accepts."""
+    host, port = address
+    error: OSError | None = None
+    for ip in _public(host, port):
+        try:
+            return socket.create_connection((ip, port), timeout, source_address)
+        except OSError as e:
+            error = e
+    raise error or OSError(f"cannot connect to {host}")
+
+
+class _PublicHTTP(http.client.HTTPConnection):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect
+
+
+class _PublicHTTPS(http.client.HTTPSConnection):  # SNI and certificates use the host
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect
+
+
+def _proxied(req: urllib.request.Request) -> bool:
+    return req.has_proxy() or bool(getattr(req, "_tunnel_host", None))
+
+
+class _HTTP(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        if _proxied(req):
+            return super().http_open(req)
+        return self.do_open(_PublicHTTP, req)
+
+
+class _HTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        if _proxied(req):
+            return super().https_open(req)
+        return self.do_open(_PublicHTTPS, req, context=self._context)  # type: ignore[attr-defined]
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
@@ -84,7 +146,8 @@ def _get(
 ) -> tuple[bytes, str, bool]:
     """(body up to MAX_FETCH, content type, truncated). Raises WebError."""
     check_url(url, allow_private)
-    opener = urllib.request.build_opener(_Redirects(allow_private))
+    checked = () if allow_private else (_HTTP(), _HTTPS())
+    opener = urllib.request.build_opener(*checked, _Redirects(allow_private))
     req = urllib.request.Request(url, headers={"user-agent": USER_AGENT, **headers})
     try:
         with opener.open(req, timeout=TIMEOUT) as r:

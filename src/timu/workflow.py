@@ -198,6 +198,8 @@ class Run:
         budget, scope = self._limit(task.budget or role.budget)
         if budget is None:
             return Result("budget", f"{scope} budget exhausted", (), Usage(), agent_id)
+        if inherited or any(a.tainted for a in task.inputs):
+            self._tainted.add(agent_id)  # goals it writes follow its inputs
         agent = Agent(
             role,
             ses.provider_for(role),
@@ -233,9 +235,9 @@ class Run:
             caps.append(("node", self.budget, self.used, now - self._start))
         return caps
 
-    def _exhausted(self) -> str | None:
+    def _exhausted(self, turns: bool = True) -> str | None:
         for scope, budget, used, elapsed in self._caps():
-            if limit := used.exceeds(budget, elapsed):
+            if limit := used.exceeds(budget, elapsed, turns=turns):
                 return f"{scope} {limit}"
         return None
 
@@ -935,6 +937,7 @@ class Workflow:
     params: Mapping[str, Param] = field(default_factory=dict)
     artifacts: tuple[str, ...] = ()  # names of the artifacts a Result may carry
     graph_only: bool = False  # needs params that only a graph file can set
+    required: tuple[str, ...] = ()  # params without a default
 
 
 def non_negative_int(v: Any) -> int:
@@ -1036,6 +1039,7 @@ WORKFLOWS = {
             {"steps": COMMANDS, "network": boolean, "timeout": positive_int},
             ("log",),
             graph_only=True,
+            required=("steps",),
         ),
         Workflow(
             "check-fix-review",
@@ -1054,6 +1058,7 @@ WORKFLOWS = {
             },
             ("log", "review"),
             graph_only=True,
+            required=("check",),
         ),
         Workflow(
             "lead",

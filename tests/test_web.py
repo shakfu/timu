@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
 import urllib.error
 import urllib.parse
@@ -121,6 +122,52 @@ def test_redirect_to_private_is_refused() -> None:
     req = urllib.request.Request("https://example.com/")
     with pytest.raises(urllib.error.HTTPError, match="redirect refused"):
         handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/admin")  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def rebinding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """rebind.invalid resolves to a public address once, then to loopback."""
+    real = socket.getaddrinfo
+    answers = iter(["93.184.215.14"])
+
+    def resolve(host: str, *args: Any, **kw: Any) -> Any:
+        if host == "rebind.invalid":
+            host = next(answers, "127.0.0.1")
+        return real(host, *args, **kw)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+def proxies(monkeypatch: pytest.MonkeyPatch, **found: str) -> None:
+    monkeypatch.setattr(urllib.request, "getproxies", lambda: found)
+
+
+@pytest.mark.usefixtures("rebinding")
+def test_fetch_connects_only_to_a_checked_address(
+    site: Site, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DNS answer that turns private after the check is not followed (F2)."""
+    proxies(monkeypatch)
+    site.routes["/p"] = html("<p>private</p>")
+    port = urllib.parse.urlsplit(site.url).port
+    url = f"http://rebind.invalid:{port}/p"
+    out = web_fetch_tool().run(ctx(tmp_path), {"url": url})
+    assert out.is_error
+    assert "non-public address (127.0.0.1)" in out.text
+    assert site.requests == []
+
+
+@pytest.mark.usefixtures("rebinding")
+def test_fetch_still_uses_a_proxy(
+    site: Site, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proxies(monkeypatch, http=site.url)  # the test server is the proxy
+    site.routes["/p"] = html("<p>via proxy</p>")
+    out = web_fetch_tool().run(ctx(tmp_path), {"url": "http://rebind.invalid/p"})
+    assert (out.is_error, out.text) == (False, "via proxy")
+    assert web.proxy_warning() is not None
+    proxies(monkeypatch)
+    assert web.proxy_warning() is None
 
 
 # ---- web_fetch ----

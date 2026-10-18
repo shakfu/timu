@@ -34,6 +34,7 @@ from commands; a key in the environment does not.
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Iterable, Mapping
@@ -148,8 +149,8 @@ def load_config(
             )
         _only(_table(roles, name, src), KEYS["roles"], f"{src}: roles.{name}")
     timeout = float(_get(prov, "timeout", (int, float), 600, src))
-    if timeout <= 0:
-        raise ConfigError(f"{src}: timeout must be positive")
+    if not 0 < timeout < math.inf:  # also rejects nan
+        raise ConfigError(f"{src}: timeout must be positive and finite")
     config = Config(
         base_url=_get(prov, "base_url", str, DEFAULT_BASE_URL, src),
         api_key_env=_get(prov, "api_key_env", str, DEFAULT_KEY_ENV, src),

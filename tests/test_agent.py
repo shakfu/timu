@@ -217,6 +217,48 @@ def test_budget_cost(make_agent: MakeAgent) -> None:
     assert len(provider.requests) == 3
 
 
+def test_a_reply_over_the_cost_limit_runs_no_tools(make_agent: MakeAgent) -> None:
+    reply = Reply("", (call("echo", text="a"),), "tool_use", Usage(cost_usd=2))
+    agent, provider, events = make_agent([reply, text("done")], Budget(cost_usd=1))
+    result = agent.run(TASK)
+    assert result.status == "budget"
+    assert "cost_usd" in result.summary
+    assert len(provider.requests) == 1
+    [out] = [e.data["text"] for e in events if e.kind == "tool_result"]
+    assert out.startswith("skipped: budget reached (cost_usd)")
+
+
+def test_wall_time_is_checked_before_each_tool(make_agent: MakeAgent) -> None:
+    clock = itertools.chain([0.0, 1.0, 2.0], itertools.repeat(20.0))
+    batch = calls(call("echo", text="a"), call("echo", id="e2", text="b"))
+    agent, _, events = make_agent(
+        [batch], Budget(wall_seconds=10), clock=lambda: next(clock)
+    )
+    assert agent.run(TASK).status == "budget"
+    outs = [e.data["text"] for e in events if e.kind == "tool_result"]
+    assert outs == ["a", "skipped: budget reached (wall_seconds)"]
+
+
+def test_the_last_allowed_turn_still_runs_its_tools(make_agent: MakeAgent) -> None:
+    agent, _, events = make_agent(_distinct_calls(2), Budget(turns=1))
+    assert agent.run(TASK).status == "budget"
+    assert [e.data["text"] for e in events if e.kind == "tool_result"] == ["0"]
+
+
+def test_unknown_cost_warns_once_under_a_cost_limit(make_agent: MakeAgent) -> None:
+    replies = [
+        Reply("", (call("echo", text="a"),), "tool_use", cost_known=False),
+        Reply("ok", cost_known=False),
+    ]
+    agent, _, events = make_agent(replies, Budget(cost_usd=1))
+    assert agent.run(TASK).status == "done"
+    warnings = [e.data["message"] for e in events if e.kind == "warning"]
+    assert warnings == ["the server reports no cost; the cost limit is not enforced"]
+    agent, _, events = make_agent([Reply("ok", cost_known=False)])
+    agent.run(TASK)
+    assert not [e for e in events if e.kind == "warning"]
+
+
 def test_no_cost_limit_by_default(make_agent: MakeAgent) -> None:
     agent, _, _ = make_agent([text("ok", cost=1e9)])
     assert agent.run(TASK).status == "done"

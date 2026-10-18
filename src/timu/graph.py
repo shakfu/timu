@@ -6,6 +6,7 @@ in its copy, never in the user's repo; agents may not commit (graph.md 7.2.1).
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
@@ -41,8 +42,9 @@ SEVERITY = ("done", "skipped", "refused", "failed", "budget", "cancelled")
 MAX_OUTPUT = 256 * 1024  # bytes, for one extracted output
 COMMITTER = (  # the user's identity, signing and hooks play no part in a copy
     *("-c", "user.name=timu", "-c", "user.email=timu@localhost"),
-    *("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"),
+    *("-c", "commit.gpgsign=false"),
 )
+DRIVERS = r"^(filter|diff)\..*\.(clean|smudge|process|textconv|command)$"
 GIT_TIMEOUT = 120  # seconds
 
 
@@ -256,6 +258,9 @@ def _node(
             params[k] = wf.params[k](v)
         except ValueError as e:
             raise GraphError(f"{where}: params.{k} {e}") from None
+    for k in wf.required:
+        if k not in params:
+            raise GraphError(f"{where}: {wf_name} needs params.{k}")
 
     trust = t.get("trust_upstream", False)
     if not isinstance(trust, bool):
@@ -290,9 +295,9 @@ def _budget(t: Mapping[str, Any], where: str) -> Budget | None:
         if (
             isinstance(v, bool)
             or not isinstance(v, int if whole else int | float)
-            or v <= 0
+            or not 0 < v < math.inf  # also rejects nan
         ):
-            kind = "positive integer" if whole else "positive number"
+            kind = "positive integer" if whole else "finite positive number"
             raise GraphError(f"{where}: budget.{k} must be a {kind}")
     return replace(WORKFLOW_BUDGET, **b)
 
@@ -425,13 +430,44 @@ def head(ws: Path) -> str:
 
 def diff(ws: Path, base: str) -> str:
     """The commits on ws's branch since base, as a patch."""
-    return _git(ws, "diff", "--binary", base, "HEAD")
+    return _git(ws, "diff", "--binary", "--no-textconv", "--no-ext-diff", base, "HEAD")
+
+
+def _no_drivers(cwd: Path) -> list[str]:
+    """-c options that blank each configured filter and diff driver. The engine runs
+    unsandboxed, and .gitattributes in an agent-written tree selects the driver, which
+    may run a script from that tree. Standard git-lfs filters stay."""
+    r = subprocess.run(
+        ["git", "config", "--get-regexp", DRIVERS],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT,
+        check=False,
+    )
+    blank = []
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if not (key.startswith("filter.lfs.") and value.startswith("git-lfs ")):
+            blank += ["-c", f"{key}="]
+    return blank
 
 
 def _git(cwd: Path, *args: str, ok: tuple[int, ...] = (0,)) -> str:
     try:
         r = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", *args],
+            [
+                *(
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ),
+                *_no_drivers(cwd),
+                *args,
+            ],
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -674,7 +710,8 @@ def _run_node(
                 f"{node.id}.{name}",
                 content,
                 "file" if spec.startswith("file:") else "output",
-                Origin.AGENT,
+                # untrusted here may be first-hand web content no gate has seen
+                Origin.NET if r.untrusted else Origin.AGENT,
                 node.id,
                 r.untrusted,
             )

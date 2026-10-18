@@ -111,7 +111,7 @@ timu run --workflow lead "add a --json flag to the report command"
 
 Useful flags:
 
-- `--max-cost USD` stops the run at a spending limit. All agents share one budget.
+- `--max-cost USD` stops the run at a spending limit. All agents share one budget. It needs a server that reports cost, such as OpenRouter; otherwise timu warns and does not enforce it.
 
 - `--approve-untrusted` asks on the terminal before web content reaches the coder, and before a task the lead writes reaches the researcher. It is on by default for `lead`. Without a terminal the answer is no; pass `--no-approve-untrusted` for unattended runs.
 

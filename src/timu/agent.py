@@ -20,6 +20,7 @@ from timu.role import Role, make_context
 from timu.sandbox import NoSandbox, Sandbox
 from timu.skills import prompt_section
 from timu.tool import Context, Delegate, ToolOutput, cap
+from timu.tools.web import proxy_warning
 from timu.types import Capability, Result, Status, Task, Usage
 
 REPEAT_LIMIT = 3  # identical consecutive tool calls before the run stops
@@ -47,11 +48,12 @@ class Agent:
         untrusted: bool = False,
         delegate: Delegate | None = None,
         on_usage: Callable[[Usage], None] | None = None,
-        outer_limit: Callable[[], str | None] | None = None,
+        outer_limit: Callable[[bool], str | None] | None = None,
     ) -> None:
         """untrusted: the task derives from untrusted content, even without tainted
         inputs. on_usage is told of each increment; outer_limit names a limit outside
-        this agent (a workflow's) that has been reached. Both come from a Run."""
+        this agent (a workflow's) that has been reached, with or without turns. Both
+        come from a Run."""
         self.role = role
         self.provider = provider
         self.sink = sink
@@ -92,9 +94,12 @@ class Agent:
         last_text = ""
         streak: tuple[str, int] = ("", 0)  # signature of the last call, times in a row
         retried = False  # an unusable final answer gets one more try
+        warned_cost = False
         self._emit("start", goal=task.goal)
         if isinstance(ctx.sandbox, NoSandbox):
             self._emit("warning", message="shell commands run without a sandbox")
+        if "web_fetch" in self._tools and (proxy := proxy_warning()):
+            self._emit("warning", message=proxy)
         for s in ctx.skills:  # a workspace skill can replace a user skill of that name
             for other in s.shadows:
                 self._emit(
@@ -117,7 +122,7 @@ class Agent:
             if self.cancel.is_set():
                 return finish("cancelled", with_last("cancelled", last_text))
             limit = usage.exceeds(budget, self._clock() - start)
-            if limit := limit or (self._outer_limit and self._outer_limit()):
+            if limit := limit or (self._outer_limit and self._outer_limit(True)):
                 return finish(
                     "budget", with_last(f"budget reached ({limit})", last_text)
                 )
@@ -126,6 +131,12 @@ class Agent:
                 messages, self.role.tools, lambda t: self._emit("model_delta", text=t)
             )
             usage += self._charge(replace(reply.usage, turns=1, tool_calls=0))
+            if budget.cost_usd is not None and not reply.cost_known and not warned_cost:
+                warned_cost = True
+                self._emit(
+                    "warning",
+                    message="the server reports no cost; the cost limit is not enforced",
+                )
             self._emit(
                 "model_reply",
                 text=reply.text,
@@ -178,12 +189,10 @@ class Agent:
                     streak = (sig, streak[1] + 1 if sig == streak[0] else 1)
                     if self.cancel.is_set():
                         stop = ("cancelled", "cancelled")
-                    elif usage.tool_calls >= budget.tool_calls:
-                        stop = ("budget", "budget reached (tool_calls)")
-                    elif (outer := self._outer_limit and self._outer_limit()) and (
-                        outer.endswith("tool_calls")  # a child may have spent them
-                    ):
-                        stop = ("budget", f"budget reached ({outer})")
+                    elif limit := usage.exceeds(
+                        budget, self._clock() - start, turns=False
+                    ) or (self._outer_limit and self._outer_limit(False)):
+                        stop = ("budget", f"budget reached ({limit})")
                     elif streak[1] >= REPEAT_LIMIT:
                         stop = (
                             "failed",

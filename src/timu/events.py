@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -38,7 +39,9 @@ class JsonlSink:
     """Appends each event to a file as one JSON line, flushed so a crash keeps it."""
 
     def __init__(self, path: str | Path) -> None:
-        self._file: IO[str] = open(path, "a", encoding="utf-8")  # noqa: SIM115 - closed by close()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)  # traces may hold workspace secrets
+        self._file: IO[str] = os.fdopen(fd, "a", encoding="utf-8")
 
     def __call__(self, event: Event) -> None:
         self._file.write(json.dumps(as_dict(event), separators=(",", ":")) + "\n")

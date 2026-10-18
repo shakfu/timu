@@ -129,12 +129,12 @@ def atomic_write(path: Path, data: bytes) -> None:
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
-        try:
-            with open(path, "xb") as f:
+        with open(path, "xb") as f:  # a file created since stat is not ours to remove
+            try:
                 f.write(data)
-        except BaseException:
-            path.unlink(missing_ok=True)
-            raise
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
         return
     fd, name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".timu-tmp", dir=path.parent

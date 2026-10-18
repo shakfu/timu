@@ -111,7 +111,7 @@ def run_sh(
     out, fd = _Output(max_output), proc.stdout.fileno()
     deadline = time.monotonic() + timeout
     exited_at: float | None = None
-    stopped = ""
+    eof, stopped = False, ""
     try:
         while True:
             now = time.monotonic()
@@ -123,12 +123,14 @@ def run_sh(
                 break
             if proc.poll() is not None:
                 exited_at = exited_at or now
-                if now - exited_at > EXIT_GRACE:
+                if eof or now - exited_at > EXIT_GRACE:
                     break
-            if select.select([fd], [], [], min(0.1, deadline - now))[0]:
+            if eof:  # sh may still be working with its output redirected
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(min(0.1, deadline - now))
+            elif select.select([fd], [], [], min(0.1, deadline - now))[0]:
                 chunk = os.read(fd, 65536)
-                if not chunk:
-                    break  # EOF: every writer has exited
+                eof = not chunk
                 out.add(chunk)
     finally:
         proc.stdout.close()

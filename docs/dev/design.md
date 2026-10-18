@@ -323,7 +323,7 @@ class Budget:
     wall_seconds: int = 1800
 ```
 
-- Every agent checks its budget before each model call. When it runs out, the agent returns `status="budget"` with its work so far.
+- Every agent checks its budget before each model call and each tool call. The turn limit does not stop the tools of the last allowed turn. When it runs out, the agent returns `status="budget"` with its work so far.
 
 - The workflow has its own budget, and every child's budget comes out of it. Agents charge the workflow as they spend, not when they finish, so a lead and the children it is waiting on draw from one live remainder. Each agent also stops when the workflow budget runs out. Separate budgets for each branch of the delegation tree are not modeled.
 

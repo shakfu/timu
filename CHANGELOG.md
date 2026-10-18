@@ -22,6 +22,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The macOS sandbox denies LaunchServices opens, Apple events, and signals to processes outside the sandbox. A command could build an `.app` in the workspace and start it with `open`. launchd ran it unsandboxed, with full file and network access. A command could also kill timu. The profile still starts from `(allow default)`. A command can still read the environment of the user's other processes through `sysctl(KERN_PROCARGS2)`, API keys included. No SBPL rule tested on macOS 26 blocks this.
 
+- With `--approve-untrusted`, a lead given web content as an input now needs approval for the goals it writes. Before, only a child's untrusted result tainted the lead, so a lead that read web input delegated coder work without a prompt.
+
+- A graph node's declared output from an untrusted run, such as a `commands` node with network on, now reaches the approval gate in the next node as web content. Before, it was labelled agent output and skipped the gate.
+
+- Graph git commands blank every configured filter and diff driver, except standard `git-lfs` filters, and run no hooks. `.gitattributes` in an agent-written tree selects the driver, so a driver that ran a workspace script ran agent code on the host during `git add`, `git diff` or a downstream checkout. Blanking each driver keeps the rest of the user's git config, which ignoring global config would drop.
+
+- `web_fetch` connects only to an address that passed the private-address check. Before, urllib resolved the host again, so a DNS answer that changed after the check could reach loopback or the local network. Through a proxy only the first check applies, and timu warns at start.
+
+- Traces are created with mode 0600. Before, they followed the umask, usually 0644. Existing traces and the state directory are not changed.
+
 ### Added
 
 - Each run prints its config sources on one line (`config: <file> + TIMU_MODEL`) and records them in the trace.
@@ -69,6 +79,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A verdict line with Markdown inside it, such as `**VERDICT:** APPROVE`, is accepted. Before, the run failed with "no VERDICT line".
 
 - A `file:` output is copied to its path in the workspace, under the node's files directory. Before, it was copied by base name, so two outputs named `x.txt` overwrote each other and both returned the last file.
+
+- An agent checks its token, cost and time limits before each tool call, not only before each model call. A reply that overspent, or a batch of slow shell calls, still ran its remaining tools. The turn limit still lets the last allowed turn's tools run.
+
+- A shell command keeps running after it closes or redirects its output. Before, timu killed it when the pipe closed, and reported exit 137.
+
+- With a cost limit, timu warns when the server reports no cost. It counted that cost as zero, so the limit was silently not enforced.
+
+- A graph node using `commands` without `steps`, or `check-fix-review` without `check`, fails to load. Before, the graph crashed with a `TypeError` partway through the run.
+
+- Graph budgets and `[provider] timeout` reject `nan` and `inf`. A `nan` budget never ran out, and a `nan` timeout raised an uncaught error on the first model call.
+
+- Writing a new file no longer deletes a file that another process created there after timu's existence check.
+
+- A provider response with `"error": null` is no longer treated as a failure.
 
 ## [0.2.0]
 

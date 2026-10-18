@@ -102,6 +102,8 @@ def test_keyless_server() -> None:
         ("[roles.reviewer]\nmodle = 'x'\n", "roles.reviewer: unknown keys: modle"),
         ("[provider]\ntimeout = 0\n", "timeout must be positive"),
         ("[provider]\ntimeout = -5\n", "timeout must be positive"),
+        ("[provider]\ntimeout = nan\n", "timeout must be positive and finite"),
+        ("[provider]\ntimeout = inf\n", "timeout must be positive and finite"),
     ],
 )
 def test_invalid(tmp_path: Path, text: str, message: str) -> None:

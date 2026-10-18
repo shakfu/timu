@@ -22,6 +22,7 @@ from timu.graph import (
     GraphError,
     Ref,
     Template,
+    _no_drivers,
     chains,
     commit,
     diff,
@@ -194,6 +195,28 @@ BASE = '[nodes.a]\nrepo = "a"\nworkflow = "fix-review"\nobjective = "o"\n'
         ),
         (
             (
+                '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\n'
+                "budget={ cost_usd = nan }\n"
+            ),
+            "budget.cost_usd must be a finite positive number",
+        ),
+        (
+            (
+                '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\n'
+                "budget={ wall_seconds = inf }\n"
+            ),
+            "budget.wall_seconds must be a finite positive number",
+        ),
+        (
+            '[nodes.b]\nrepo="b"\nworkflow="commands"\nobjective="o"\n',
+            "commands needs params.steps",
+        ),
+        (
+            '[nodes.b]\nrepo="b"\nworkflow="check-fix-review"\nobjective="o"\n',
+            "check-fix-review needs params.check",
+        ),
+        (
+            (
                 '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\nneeds=["c"]\n'
                 '[nodes.c]\nrepo="c"\nworkflow="fix-review"\nobjective="o"\nneeds=["b"]\n'
             ),
@@ -332,6 +355,50 @@ def test_commit_ignores_the_users_hooks_and_signing(
     base, _ = provision(src, ws, "HEAD", "timu/r1/a")
     (ws / "f.txt").write_text("x\n")
     assert commit(ws, "m") != base
+
+
+def test_git_runs_no_driver_the_workspace_selects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Config drivers could run agent-written scripts on the host (F1)."""
+    config = tmp_path / "gitconfig"
+    config.write_text(
+        '[filter "clean"]\n\tclean = sh clean.sh\n'
+        '[filter "smudge"]\n\tsmudge = sh a_smudge.sh\n'
+        '[diff "tc"]\n\ttextconv = sh textconv.sh\n'
+    )
+    src = project(tmp_path / "p", "a")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    ws = tmp_path / "work" / "a"
+    base, _ = provision(src, ws, "HEAD", "timu/r1/a")
+    marker = tmp_path / "marker"
+    (ws / ".gitattributes").write_text(
+        "c.txt filter=clean\ns.txt filter=smudge\nt.txt diff=tc\n"
+    )
+    for script in ("clean.sh", "a_smudge.sh", "textconv.sh"):
+        (ws / script).write_text(f'echo {script} >> {marker}; cat "${{1:--}}"\n')
+    for rel in ("c.txt", "s.txt", "t.txt"):
+        (ws / rel).write_text("x\n")
+    new = commit(ws, "m")
+    diff(ws, base)
+    provision(ws, tmp_path / "work" / "b", new, "timu/r1/b")  # a downstream node
+    assert not marker.exists()
+    assert git(ws, "show", f"{new}:c.txt") == "x\n"
+
+
+def test_git_keeps_the_standard_lfs_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "gitconfig"
+    config.write_text(
+        '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tprocess = sh evil.sh\n'
+        '[filter "x"]\n\tclean = sh x.sh\n'
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    assert _no_drivers(tmp_path) == [
+        *("-c", "filter.lfs.process="),
+        *("-c", "filter.x.clean="),
+    ]
 
 
 def test_the_users_repo_can_fetch_the_branch(tmp_path: Path) -> None:
@@ -833,3 +900,26 @@ def test_cli_graph_usage_errors(tmp_path: Path) -> None:
     err = io.StringIO()
     assert main(argv, provider_for=lambda role: FakeProvider([]), err=err) == 2
     assert "repo must be a non-empty string" in err.getvalue()
+
+
+def test_a_network_output_reaches_the_approval_gate(tmp_path: Path) -> None:
+    """A network node's extracted output is first-hand web content (F3)."""
+    project(tmp_path / "projects", "n")
+    project(tmp_path / "projects", "c")
+    asked: list[tuple[str, str]] = []
+
+    def deny(a: Any, role: Any) -> bool:
+        asked.append((a.name, role.name))
+        return False
+
+    g = graph(
+        '[nodes.n]\nrepo = "n"\nworkflow = "commands"\nobjective = "fetch"\n'
+        'params = { steps = ["echo page > x.txt"], network = true }\n'
+        'outputs = { x = "file:x.txt" }\n'
+        '[nodes.c]\nrepo = "c"\nneeds = ["n"]\ninputs = ["n.x"]\n'
+        'workflow = "fix-review"\nobjective = "apply"\n'
+    )
+    result, provider, _, _ = engine(tmp_path, g, [], approve=deny)
+    assert asked == [("n.x", "coder")]
+    assert result.nodes["c"].status == "refused"
+    assert provider.requests == []

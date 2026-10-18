@@ -45,6 +45,7 @@ class Reply:
     usage: Usage = field(default_factory=Usage)
     error: str = ""  # set when stop is "error"
     extra: Mapping[str, Any] = field(default_factory=dict)
+    cost_known: bool = True  # False: the server reported tokens but no cost
 
 
 OnText = Callable[[str], None]

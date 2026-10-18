@@ -275,6 +275,28 @@ def test_non_streamed_json(server: Server) -> None:
     assert pieces == ["calling"]
     assert reply.tool_calls == (ToolCall("c1", "echo", {"text": "x"}, '{"text": "x"}'),)
     assert reply.usage == Usage(input_tokens=5, output_tokens=2)
+    assert not reply.cost_known  # no usage.cost: not the same as costing nothing
+
+
+@pytest.mark.parametrize("streamed", [True, False])
+def test_a_null_error_is_not_a_failure(server: Server, streamed: bool) -> None:
+    if streamed:
+        chunks = [event({"content": "ok"}, finish="stop", error=None), USAGE, DONE]
+        server.responses.append(Resp(chunks=chunks))
+    else:
+        body = {
+            "choices": [{"finish_reason": "stop", "message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "cost": 0.002},
+            "error": None,
+        }
+        server.responses.append(
+            Resp(headers=dict(JSON), chunks=[json.dumps(body).encode()])
+        )
+    reply = make(server)[0].complete([], [])
+    assert (reply.stop, reply.text, reply.error) == ("end", "ok", "")
+    assert reply.usage == Usage(input_tokens=12, output_tokens=3, cost_usd=0.002)
+    assert reply.cost_known
+    assert len(server.requests) == 1
 
 
 # ---- failures and retries ----
