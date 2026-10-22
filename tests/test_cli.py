@@ -237,6 +237,31 @@ def test_console_sink() -> None:
     )
 
 
+def test_console_sink_in_parallel_writes_whole_lines_per_node() -> None:
+    out, err = io.StringIO(), io.StringIO()
+    sink = ConsoleSink(out, err, parallel=True)
+
+    def ev(kind: str, agent: str, node: str, **data: Any) -> Event:
+        return Event(kind, agent, "", "coder", 0.0, data, node)
+
+    sink(ev("model_delta", "a1", "x", text="one "))
+    sink(ev("model_delta", "a2", "y", text="other\nhalf"))
+    sink(ev("model_delta", "a1", "x", text="line\ntail"))
+    usage = {"turns": 1, "input_tokens": 1, "output_tokens": 1}
+    sink(ev("result", "a1", "x", status="done", usage=usage))
+    assert out.getvalue() == "[y] other\n[x] one line\n[x] tail\n"
+    assert err.getvalue() == "[x] [coder a1] done: 1 turns, 2 tokens\n"
+
+
+def test_console_sink_escapes_control_characters() -> None:
+    out, err = io.StringIO(), io.StringIO()
+    sink = ConsoleSink(out, err)
+    sink(Event("model_delta", "a1", "", "coder", 0.0, {"text": "a\x1b[2Jb\r\n"}))
+    sink(Event("warning", "a1", "", "coder", 0.0, {"message": "w\u202ex\x9by"}))
+    assert out.getvalue() == "a\\x1b[2Jb\n"
+    assert err.getvalue() == "warning: w\\u202ex\\x9by\n"
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "lots"])
 def test_max_cost_must_be_a_positive_amount(
     value: str, capsys: pytest.CaptureFixture[str]

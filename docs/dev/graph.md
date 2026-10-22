@@ -92,7 +92,7 @@ Node results may appear only in `inputs`, never in `params`. They are free text.
 
 ## 5. Engine
 
-The scheduler is stdlib `graphlib.TopologicalSorter` (https://docs.python.org/3/library/graphlib.html). Its `get_ready()` and `done()` calls allow parallel nodes later without a rewrite.
+The scheduler is stdlib `graphlib.TopologicalSorter` (https://docs.python.org/3/library/graphlib.html). Its `get_ready()` and `done()` calls allow parallel nodes without a rewrite. The sketch below is the sequential first version; `graph.py` holds the parallel one.
 
 ```python
 def run_graph(session: Session, graph: Graph) -> GraphResult:
@@ -269,7 +269,7 @@ Risk that remains: `wheel` and `app` run code `lib`'s coder wrote, such as a cha
 4. `commands` and `check-fix-review` workflows, and file outputs (7.7). Done; see CHANGELOG, Unreleased. The Linux `bwrap` backend is built too (`docs/dev/bwrap.md`). Command steps with network need a sandbox with network on: `sandbox-exec` on macOS, `bwrap` on Linux, or `--unsafe-no-sandbox`.
 5. GitHub clones for projects with no local copy (7.2).
 6. Effect nodes behind `--allow-effects`.
-7. Parallel scheduling. `--resume <run id>` skips nodes whose spec and input values hash to a previous `done` result.
+7. Parallel scheduling (`--max-parallel`) and `--resume <run id>`. Done; see CHANGELOG, Unreleased. Resume hashes each node's spec and project. It does not hash input values: a node is reused only when every node it needs is reused too, so its inputs are those of the earlier run.
 
 ## 9. Open questions
 
@@ -278,7 +278,7 @@ Risk that remains: `wheel` and `app` run code `lib`'s coder wrote, such as a cha
 3. Can a node's output add or remove nodes? A `when` predicate on edges covers simple cases. Anything more needs the alternative in section 10.
 4. How should B build against an unpublished A? For a library and its app: a local wheel before the release, the released version after (7.5).
 5. Which config does a node use? Decided: a repo contributes no config (CHANGELOG, Unreleased). The graph file sets per-node roles and models, over the user file. Open: whether a node may override `extra_body` or `timeout`.
-6. How do approval prompts work across nodes? `tty_approve` asks once per artifact per run. A graph with many nodes asks many times, and parallel nodes would interleave prompts. Options: serialize prompts and label each with its node id; or decide approvals per edge in the graph file before the run starts.
+6. How do approval prompts work across nodes? `tty_approve` asks once per artifact per run. A graph with many nodes asks many times, and parallel nodes would interleave prompts. Options: serialize prompts and label each with its node id; or decide approvals per edge in the graph file before the run starts. Partly decided: prompts are serialized; they are not yet labelled with the node.
 7. How does the app declare the library? For `cyllama-desktop`: a shell default in `scripts/build-python-env.sh`, a floor in `python-sidecar/pyproject.toml`, and `CYLLAMA_SOURCE` for a local build (7.6). How the adopt graph edits the pin is open: a `commands` step (`sed`), or a fix-review node told the new version.
 8. Decided: "the app works" means the build and every test pass. No human check is needed. For `cyllama-desktop` this does not yet cover the real library (7.6, point 3).
 

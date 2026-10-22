@@ -1,17 +1,22 @@
 """Workflow graphs (docs/dev/graph.md): a DAG of workflow instances in one Session,
-each on its own copy of one local project. Nodes run one at a time, in file order
-among those whose needs are done. The engine commits each node's changes on a branch
+each on its own copy of one local project. A node starts once its needs are done, at
+most max_parallel at a time, in file order among those ready; each runs in its own
+thread when more than one may run. The engine commits each node's changes on a branch
 in its copy, never in the user's repo; agents may not commit (graph.md 7.2.1).
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
+import threading
+import time
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
@@ -20,6 +25,7 @@ from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any
 
+from timu.events import Event
 from timu.report import ReportError
 from timu.role import RoleError
 from timu.types import Artifact, Budget, Origin
@@ -36,7 +42,7 @@ GITHUB = re.compile(
 )
 NODE_KEYS = frozenset(
     {"repo", "workflow", "objective", "needs", "ref", "params", "inputs", "outputs"}
-    | {"budget", "trust_upstream"}
+    | {"budget", "trust_upstream", "models"}
 )
 SEVERITY = ("done", "skipped", "refused", "failed", "budget", "cancelled")
 MAX_OUTPUT = 256 * 1024  # bytes, for one extracted output
@@ -46,6 +52,7 @@ COMMITTER = (  # the user's identity, signing and hooks play no part in a copy
 )
 DRIVERS = r"^(filter|diff)\..*\.(clean|smudge|process|textconv|command)$"
 GIT_TIMEOUT = 120  # seconds
+STOP_GRACE = 5.0  # seconds running nodes get to stop when the scheduler aborts
 
 
 class GraphError(ValueError):
@@ -81,6 +88,7 @@ class Node:
     outputs: Mapping[str, str] = field(default_factory=dict)  # name -> extractor
     budget: Budget | None = None
     trust_upstream: bool = False  # network on despite model nodes upstream
+    models: Mapping[str, str] = field(default_factory=dict)  # role -> model
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,8 @@ class NodeResult:
     branch: str = ""
     base: str = ""  # the commit the node started from
     head: str = ""  # the branch's last commit; == base if nothing was committed
+    files: Path | None = None  # where its file outputs were copied, if any
+    reused: bool = False  # taken from an earlier run (resumable)
 
 
 @dataclass(frozen=True)
@@ -262,6 +272,13 @@ def _node(
         if k not in params:
             raise GraphError(f"{where}: {wf_name} needs params.{k}")
 
+    models = _table(t, "models", where)
+    for role, model in models.items():
+        if role not in wf.roles:
+            known = ", ".join(wf.roles) or "none"
+            raise GraphError(f"{where}: {wf_name} runs no {role}; roles: {known}")
+        if not isinstance(model, str) or not model:
+            raise GraphError(f"{where}: models.{role} must be a non-empty string")
     trust = t.get("trust_upstream", False)
     if not isinstance(trust, bool):
         raise GraphError(f"{where}: trust_upstream must be true or false")
@@ -280,6 +297,7 @@ def _node(
         outputs,
         budget,
         trust,
+        dict(models),
     )
 
 
@@ -593,36 +611,172 @@ def run_graph(
     projects: Mapping[str, Path],
     work: Path,
     options: Options,
+    *,
+    max_parallel: int = 1,
+    prior: Mapping[str, NodeResult] | None = None,
 ) -> GraphResult:
     """Run every node on a copy of its project under work. A node runs once its needs
     are done; if one is not, the node is skipped. options.params and inputs are
-    replaced per node."""
+    replaced per node. A node in prior is not run again: its result is reused."""
+    prior = prior or {}
     order = list(graph.nodes)
     parents = chains(graph, projects)
     ts = TopologicalSorter({n.id: n.needs for n in graph.nodes.values()})
     ts.prepare()
     results: dict[str, NodeResult] = {}
+    ready: list[str] = []
+    finished: queue.Queue[tuple[str, NodeResult | BaseException]] = queue.Queue()
+    running = 0
+
+    def run(nid: str) -> NodeResult:
+        if nid in prior:
+            return prior[nid]
+        parent = results[p] if (p := parents[nid]) else None
+        node = graph.nodes[nid]
+        return _run_node(session, node, results, projects[nid], parent, work, options)
+
+    def in_thread(nid: str) -> None:
+        try:
+            finished.put((nid, run(nid)))
+        except BaseException as e:  # noqa: BLE001 - re-raised by the scheduler
+            finished.put((nid, e))
+
     while ts.is_active():
-        for nid in sorted(ts.get_ready(), key=order.index):
-            node = graph.nodes[nid]
-            parent = results[p] if (p := parents[nid]) else None
-            src = projects[nid]
-            r = _run_node(session, node, results, src, parent, work, options)
-            results[nid] = r
-            session.emit(
-                "node_result",
-                node=nid,
-                status=r.status,
-                summary=r.summary,
-                branch=r.branch,
-                head=r.head,
-            )
-            ts.done(nid)
+        ready += sorted(ts.get_ready(), key=order.index)
+        while ready and running < max_parallel:
+            nid = ready.pop(0)
+            running += 1
+            if max_parallel == 1 or nid in prior:  # Ctrl-C aborts a serial run at once
+                finished.put((nid, run(nid)))
+            else:  # daemon: an aborted run does not wait for its nodes
+                threading.Thread(target=in_thread, args=(nid,), daemon=True).start()
+        try:
+            nid, r = finished.get()
+        except KeyboardInterrupt:
+            _stop(session, finished, running)
+            raise
+        running -= 1
+        if isinstance(r, BaseException):
+            _stop(session, finished, running)
+            raise r
+        results[nid] = r
+        session.emit("node_result", **node_record(graph.nodes[nid], projects[nid], r))
+        ts.done(nid)
     status = max((r.status for r in results.values()), key=SEVERITY.index)
     done = sum(r.status == "done" for r in results.values())
     summary = f"{done} of {len(results)} nodes done"
     session.emit("workflow_result", status=status, summary=summary)
     return GraphResult(status, results)
+
+
+def _stop(session: Session, finished: queue.Queue[Any], running: int) -> None:
+    """Cancel the session and wait up to STOP_GRACE for running node threads, so their
+    commands are killed before the process exits and ends the daemon threads."""
+    session.cancel.set()
+    deadline = time.monotonic() + STOP_GRACE
+    while running > 0 and (left := deadline - time.monotonic()) > 0:
+        try:
+            finished.get(timeout=left)
+        except queue.Empty:
+            return
+        running -= 1
+
+
+def spec(node: Node, project: Path) -> str:
+    """A hash of what a node runs: its definition and its project. Resume reuses a
+    result only under the same hash."""
+    return hashlib.sha256(repr((node, str(project))).encode()).hexdigest()[:16]
+
+
+def node_record(node: Node, project: Path, r: NodeResult) -> dict[str, Any]:
+    """The node_result event's data: enough to rebuild r for resume."""
+    return {
+        "node": node.id,
+        "status": r.status,
+        "summary": r.summary,
+        "branch": r.branch,
+        "base": r.base,
+        "head": r.head,
+        "workdir": str(r.workdir or ""),
+        "files": str(r.files or ""),
+        "spec": spec(node, project),
+        "reused": r.reused,
+        "outputs": [
+            {
+                "name": a.name,
+                "content": a.content,
+                "kind": a.kind,
+                "origin": a.origin.value,
+                "source": a.source,
+                "untrusted": a.untrusted,
+            }
+            for a in r.outputs.values()
+        ],
+    }
+
+
+def resumable(
+    events: Sequence[Event], graph: Graph, projects: Mapping[str, Path]
+) -> dict[str, NodeResult]:
+    """The done results in an earlier run's events that a run of graph may reuse: same
+    spec, every need reused too, and a copy still at the recorded head."""
+    found = {
+        e.data.get("node"): e.data
+        for e in events
+        if e.kind == "node_result" and e.data.get("status") == "done"
+    }
+    reuse: dict[str, NodeResult] = {}
+    deps = {n.id: n.needs for n in graph.nodes.values()}
+    for nid in TopologicalSorter(deps).static_order():
+        node, d = graph.nodes[nid], found.get(nid)
+        if not d or d.get("spec") != spec(node, projects[nid]):
+            continue
+        if not all(n in reuse for n in node.needs):
+            continue
+        try:
+            workdir = Path(d["workdir"])
+            if head(workdir) != d["head"]:
+                continue
+            outputs = {
+                o["name"]: Artifact(
+                    o["name"],
+                    o["content"],
+                    o["kind"],
+                    Origin(o["origin"]),
+                    o["source"],
+                    o["untrusted"],
+                )
+                for o in d["outputs"]
+            }
+            reuse[nid] = NodeResult(
+                "done",
+                d["summary"],
+                {name.partition(".")[2]: a for name, a in outputs.items()},
+                workdir,
+                d["branch"],
+                d["base"],
+                d["head"],
+                Path(d["files"]) if d["files"] else None,
+                reused=True,
+            )
+        except (GraphError, KeyError, TypeError, ValueError):
+            continue  # a trace from before resume, or a copy that is gone
+    return reuse
+
+
+def serial_order(graph: Graph) -> list[str]:
+    """The order a run with max_parallel 1 starts nodes in."""
+    order = list(graph.nodes)
+    ts = TopologicalSorter({n.id: n.needs for n in graph.nodes.values()})
+    ts.prepare()
+    ready: list[str] = []
+    out = []
+    while ts.is_active():
+        ready += sorted(ts.get_ready(), key=order.index)
+        nid = ready.pop(0)
+        out.append(nid)
+        ts.done(nid)
+    return out
 
 
 def _run_node(
@@ -651,9 +805,11 @@ def _run_node(
         base, dirty = provision(src, ws, ref, branch)
     except GraphError as e:
         return NodeResult("failed", str(e))
-    files = work / "_files"  # no node id starts with _
-    reads = tuple(sorted({files / d for d in node.needs if (files / d).is_dir()}))
-    run = session.at(ws, node=node.id, budget=node.budget, reads=reads)
+    files = work / "_files" / node.id  # no node id starts with _
+    reads = tuple(sorted({f for d in node.needs if (f := results[d].files)}))
+    run = session.at(
+        ws, node=node.id, budget=node.budget, reads=reads, models=node.models
+    )
     run.emit("node", repo=node.repo, project=str(project), workflow=node.workflow)
     if node.trust_upstream:
         message = f"node {node.id} runs commands with network on code models changed"
@@ -697,25 +853,29 @@ def _run_node(
         new_head = commit(run.workdir, message, exclude)
     except GraphError as e:
         return copy("failed", f"cannot commit: {e}", head=base)
+    coded = any(role.name == "coder" for role, _ in run.results.values())
+    if status == "done" and new_head == base and coded:
+        run.emit("warning", message=f"node {node.id} changed nothing")
     outputs: dict[str, Artifact] = {}
     if status == "done":
         outputs = {a.name: replace(a, name=f"{node.id}.{a.name}") for a in r.artifacts}
-        for name, spec in node.outputs.items():
+        for name, extractor in node.outputs.items():
             try:
-                content = extract(spec, run.workdir, base, files / node.id)
+                content = extract(extractor, run.workdir, base, files)
             except (GraphError, OSError) as e:
                 status, summary = "failed", f"output {name}: {e}"
                 break
             outputs[name] = Artifact(
                 f"{node.id}.{name}",
                 content,
-                "file" if spec.startswith("file:") else "output",
+                "file" if extractor.startswith("file:") else "output",
                 # untrusted here may be first-hand web content no gate has seen
                 Origin.NET if r.untrusted else Origin.AGENT,
                 node.id,
                 r.untrusted,
             )
-    return copy(status, summary, outputs, head=new_head)
+    exported = files if files.is_dir() else None
+    return copy(status, summary, outputs, head=new_head, files=exported)
 
 
 def _bind(node: Node, results: Mapping[str, NodeResult]) -> dict[str, Any]:

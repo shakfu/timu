@@ -31,10 +31,13 @@ from timu.graph import (
     find_projects,
     parse_graph,
     provision,
+    resumable,
     run_graph,
+    serial_order,
 )
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider, call, calls, text
+from timu.role import Role
 from timu.sandbox import NoSandbox
 from timu.workflow import WORKFLOW_BUDGET, Options, Session
 
@@ -489,15 +492,25 @@ def two_projects(root: Path) -> tuple[Path, Path]:
 
 
 def engine(
-    tmp_path: Path, g: Graph, replies: list[Reply], **kw: Any
+    tmp_path: Path,
+    g: Graph,
+    replies: list[Reply],
+    run_kw: dict[str, Any] | None = None,
+    work: str = "work",
+    **kw: Any,
 ) -> tuple[Any, FakeProvider, list[Event], dict[str, Path]]:
+    """Run g with replies under tmp_path/work; run_kw goes to run_graph, kw to the
+    Session."""
     provider = FakeProvider(replies)
     events: list[Event] = []
+    run_id = kw.pop("run_id", "r1")
     session = Session(
-        lambda role: provider, events.append, run_id="r1", sandbox=NoSandbox(), **kw
+        lambda role: provider, events.append, run_id=run_id, sandbox=NoSandbox(), **kw
     )
     projects = find_projects(g, [tmp_path / "projects"])
-    result = run_graph(session, g, projects, tmp_path / "work", Options({}))
+    result = run_graph(
+        session, g, projects, tmp_path / work, Options({}), **(run_kw or {})
+    )
     return result, provider, events, projects
 
 
@@ -855,9 +868,10 @@ def test_a_missing_optional_result_fails_the_node(tmp_path: Path) -> None:
         '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\nneeds=["a"]\n'
         'inputs=["a.review"]\n'
     )
-    result, *_ = engine(tmp_path, g, [])
+    result, _, events, _ = engine(tmp_path, g, [])
     assert result.nodes["a"].status == "done"
     assert result.nodes["b"].summary == "no a.review to pass on"
+    assert not [e for e in events if e.kind == "warning"]  # no coder ran in a
 
 
 # ---- the CLI ----
@@ -923,3 +937,264 @@ def test_a_network_output_reaches_the_approval_gate(tmp_path: Path) -> None:
     assert asked == [("n.x", "coder")]
     assert result.nodes["c"].status == "refused"
     assert provider.requests == []
+
+
+# ---- models, parallel nodes and resume ----
+
+
+def test_models_pick_a_model_per_role(tmp_path: Path) -> None:
+    project(tmp_path / "projects", "a")
+    g = graph(BASE + 'models = { reviewer = "small" }\n')
+    assert g.nodes["a"].models == {"reviewer": "small"}
+    asked: list[tuple[str, str]] = []
+    small = FakeProvider([text("VERDICT: APPROVE")])
+
+    def model_provider(role: Role, model: str) -> FakeProvider:
+        asked.append((role.name, model))
+        return small
+
+    result, provider, *_ = engine(
+        tmp_path, g, [text("done")], model_provider=model_provider
+    )
+    assert result.status == "done", result.nodes
+    assert asked == [("reviewer", "small")]
+    assert (len(provider.requests), len(small.requests)) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("models", "message"),
+    [
+        ('{ lead = "x" }', "fix-review runs no lead; roles: coder, reviewer"),
+        ('{ coder = "" }', "models.coder must be a non-empty string"),
+        ('"x"', "models must be a table"),
+    ],
+)
+def test_models_errors(models: str, message: str) -> None:
+    with pytest.raises(GraphError, match=message):
+        graph(BASE + f"models = {models}\n")
+
+
+class PerThread:
+    """A FakeProvider per thread, so parallel nodes each get the whole script. The
+    first call in each thread waits until parties threads have made one."""
+
+    def __init__(self, script: list[Reply], parties: int) -> None:
+        self.script, self.local = script, threading.local()
+        self.barrier = threading.Barrier(parties, timeout=10)
+
+    def complete(self, messages: Any, tools: Any, on_text: Any = None) -> Reply:
+        if not hasattr(self.local, "fake"):
+            self.local.fake = FakeProvider(self.script)
+            self.barrier.wait()  # breaks, failing the node, unless both run at once
+        fake: FakeProvider = self.local.fake
+        return fake.complete(messages, tools, on_text)
+
+
+PARALLEL = BASE + '[nodes.c]\nrepo = "c"\nworkflow = "fix-review"\nobjective = "o"\n'
+
+
+def test_independent_nodes_run_at_once(tmp_path: Path) -> None:
+    project(tmp_path / "projects", "a")
+    project(tmp_path / "projects", "c")
+    shared = PerThread([text("done"), text("VERDICT: APPROVE")], 2)
+    events: list[Event] = []
+    session = Session(
+        lambda role: shared, events.append, run_id="r1", sandbox=NoSandbox()
+    )
+    g = graph(PARALLEL)
+    projects = find_projects(g, [tmp_path / "projects"])
+    result = run_graph(
+        session, g, projects, tmp_path / "work", Options({}), max_parallel=2
+    )
+    assert {n: r.status for n, r in result.nodes.items()} == {"a": "done", "c": "done"}
+    ids = [e.agent_id for e in events if e.kind == "start"]
+    assert sorted(ids) == ["a1", "a2", "a3", "a4"]  # unique across threads
+    assert events[-1].kind == "workflow_result"
+
+
+def test_a_node_error_reaches_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project(tmp_path / "projects", "a")
+    project(tmp_path / "projects", "c")
+
+    def boom(*args: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("timu.graph._run_node", boom)
+    cancel = threading.Event()
+    with pytest.raises(RuntimeError, match="boom"):
+        engine(tmp_path, graph(PARALLEL), [], {"max_parallel": 2}, cancel=cancel)
+    assert cancel.is_set()  # the other node stops too
+
+
+def test_serial_order_is_file_order_among_ready_nodes() -> None:
+    g = graph(
+        PARALLEL
+        + '[nodes.b]\nrepo = "b"\nworkflow = "fix-review"\nobjective = "o"\n'
+        + 'needs = ["a"]\n'
+    )
+    assert serial_order(g) == ["a", "c", "b"]
+
+
+def test_a_node_whose_coder_changed_nothing_is_flagged(tmp_path: Path) -> None:
+    project(tmp_path / "projects", "a")
+    result, _, events, _ = engine(
+        tmp_path, graph(BASE), [text("done"), text("VERDICT: APPROVE")]
+    )
+    assert result.status == "done"
+    warnings = [e.data["message"] for e in events if e.kind == "warning"]
+    assert "node a changed nothing" in warnings
+
+
+B_FAILS = [text("updated"), text("no verdict")]
+
+
+def test_resume_reuses_done_nodes_and_their_outputs(tmp_path: Path) -> None:
+    two_projects(tmp_path / "projects")
+    g = graph(AB)
+    first, _, events, projects = engine(tmp_path, g, A_WORK + B_FAILS)
+    assert {n: r.status for n, r in first.nodes.items()} == {"a": "done", "b": "failed"}
+    prior = resumable(events, g, projects)
+    assert list(prior) == ["a"]
+    assert (
+        prior["a"].outputs["notes"].content == first.nodes["a"].outputs["notes"].content
+    )
+    result, provider, again, _ = engine(
+        tmp_path, g, B_WORK, run_kw={"prior": prior}, work="work2", run_id="r2"
+    )
+    assert result.status == "done", result.nodes
+    assert result.nodes["a"].reused and result.nodes["a"].head == first.nodes["a"].head
+    assert len(provider.requests) == 2  # only b ran
+    b_coder = provider.requests[0].messages[1].content
+    assert "a.notes" in b_coder and "- new" in b_coder
+    record = next(e.data for e in again if e.kind == "node_result")
+    assert (record["node"], record["reused"]) == ("a", True)
+    assert list(resumable(again, g, projects)) == ["a", "b"]  # a resume of a resume
+
+
+def test_resume_reruns_a_changed_node_and_what_needs_it(tmp_path: Path) -> None:
+    two_projects(tmp_path / "projects")
+    g = graph(AB)
+    first, _, events, projects = engine(tmp_path, g, A_WORK + B_WORK)
+    assert first.status == "done"
+    changed = graph(AB.replace('objective = "bump"', 'objective = "bump it"'))
+    assert resumable(events, changed, projects) == {}
+    downstream = graph(AB.replace('objective = "update"', 'objective = "update it"'))
+    assert list(resumable(events, downstream, projects)) == ["a"]
+
+
+def test_resume_reruns_a_node_whose_copy_moved(tmp_path: Path) -> None:
+    two_projects(tmp_path / "projects")
+    g = graph(AB)
+    first, _, events, projects = engine(tmp_path, g, A_WORK + B_WORK)
+    git(first.nodes["a"].workdir, "commit", "-q", "--allow-empty", "-m", "later")
+    assert list(resumable(events, g, projects)) == []
+    shutil.rmtree(first.nodes["b"].workdir)
+    assert list(resumable(events, graph(BASE), projects)) == []  # a moved; b absent
+
+
+def cli_config(tmp_path: Path, extra: str = "") -> Path:
+    config = tmp_path / "timu.toml"
+    config.write_text(
+        '[provider]\nmodel = "m"\napi_key_env = ""\n'
+        f"[projects]\nroots = [{json.dumps(str(tmp_path / 'projects'))}]\n{extra}"
+    )
+    return config
+
+
+def test_cli_dry_run_prints_the_plan_and_runs_nothing(tmp_path: Path) -> None:
+    two_projects(tmp_path / "projects")
+    config = tmp_path / "timu.toml"
+    config.write_text(
+        '[provider]\nmodel = "m"\napi_key_env = "TIMU_TEST_NO_SUCH_KEY"\n'
+        '[roles.reviewer]\nmodel = "r"\n'
+        f"[projects]\nroots = [{json.dumps(str(tmp_path / 'projects'))}]\n"
+    )
+    file = tmp_path / "graph.toml"
+    file.write_text(
+        AB.replace(
+            'objective = "bump"', 'objective = "bump"\nbudget = { cost_usd = 1.5 }'
+        ).replace(
+            'objective = "update"', 'objective = "update"\nmodels = { coder = "c" }'
+        )
+    )
+    out, err = io.StringIO(), io.StringIO()
+    argv = ["graph", "run", "--dry-run", "--config", str(config), str(file)]
+    assert main(argv, out=out, err=err) == 0, err.getvalue()
+    projects = tmp_path / "projects"
+    assert out.getvalue() == (
+        "2 nodes, at most 1 at a time:\n"
+        f"  1. a: fix-review on {projects / 'a'}\n"
+        "       coder m, reviewer r\n"
+        "       cost cap $1.50\n"
+        f"  2. b: fix-review on {projects / 'b'} after a\n"
+        "       coder c, reviewer r\n"
+        "       cost cap none\n"
+        "ceiling: none; b set no budget.cost_usd and --max-cost is not given\n"
+    )
+    assert not (tmp_path / "state").exists()  # no trace, no copies
+    out = io.StringIO()
+    argv[3:3] = ["--max-cost", "3", "--max-parallel", "2"]
+    assert main(argv, out=out, err=err) == 0
+    assert out.getvalue().startswith("2 nodes, at most 2 at a time:")
+    assert out.getvalue().endswith("ceiling: $3.00, if the server reports cost\n")
+
+
+def test_cli_resume_and_report(tmp_path: Path) -> None:
+    two_projects(tmp_path / "projects")
+    config = cli_config(tmp_path)
+    file = tmp_path / "graph.toml"
+    file.write_text(AB)
+    argv = ["graph", "run", "--config", str(config), "--unsafe-no-sandbox", str(file)]
+    provider = FakeProvider(A_WORK + B_FAILS)
+    err = io.StringIO()
+    assert main(argv, provider_for=lambda role: provider, err=err) == 1
+    (trace,) = (tmp_path / "state" / "timu" / "runs").glob("*.jsonl")
+    provider = FakeProvider(B_WORK)
+    err = io.StringIO()
+    resume = [*argv[:2], "--resume", trace.stem, *argv[2:]]
+    assert main(resume, provider_for=lambda role: provider, err=err) == 0, (
+        err.getvalue()
+    )
+    assert f"timu: from {trace.stem}, reusing a" in err.getvalue()
+    assert "timu: node a: done (reused): approved in round 1" in err.getvalue()
+    out = io.StringIO()
+    assert main(["report"], out=out, err=io.StringIO()) == 0
+    rows = [line.split() for line in out.getvalue().splitlines()]
+    assert rows[0] == ["workflow", "runs", "done", "cost", "tokens", "time"]
+    assert rows[1][:4] == ["fix-review", "3", "2", "(66%)"]  # a, b, b; a reused ran not
+    out = io.StringIO()
+    assert main(["report", "--by", "project"], out=out, err=io.StringIO()) == 0
+    assert [r.split()[:2] for r in out.getvalue().splitlines()[1:]] == [
+        ["a", "1"],
+        ["b", "2"],
+    ]
+
+
+def test_cli_parallel_names_each_line_with_its_node(tmp_path: Path) -> None:
+    for name in ("a", "c"):
+        project(tmp_path / "projects", name)
+    file = tmp_path / "graph.toml"
+    file.write_text(PARALLEL)
+    shared = PerThread([text("done\n"), text("VERDICT: APPROVE")], 2)
+    out, err = io.StringIO(), io.StringIO()
+    argv = [
+        "graph",
+        "run",
+        "--max-parallel",
+        "2",
+        "--config",
+        str(cli_config(tmp_path)),
+    ]
+    argv += ["--unsafe-no-sandbox", str(file)]
+    assert main(argv, provider_for=lambda role: shared, out=out, err=err) == 0
+    assert sorted(out.getvalue().splitlines()) == [
+        "[a] VERDICT: APPROVE",
+        "[a] done",
+        "[c] VERDICT: APPROVE",
+        "[c] done",
+    ]
+    log = err.getvalue().splitlines()
+    assert "[a] == round 1 code" in log and "[c] == round 1 code" in log
+    assert "== node a: done: approved in round 1" in log  # node lines name it already

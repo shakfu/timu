@@ -10,10 +10,11 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import FrameType
@@ -21,13 +22,23 @@ from typing import Any, TextIO, TypeVar
 
 from timu.config import Config, ConfigError, load_config
 from timu.events import Event, JsonlSink
-from timu.graph import GraphError, GraphResult, find_projects, load_graph, run_graph
+from timu.graph import (
+    Graph,
+    GraphError,
+    GraphResult,
+    NodeResult,
+    find_projects,
+    load_graph,
+    resumable,
+    run_graph,
+    serial_order,
+)
 from timu.provider.base import Provider
 from timu.report import ReportError
 from timu.role import Role, RoleError
 from timu.sandbox import NoSandbox, Sandbox, detect, why_none
 from timu.tool import Tool
-from timu.trace import TraceError, load, render
+from timu.trace import BY, TraceError, load, render, totals
 from timu.types import Artifact, Result
 from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Options, Session, new_run_id
 
@@ -41,6 +52,9 @@ EXIT = {
 }
 T = TypeVar("T")
 USAGE_ERROR = 2
+# C0 and C1 controls but newline and tab, and bidi overrides: on a terminal they can
+# move the cursor, hide text or reorder it
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
 # workflow param -> `timu run` argument; a workflow gets the ones it declares
 RUN_PARAMS = {
     "review_to_fix": "review_to_fix",
@@ -50,20 +64,48 @@ RUN_PARAMS = {
 }
 
 
-class ConsoleSink:
-    """Model text to out; one line per tool call, warning and result to err."""
+def printable(text: str) -> str:
+    """text with each CONTROL character written as its escape, such as \\x1b."""
+    return CONTROL.sub(
+        lambda m: m.group().encode("unicode_escape").decode(),
+        text.replace("\r\n", "\n"),
+    )
 
-    def __init__(self, out: TextIO, err: TextIO, verbose: bool = False) -> None:
+
+class ConsoleSink:
+    """Model text to out; one line per tool call, warning and result to err. With
+    parallel, nodes run at once, so model text goes out by whole lines and each line
+    names its node."""
+
+    def __init__(
+        self, out: TextIO, err: TextIO, verbose: bool = False, parallel: bool = False
+    ) -> None:
         self.out, self.err, self.verbose = out, err, verbose
+        self.parallel = parallel
         self._mid_line = False
+        self._partial: dict[str, str] = {}  # agent id -> model text after its last \n
+        self._node = ""
 
     def __call__(self, e: Event) -> None:
         d, who = e.data, f"[{e.role} {e.agent_id}]"
+        self._node = e.node if self.parallel else ""
+        if e.kind == "model_delta" and self.parallel:
+            *lines, self._partial[e.agent_id] = (
+                self._partial.get(e.agent_id, "") + d["text"]
+            ).split("\n")
+            for line in lines:
+                self.out.write(
+                    printable(f"[{e.node}] {line}" if e.node else line) + "\n"
+                )
+            self.out.flush()
+            return
         if e.kind == "model_delta":
-            self.out.write(d["text"])
+            self.out.write(printable(d["text"]))
             self.out.flush()
             self._mid_line = not d["text"].endswith("\n")
             return
+        if e.kind == "result" and (rest := self._partial.pop(e.agent_id, "")):
+            self.out.write(printable(f"[{e.node}] {rest}" if e.node else rest) + "\n")
         if self._mid_line:
             self.out.write("\n")
             self.out.flush()
@@ -96,7 +138,9 @@ class ConsoleSink:
             self._line(f"{who} {d['status']}: {u['turns']} turns, {tokens} tokens")
 
     def _line(self, text: str) -> None:
-        self.err.write(text + "\n")
+        if self._node and not text.startswith("== node"):
+            text = f"[{self._node}] {text}"
+        self.err.write(printable(text) + "\n")
         self.err.flush()
 
 
@@ -122,6 +166,12 @@ def trace_dir(env: dict[str, str] | os._Environ[str] = os.environ) -> Path:
         Path(env.get("HOME", ".")) / ".local" / "state"
     )
     return Path(base) / "timu" / "runs"
+
+
+def positive(v: str) -> int:
+    if not v.isdigit() or int(v) < 1:
+        raise argparse.ArgumentTypeError(f"{v!r} is not a positive integer")
+    return int(v)
 
 
 def usd(v: str) -> float:
@@ -202,9 +252,37 @@ def parser() -> argparse.ArgumentParser:
         "run", parents=[common], help="run every node of a graph file"
     )
     graph_run.add_argument("file", type=Path, help="the graph file (docs/dev/graph.md)")
+    graph_run.add_argument(
+        "--max-parallel",
+        type=positive,
+        default=1,
+        help="how many nodes may run at once (default: 1)",
+    )
+    graph_run.add_argument(
+        "--resume",
+        metavar="RUN",
+        help="reuse the nodes an earlier run of this graph finished, where their "
+        "definition is unchanged and their copy is intact",
+    )
+    graph_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the nodes in order, their models and cost caps, and the ceiling; "
+        "run nothing",
+    )
     show = sub.add_parser("trace", help="show a run's agent tree, status and cost")
     show.add_argument(
         "run", nargs="?", help="a run id or .jsonl path; default: the latest run"
+    )
+    report = sub.add_parser(
+        "report", help="totals across every trace: runs, done, cost, time"
+    )
+    report.add_argument(
+        "--by",
+        choices=BY,
+        default="workflow",
+        help="group workflow runs and graph nodes by workflow or project, or agents "
+        "by model (default: workflow)",
     )
     return ap
 
@@ -219,13 +297,15 @@ def main(
     args = parser().parse_args(argv)
     if args.command == "trace":
         return show_trace(args.run, out, err)
+    if args.command == "report":
+        return show_report(args.by, out, err)
     if args.command == "graph":
         return run_graph_file(args, provider_for, out, err)
     workflow = WORKFLOWS[args.workflow]
     loaded = _load(args, workflow.roles, provider_for, err)
     if isinstance(loaded, int):
         return loaded
-    config, provider_for = loaded
+    config, provider_for, model_provider = loaded
     if not args.workdir.is_dir():
         err.write(f"timu: {args.workdir} is not a directory\n")
         return USAGE_ERROR
@@ -246,12 +326,19 @@ def main(
 
     def body(session: Session) -> Result:
         run = session.at(args.workdir)
+        session.emit("run", workflow=workflow.name, workdir=str(run.workdir))
         search = _search(session, config, workflow.roles)
         options = Options(config.role_skills, search, given)
         return workflow.run(run, args.objective, options)
 
     done = _execute(
-        args, config, provider_for, workflow.approve_untrusted, out, err, body
+        args,
+        config,
+        (provider_for, model_provider),
+        workflow.approve_untrusted,
+        out,
+        err,
+        body,
     )
     if isinstance(done, int):
         return done
@@ -266,7 +353,8 @@ def run_graph_file(
     out: TextIO,
     err: TextIO,
 ) -> int:
-    """`timu graph run FILE`: check the graph and find its projects, then run it."""
+    """`timu graph run FILE`: check the graph and find its projects, then run it, or
+    with --dry-run print its plan."""
     try:
         graph = load_graph(args.file)
     except GraphError as e:
@@ -274,28 +362,65 @@ def run_graph_file(
         return USAGE_ERROR
     workflows = [WORKFLOWS[n.workflow] for n in graph.nodes.values()]
     roles = tuple(dict.fromkeys(r for w in workflows for r in w.roles))
-    loaded = _load(args, roles, provider_for, err)
-    if isinstance(loaded, int):
-        return loaded
-    config, provider_for = loaded
+    if args.dry_run:
+        try:
+            config = load_config(args.config)
+        except ConfigError as e:
+            err.write(f"timu: {e}\n")
+            return USAGE_ERROR
+        model_provider = None
+    else:
+        loaded = _load(args, roles, provider_for, err)
+        if isinstance(loaded, int):
+            return loaded
+        config, provider_for, model_provider = loaded
     try:
         projects = find_projects(graph, config.project_roots)
     except GraphError as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
+    prior: dict[str, NodeResult] = {}
+    if args.resume:
+        try:
+            prior = resumable(load(_trace_path(args.resume)), graph, projects)
+        except TraceError as e:
+            err.write(f"timu: {e}\n")
+            return USAGE_ERROR
+        err.write(
+            f"timu: from {args.resume}, reusing {', '.join(prior) or 'no nodes'}\n"
+        )
+    if args.dry_run:
+        out.write(
+            plan(graph, projects, config, prior, args.max_cost, args.max_parallel)
+        )
+        return 0
+    assert provider_for is not None
 
     def body(session: Session) -> GraphResult:
         options = Options(config.role_skills, _search(session, config, roles))
         work = trace_dir().parent / "work" / session.run_id
-        return run_graph(session, graph, projects, work, options)
+        if args.resume:
+            session.emit("resume", run=args.resume, nodes=list(prior))
+        return run_graph(
+            session,
+            graph,
+            projects,
+            work,
+            options,
+            max_parallel=args.max_parallel,
+            prior=prior,
+        )
 
     gate = any(w.approve_untrusted for w in workflows)
-    done = _execute(args, config, provider_for, gate, out, err, body)
+    done = _execute(args, config, (provider_for, model_provider), gate, out, err, body)
     if isinstance(done, int):
         return done
     result, trace = done
     for nid, r in result.nodes.items():
-        err.write(f"timu: node {nid}: {r.status}: {r.summary}\n")
+        reused = " (reused)" if r.reused else ""
+        err.write(
+            printable(f"timu: node {nid}: {r.status}{reused}: {r.summary}") + "\n"
+        )
         if r.head != r.base:
             ref = f"{r.branch}:{r.branch}"
             err.write(f"timu:   git -C {projects[nid]} fetch {r.workdir} {ref}\n")
@@ -303,14 +428,68 @@ def run_graph_file(
     return EXIT[result.status]
 
 
+def plan(
+    graph: Graph,
+    projects: Mapping[str, Path],
+    config: Config,
+    prior: Mapping[str, NodeResult],
+    max_cost: float | None,
+    max_parallel: int,
+) -> str:
+    """What `graph run` would do: each node in the order a serial run starts them,
+    its models and cost cap, and the most the run can spend."""
+    lines = [f"{len(graph.nodes)} nodes, at most {max_parallel} at a time:"]
+    uncapped, caps = [], 0.0
+    for n, nid in enumerate(serial_order(graph), 1):
+        node = graph.nodes[nid]
+        wf = WORKFLOWS[node.workflow]
+        needs = f" after {', '.join(node.needs)}" if node.needs else ""
+        lines.append(f"{n:3}. {nid}: {node.workflow} on {projects[nid]}{needs}")
+        if nid in prior:
+            lines.append("       reused from the earlier run")
+            continue
+        if not wf.roles:
+            lines.append("       commands only; no model")
+            continue
+        models = ", ".join(
+            f"{r} {node.models.get(r) or config.model_for(r) or '(no model)'}"
+            for r in wf.roles
+        )
+        lines.append(f"       {models}")
+        cap = node.budget.cost_usd if node.budget else None
+        lines.append(f"       cost cap {f'${cap:.2f}' if cap is not None else 'none'}")
+        if cap is None:
+            uncapped.append(nid)
+        else:
+            caps += cap
+    if uncapped and max_cost is None:
+        lines.append(
+            f"ceiling: none; {', '.join(uncapped)} set no budget.cost_usd and "
+            "--max-cost is not given"
+        )
+    else:
+        ceiling = min(caps if not uncapped else math.inf, max_cost or math.inf)
+        lines.append(f"ceiling: ${ceiling:.2f}, if the server reports cost")
+    return "\n".join(lines) + "\n"
+
+
 def _load(
     args: argparse.Namespace,
     roles: Sequence[str],
     provider_for: Callable[[Role], Provider] | None,
     err: TextIO,
-) -> tuple[Config, Callable[[Role], Provider]] | int:
-    """The config and a provider for each role, checked before the run so it does not
-    fail halfway. A usage error code instead, after reporting it."""
+) -> (
+    tuple[
+        Config,
+        Callable[[Role], Provider],
+        Callable[[Role, str], Provider] | None,
+    ]
+    | int
+):
+    """The config, a provider for each role, and one for a role at a model a graph
+    node names, checked before the run so it does not fail halfway. A usage error
+    code instead, after reporting it. A given provider_for serves every model."""
+    model_provider = None
     try:
         config = load_config(args.config)
         if provider_for is None:
@@ -319,10 +498,11 @@ def _load(
             if "researcher" in roles:
                 config.search_tool()  # a bad key file fails here, not mid-run
             provider_for = lambda role: config.provider(role.name)
+            model_provider = lambda role, model: config.provider(role.name, model=model)
     except ConfigError as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
-    return config, provider_for
+    return config, provider_for, model_provider
 
 
 def _search(session: Session, config: Config, roles: Sequence[str]) -> Tool | None:
@@ -342,7 +522,9 @@ def _search(session: Session, config: Config, roles: Sequence[str]) -> Tool | No
 def _execute(
     args: argparse.Namespace,
     config: Config,
-    provider_for: Callable[[Role], Provider],
+    providers: tuple[
+        Callable[[Role], Provider], Callable[[Role, str], Provider] | None
+    ],
     gate_default: bool,
     out: TextIO,
     err: TextIO,
@@ -362,7 +544,7 @@ def _execute(
     trace = trace_dir() / f"{run_id}.jsonl"
     trace.parent.mkdir(parents=True, exist_ok=True)
     cancel = threading.Event()
-    console = ConsoleSink(out, err, args.verbose)
+    console = ConsoleSink(out, err, args.verbose, getattr(args, "max_parallel", 1) > 1)
 
     def on_sigint(sig: int, frame: FrameType | None) -> None:
         if cancel.is_set():
@@ -379,13 +561,14 @@ def _execute(
                 console(e)
 
             session = Session(
-                provider_for,
+                providers[0],
                 sink,
                 replace(WORKFLOW_BUDGET, cost_usd=args.max_cost),
                 run_id=run_id,
                 cancel=cancel,
                 approve=tty_approve if gate else None,
                 sandbox=sandbox,
+                model_provider=providers[1],
             )
             session.emit("config", source=config.source)
             result = body(session)
@@ -401,22 +584,29 @@ def _execute(
 
 
 def tty_approve(artifact: Artifact, role: Role, tty: str = "/dev/tty") -> bool:
-    """Show web content and ask on the terminal whether role may receive it. No
-    terminal means no. A terminal is not seekable, so it is opened unbuffered."""
+    """Show web content, all of it and with control characters escaped, and ask on
+    the terminal whether role may receive it. No terminal means no. A terminal is
+    not seekable, so it is opened unbuffered."""
     try:
         f = open(tty, "r+b", buffering=0)  # noqa: SIM115 - closed by the with below
     except OSError:
         return False
-    lines = artifact.content.splitlines()
-    more = f"\n[... {len(lines) - 40} more lines]" if len(lines) > 40 else ""
-    shown = "\n".join(lines[:40]) + more
+    n = len(artifact.content.splitlines())
+    head = f"untrusted {artifact.name} from {artifact.source}, {n} lines"
     with f:
         f.write(
-            f"\n--- untrusted {artifact.name} from {artifact.source} ---\n{shown}\n---\n"
-            f"Pass this to the {role.name}? [y/N] ".encode()
+            printable(
+                f"\n--- {head} ---\n{artifact.content}\n--- end of {head} ---\n"
+                f"Pass this to the {role.name}? [y/N] "
+            ).encode()
         )
         answer = f.readline().decode(errors="replace")
     return answer.strip().lower() in ("y", "yes")
+
+
+def _trace_path(run: str) -> Path:
+    """run as a trace: a .jsonl path, or a run id in trace_dir."""
+    return Path(run) if run.endswith(".jsonl") else trace_dir() / f"{run}.jsonl"
 
 
 def show_trace(run: str | None, out: TextIO, err: TextIO) -> int:
@@ -429,7 +619,7 @@ def show_trace(run: str | None, out: TextIO, err: TextIO) -> int:
             return USAGE_ERROR
         path = found[-1]
     else:
-        path = Path(run) if run.endswith(".jsonl") else runs / f"{run}.jsonl"
+        path = _trace_path(run)
     try:
         out.write(render(load(path)) + "\n")
     except TraceError as e:
@@ -439,10 +629,28 @@ def show_trace(run: str | None, out: TextIO, err: TextIO) -> int:
     return 0
 
 
+def show_report(by: str, out: TextIO, err: TextIO) -> int:
+    """Print totals across every trace in trace_dir, grouped by by."""
+    runs = trace_dir()
+    traces, unreadable = [], 0
+    for path in sorted(runs.glob("*.jsonl")):
+        try:
+            traces.append(load(path))
+        except TraceError:
+            unreadable += 1
+    if not traces:
+        err.write(f"timu: no traces in {runs}\n")
+        return USAGE_ERROR
+    out.write(printable(totals(traces, by)) + "\n")
+    if unreadable:
+        err.write(f"timu: skipped {unreadable} unreadable traces in {runs}\n")
+    return 0
+
+
 def _report(result: Result, trace: Path, err: TextIO) -> None:
     u = result.usage
     cost = f", ${u.cost_usd:.4f}" if u.cost_usd else ""
-    err.write(f"\ntimu: {result.status}: {result.summary}\n")
+    err.write(printable(f"\ntimu: {result.status}: {result.summary}") + "\n")
     err.write(
         f"timu: {u.turns} turns, {u.tool_calls} tool calls, {u.tokens} tokens{cost}\n"
     )

@@ -91,7 +91,7 @@ The prompt does not enforce a denied capability. Leaving a tool out does not enf
 |-|-|
 | `fs.read` | Path check against allowed roots, after resolving symlinks. |
 | `fs.write` | Same, plus atomic writes. Never inside `.git`, where hooks and config can run commands. |
-| `exec` | Subprocess in a sandbox. It writes only the write roots and a private temp dir, never `.git`. Under `$HOME` it reads only the read roots and configured toolchain paths; elsewhere reads are allowed, except the host socket directories that `sandbox.py` lists. No network. The environment is scrubbed, and `HOME` is the temp dir. |
+| `exec` | Subprocess in a sandbox. It writes only the write roots and a private temp dir, and never a `.git` outside the temp dir: existing ones, at any depth, are read-only, and a new one, such as a clone, is removed after the command, which fails. So is a new `timu.toml` or `.timu`. Under `$HOME` it reads only the read roots and configured toolchain paths; elsewhere reads are allowed, except the host socket directories that `sandbox.py` lists. No network. The environment is scrubbed, and `HOME` is the temp dir. |
 | `net` | Only the `web_fetch` / `web_search` tools, or an exec sandbox with network on. |
 
 Sandbox backends: `sandbox-exec` with a generated profile on macOS; `bwrap` on Linux. The `sandbox.py` module docstring lists where the two differ. If no backend is available, a role with `exec` fails at startup unless the caller passes `NoSandbox()` explicitly. It must not run with network access by mistake.

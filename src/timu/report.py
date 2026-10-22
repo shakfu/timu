@@ -6,7 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from timu.tools.fs import atomic_write
+from timu.tools.fs import atomic_write, reserved
 
 MAX_REPORT = 256 * 1024  # bytes
 
@@ -16,8 +16,9 @@ class ReportError(ValueError):
 
 
 def file_root(workdir: Path, path: str) -> Path:
-    """path as a single-file root: inside workdir, with an existing parent, not a
-    symlink and not a directory. workdir must be resolved. Raises ReportError."""
+    """path as a single-file root: inside workdir and not reserved (fs.reserved),
+    with an existing parent, not a symlink and not a directory. workdir must be
+    resolved. Raises ReportError."""
     lexical = workdir / path
     try:
         parent = Path(os.path.realpath(lexical.parent, strict=True))
@@ -26,6 +27,8 @@ def file_root(workdir: Path, path: str) -> Path:
     target = parent / lexical.name
     if not target.is_relative_to(workdir):
         raise ReportError(f"{path} is outside the workdir")
+    if why := reserved(workdir, target):
+        raise ReportError(f"{path}: {why}")
     if target.is_symlink():
         raise ReportError(f"{path} is a symlink")
     if target.is_dir():

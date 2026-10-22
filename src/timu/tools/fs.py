@@ -98,21 +98,27 @@ def readable(ctx: Context, raw: str) -> Path:
     return real
 
 
+def reserved(workdir: Path, real: Path) -> str | None:
+    """Why no agent may write the resolved path real, or None. Shared by the write
+    tools and the report writer."""
+    # casefold: macOS volumes are case-insensitive, and realpath keeps the given case
+    if ".git" in (p.casefold() for p in real.parts):  # hooks and config can run code
+        return "writes inside .git are not allowed"
+    rel = real.relative_to(workdir).parts if real.is_relative_to(workdir) else ()
+    if rel and rel[0].casefold() in PROTECTED:
+        return "timu reads this on later runs; agents may not write it"
+    return None
+
+
 def writable(ctx: Context, raw: str) -> Path:
     lexical = _lexical(ctx, raw)
     if lexical in ctx.write_files and lexical.is_symlink():
         raise FsError(f"{raw}: is a symlink; refusing to write through it")
     real = _real(lexical)
-    # casefold: macOS volumes are case-insensitive, and realpath keeps the given case
-    if ".git" in (p.casefold() for p in real.parts):  # hooks and config can run code
-        raise FsError(f"{raw}: writes inside .git are not allowed")
+    if why := reserved(ctx.workdir, real):
+        raise FsError(f"{raw}: {why}")
     if real in ctx.write_files:
         return real
-    rel = (
-        real.relative_to(ctx.workdir).parts if real.is_relative_to(ctx.workdir) else ()
-    )
-    if rel and rel[0].casefold() in PROTECTED:
-        raise FsError(f"{raw}: timu reads this on later runs; agents may not write it")
     if _within(real, ctx.write_roots):
         return real
     raise FsError(f"{raw}: outside the writable roots")

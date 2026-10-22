@@ -27,6 +27,7 @@ from timu.trace import (
     render,
     replies,
     save,
+    totals,
     tree,
 )
 from timu.workflow import Run, fix_review, lead
@@ -278,3 +279,52 @@ def test_recorded_traces_replay(tmp_path: Path, path: Path) -> None:
     trace = load(path)
     diff = compare(trace, replay(tmp_path, meta["scenario"], trace))
     assert diff is None, f"{path.name}: {diff}"
+
+
+# ---- totals ----
+
+
+def _ev(kind: str, ts: float, at: str = "", agent: str = "", **data: Any) -> Event:
+    """An event; at is the graph node whose Run emitted it."""
+    return Event(kind, agent, "", "workflow" if not agent else "coder", ts, data, at)
+
+
+def test_totals_by_workflow_project_and_model() -> None:
+    usage = {"turns": 1, "input_tokens": 100, "output_tokens": 20, "cost_usd": 0.5}
+    single = [
+        _ev("run", 0, workflow="fix-review", workdir="/p/calc"),
+        _ev("start", 1, agent="a1", model="m1"),
+        _ev("result", 61, agent="a1", status="done", usage=usage),
+        _ev("workflow_result", 62, status="done"),
+    ]
+    graph_run = [
+        _ev("node", 0, at="x", workflow="commands", repo="lib"),
+        _ev("node_result", 5, node="x", status="done"),
+        _ev("node", 5, at="y", workflow="fix-review", repo="calc"),
+        _ev("start", 6, at="y", agent="a1", model="m2"),
+        _ev("result", 9, at="y", agent="a1", status="failed", usage=usage),
+        _ev("node_result", 10, node="y", status="failed"),
+        _ev("workflow_result", 10, status="failed"),
+    ]
+    old = [_ev("start", 0, agent="a1"), _ev("workflow_result", 1, status="done")]
+    assert totals([single, graph_run, old], "workflow").splitlines() == [
+        "workflow    runs  done      cost   tokens  time",
+        "?           1     1 (100%)  $0.00  0       0m01s",
+        "commands    1     1 (100%)  $0.00  0       0m05s",
+        "fix-review  2     1 (50%)   $1.00  240     1m07s",
+    ]
+    assert [
+        r.split()[:2] for r in totals([single, graph_run], "project").splitlines()
+    ] == [
+        ["project", "runs"],
+        ["calc", "2"],
+        ["lib", "1"],
+    ]
+    assert [
+        r.split()[:3] for r in totals([single, graph_run, old], "model").splitlines()
+    ] == [
+        ["model", "agents", "done"],
+        ["?", "1", "0"],
+        ["m1", "1", "1"],
+        ["m2", "1", "0"],
+    ]

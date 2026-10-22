@@ -75,10 +75,11 @@ class Config:
         return self.role_models.get(role) or self.model
 
     def provider(
-        self, role: str, env: Mapping[str, str] = os.environ
+        self, role: str, env: Mapping[str, str] = os.environ, model: str = ""
     ) -> OpenAIProvider:
-        """A provider for role. Raises ConfigError if the model or key is missing."""
-        model = self.model_for(role)
+        """A provider for role, at model if given. Raises ConfigError if the model or
+        key is missing."""
+        model = model or self.model_for(role)
         if not model:
             raise ConfigError(
                 f"{self.source}: no model; set provider.model or TIMU_MODEL"

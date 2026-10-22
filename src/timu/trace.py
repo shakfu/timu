@@ -22,7 +22,9 @@ from timu.provider.fake import FakeProvider
 from timu.tool import Context, Tool, ToolOutput
 from timu.types import Capability, Usage
 
-IGNORED = frozenset({"model_delta", "warning", "config"})  # chunks; environment notices
+# chunks; environment notices; labels that replay, which runs the workflow directly,
+# does not emit
+IGNORED = frozenset({"model_delta", "warning", "config", "run", "resume"})
 
 
 class TraceError(ValueError):
@@ -189,6 +191,101 @@ def _usage(d: Any) -> Usage:
         return Usage()
     names = ("turns", "tool_calls", "input_tokens", "output_tokens", "cost_usd")
     return Usage(**{k: d[k] for k in names if isinstance(d.get(k), int | float)})
+
+
+# ---- totals across runs ----
+
+BY = ("workflow", "project", "model")
+
+
+@dataclass
+class _Unit:
+    """One workflow run, graph node or agent, for totals."""
+
+    key: str
+    status: str = "unfinished"
+    usage: Usage = field(default_factory=Usage)
+    start: float = 0.0
+    end: float = 0.0
+
+
+def units(events: Sequence[Event], by: str) -> list[_Unit]:
+    """events as units for totals: agents by model; else each `timu run` or graph
+    node, keyed by workflow or project. A trace from before the run event has
+    workflow and project ?."""
+    if not events:
+        return []
+    if by == "model":
+        agents: dict[str, _Unit] = {}
+        for e in events:
+            if e.kind == "start":
+                key = str(e.data.get("model") or "?")
+                agents[e.agent_id] = _Unit(key, start=e.ts, end=e.ts)
+            elif e.kind == "result" and (u := agents.get(e.agent_id)):
+                u.status = str(e.data.get("status", "?"))
+                u.usage, u.end = _usage(e.data.get("usage")), e.ts
+        return list(agents.values())
+    field_ = "repo" if by == "project" else "workflow"
+    nodes = {e.node: e for e in events if e.kind == "node"}
+    if not nodes:
+        run = next((e for e in events if e.kind == "run"), None)
+        key = "?"
+        if run:
+            key = str(run.data.get("workflow" if by == "workflow" else "workdir", "?"))
+            key = key if by == "workflow" else Path(key).name
+        u = _Unit(key, start=events[0].ts, end=events[-1].ts)
+        outcome = [e for e in events if e.kind == "workflow_result" and not e.node]
+        u.status = str(outcome[-1].data.get("status", "?")) if outcome else u.status
+        for e in events:
+            if e.kind == "result":
+                u.usage += _usage(e.data.get("usage"))
+        return [u]
+    out: dict[str, _Unit] = {}
+    for nid, e in nodes.items():
+        out[nid] = _Unit(str(e.data.get(field_, "?")), start=e.ts, end=e.ts)
+    for e in events:
+        if e.kind == "result" and (u := out.get(e.node)):
+            u.usage += _usage(e.data.get("usage"))
+        elif e.kind == "node_result" and (u := out.get(str(e.data.get("node")))):
+            u.status, u.end = str(e.data.get("status", "?")), e.ts
+    return list(out.values())
+
+
+def totals(traces: Sequence[Sequence[Event]], by: str) -> str:
+    """A table over traces: per key, how many units, how many ended done, their cost,
+    tokens and time. Units still unfinished count but are never done."""
+    rows: dict[str, list[_Unit]] = {}
+    for events in traces:
+        for u in units(events, by):
+            rows.setdefault(u.key, []).append(u)
+    head = (by, "runs" if by != "model" else "agents", "done", "cost", "tokens", "time")
+    table = [head]
+    for key in sorted(rows):
+        us = rows[key]
+        done = sum(u.status == "done" for u in us)
+        usage = sum((u.usage for u in us), Usage())
+        seconds = sum(u.end - u.start for u in us)
+        table.append(
+            (
+                key,
+                str(len(us)),
+                f"{done} ({100 * done // len(us)}%)",
+                f"${usage.cost_usd:.2f}",
+                str(usage.tokens),
+                _duration(seconds),
+            )
+        )
+    widths = [max(len(r[i]) for r in table) for i in range(len(head))]
+    return "\n".join(
+        "  ".join(c.ljust(w) for c, w in zip(r, widths, strict=True)).rstrip()
+        for r in table
+    )
+
+
+def _duration(seconds: float) -> str:
+    m, s = divmod(round(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02}m" if h else f"{m}m{s:02}s"
 
 
 # ---- replay ----

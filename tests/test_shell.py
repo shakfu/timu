@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from timu.role import make_context
 from timu.sandbox import MacSandbox, NoSandbox, Policy, Sandbox, detect, mac_profile
 from timu.skills import find
 from timu.tools.fs import EDIT, READ, WRITE
-from timu.tools.shell import SHELL
+from timu.tools.shell import SHELL, Ran, refusal, run_sh
 
 mac_only = pytest.mark.skipif(
     not isinstance(detect(), MacSandbox), reason="needs macOS sandbox-exec"
@@ -73,6 +74,75 @@ def sh(ctx: Context, command: str, **args: Any) -> ToolOutput:
 
 
 # ---- the tool, on any backend ----
+
+
+def test_new_git_and_timu_entries_are_removed(dirs: tuple[Path, Path, Path]) -> None:
+    ws, tmp, _ = dirs
+    (ws / "vendor" / ".git").mkdir(parents=True)  # existing: kept
+    ctx = ctx_for(dirs, NoSandbox())
+    out = sh(ctx, "git init -q sub && echo x > timu.toml && mkdir .timu && echo ok")
+    assert out.is_error
+    first, rest = out.text.split("\n", 1)
+    assert first == (
+        "refused: commands may create .git only under $TMPDIR, and never "
+        "timu.toml or .timu; created timu.toml, .timu, sub/.git; removed"
+    )
+    assert rest == "ok\n[exit 0]"
+    assert not (ws / "timu.toml").exists() and not (ws / ".timu").exists()
+    assert not (ws / "sub" / ".git").exists() and (ws / "sub").is_dir()
+    assert (ws / "vendor" / ".git").is_dir()
+    assert not sh(ctx, 'git init -q "$TMPDIR/clone"').is_error  # scratch
+    assert (tmp / "clone" / ".git").is_dir()
+
+
+def test_a_hidden_directory_is_still_scanned(dirs: tuple[Path, Path, Path]) -> None:
+    ws = dirs[0]
+    (ws / "own").mkdir(mode=0o300)  # the user's, unreadable before the command
+    out = sh(ctx_for(dirs, NoSandbox()), "git init -q a/b && chmod 000 a/b a")
+    assert out.is_error and "created a/b/.git; removed" in out.text
+    assert not (ws / "a" / "b" / ".git").exists()
+    assert (ws / "own").stat().st_mode & 0o777 == 0o300  # restored
+    assert (ws / "a").stat().st_mode & 0o777 == 0
+    for d in ("a", "a/b", "own"):  # so pytest can delete them
+        os.chmod(ws / d, 0o700)
+
+
+def test_existing_git_entries_are_read_only(dirs: tuple[Path, Path, Path]) -> None:
+    ws, tmp, _ = dirs
+    (ws / ".git").mkdir()
+    (ws / "vendor" / ".git").mkdir(parents=True)
+    (ws / "sub").mkdir()
+    (ws / "sub" / ".git").write_text("gitdir: ../.git/modules/sub\n")
+    policies: list[Policy] = []
+
+    class Recorder:
+        def wrap(self, argv: Sequence[str], policy: Policy) -> list[str]:
+            policies.append(policy)
+            return list(argv)
+
+    run_sh(
+        "true",
+        cwd=ws,
+        sandbox=Recorder(),
+        policy=Policy((ws,), (ws, tmp), (ws / "timu.toml",), scratch=(tmp,)),
+        env={},
+        timeout=5,
+        cancel=threading.Event(),
+        max_output=1024,
+    )
+    assert policies[0].deny_write == (
+        ws / "timu.toml",
+        ws / ".git",
+        ws / "sub" / ".git",
+        ws / "vendor" / ".git",
+    )
+
+
+def test_refusal_names_what_was_left() -> None:
+    ran = Ran("", 0, created=(Path("/w/.timu"),), left=(Path("/w/.timu"),))
+    assert refusal(ran, Path("/w")).endswith(
+        "could not remove .timu, delete it before running git or timu"
+    )
 
 
 def test_output_and_exit_status(dirs: tuple[Path, Path, Path]) -> None:
@@ -290,6 +360,16 @@ def test_profile_denies_after_allowing_writes() -> None:
     policy = Policy((), (Path("/w"),), (Path("/w/timu.toml"),))
     lines = mac_profile(policy, None).splitlines()
     assert lines[-1] == '(deny file-write* (subpath "/w/timu.toml"))'
+
+
+def test_profile_allows_git_only_in_scratch() -> None:
+    policy = Policy(
+        (), (Path("/w"), Path("/t")), (Path("/w/.git"),), scratch=(Path("/t"),)
+    )
+    lines = mac_profile(policy, None).splitlines()
+    deny_git = lines.index('(deny file-write* (regex #"/\\.git(/|$)"))')
+    assert lines[deny_git + 1] == '(allow file-write* (subpath "/t"))'
+    assert lines[deny_git + 2] == '(deny file-write* (subpath "/w/.git"))'
 
 
 def test_profile_quotes_paths() -> None:

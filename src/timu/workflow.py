@@ -4,6 +4,8 @@ the agents it starts; a Run binds it to one workdir. WORKFLOWS holds the built-i
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -35,7 +37,7 @@ from timu.roles import (
 )
 from timu.sandbox import Policy, Sandbox
 from timu.tool import PROTECTED, DelegateError, Tool
-from timu.tools.shell import run_sh, scrubbed_env
+from timu.tools.shell import refusal, run_sh, scrubbed_env
 from timu.tools.web import WEB_FETCH
 from timu.types import Artifact, Budget, Capability, Origin, Result, Status, Task, Usage
 
@@ -55,7 +57,8 @@ def new_run_id() -> str:
 class Session:
     """What every Run in one invocation shares: id, sink, budget, cancel flag and
     approvals. The budget is charged live as each agent spends, so agents running at
-    once (a lead and its children) draw from the same remainder."""
+    once (a lead and its children, or parallel graph nodes) draw from the same
+    remainder. lock guards the shared state and the sink, so Runs may run in threads."""
 
     def __init__(
         self,
@@ -70,12 +73,23 @@ class Session:
         clock: Callable[[], float] = time.monotonic,
         approve: Callable[[Artifact, Role], bool] | None = None,
         max_depth: int = 2,
+        model_provider: Callable[[Role, str], Provider] | None = None,
     ) -> None:
         """approve, if given, is asked before web content first reaches a role that can
         run commands or write files, and before a task an agent wrote reaches a role
-        with net (design 6)."""
+        with net (design 6). model_provider gives a provider for a role at a model a
+        graph node names; without it, provider_for serves every model."""
+        self.lock = threading.RLock()
         self.provider_for = provider_for
-        self.sink = sink
+        self.model_provider = model_provider or (
+            lambda role, _model: provider_for(role)
+        )
+
+        def locked(e: Event) -> None:
+            with self.lock:
+                sink(e)
+
+        self.sink: EventSink = locked
         self.budget = budget
         self.run_id = run_id or new_run_id()
         self.cancel = cancel or threading.Event()
@@ -97,11 +111,13 @@ class Session:
         node: str = "",
         budget: Budget | None = None,
         reads: tuple[Path, ...] = (),
+        models: Mapping[str, str] | None = None,
     ) -> Run:
         """A Run on workdir in this session. Its events carry node; budget, if given,
-        caps what its agents spend together. Its command steps may read reads."""
+        caps what its agents spend together. Its command steps may read reads. models
+        maps a role name to the model its agents use instead of the configured one."""
         run = Run.__new__(Run)
-        run._bind(self, workdir, roles, node, budget, reads)
+        run._bind(self, workdir, roles, node, budget, reads, models)
         return run
 
     def emit(self, kind: str, **data: Any) -> None:
@@ -152,9 +168,11 @@ class Run:
         node: str = "",
         budget: Budget | None = None,
         reads: tuple[Path, ...] = (),
+        models: Mapping[str, str] | None = None,
     ) -> None:
         self.session = session
         self.reads = reads
+        self.models = dict(models or {})
         self.workdir = Path(os.path.realpath(workdir))
         self.roles = dict(roles or {})
         self.node = node
@@ -188,8 +206,9 @@ class Run:
     ) -> Result:
         """Build an agent for role and run task. Raises RoleError for a bad role."""
         ses = self.session
-        ses.agents += 1
-        agent_id = f"a{ses.agents}"
+        with ses.lock:
+            ses.agents += 1
+            agent_id = f"a{ses.agents}"
         inherited = (
             parent_id in self._tainted
         )  # the task was written after reading web content
@@ -200,9 +219,10 @@ class Run:
             return Result("budget", f"{scope} budget exhausted", (), Usage(), agent_id)
         if inherited or any(a.tainted for a in task.inputs):
             self._tainted.add(agent_id)  # goals it writes follow its inputs
+        model = self.models.get(role.name)
         agent = Agent(
             role,
-            ses.provider_for(role),
+            ses.model_provider(role, model) if model else ses.provider_for(role),
             self.sink,
             self.workdir,
             agent_id=agent_id,
@@ -224,7 +244,8 @@ class Run:
 
     def _charge(self, delta: Usage) -> None:
         self.used += delta
-        self.session.used += delta
+        with self.session.lock:
+            self.session.used += delta
 
     def _caps(self) -> list[tuple[str, Budget, Usage, float]]:
         """(scope, budget, used, elapsed) for the session and, if capped, this Run."""
@@ -322,21 +343,22 @@ class Run:
         risky = role.grants & {Capability.EXEC, Capability.FS_WRITE}
         if approve is None or not (outbound or risky):
             return None
-        pending = [
-            a
-            for a in task.inputs
-            if (outbound or a.origin is Origin.NET) and a not in approved
-        ]
-        if inherited or outbound:
-            pending.append(
-                Artifact("goal", task.goal, "goal", Origin.AGENT, parent_id, True)
-            )
-        for a in pending:
-            ok = approve(a, role)
-            self.emit("approval", artifact=a.name, role=role.name, approved=ok)
-            if not ok:
-                return f"untrusted input {a.name} was not approved for {role.name}"
-            approved.add(a)
+        with self.session.lock:  # one prompt at a time; other nodes' output waits
+            pending = [
+                a
+                for a in task.inputs
+                if (outbound or a.origin is Origin.NET) and a not in approved
+            ]
+            if inherited or outbound:
+                pending.append(
+                    Artifact("goal", task.goal, "goal", Origin.AGENT, parent_id, True)
+                )
+            for a in pending:
+                ok = approve(a, role)
+                self.emit("approval", artifact=a.name, role=role.name, approved=ok)
+                if not ok:
+                    return f"untrusted input {a.name} was not approved for {role.name}"
+                approved.add(a)
         return None
 
     def _child_budget(self, want: Budget) -> Budget | None:
@@ -568,7 +590,9 @@ def run_steps(
     summary = f"{len(steps)} commands passed"
     with tempfile.TemporaryDirectory(prefix="timu-") as tmp:
         home = Path(os.path.realpath(tmp))
-        step_policy = replace(policy, write_roots=(*policy.write_roots, home))
+        step_policy = replace(
+            policy, write_roots=(*policy.write_roots, home), scratch=(home,)
+        )
         for cmd in steps:
             left, scope = run._limit(
                 Budget(turns=1, tool_calls=1, tokens=1, wall_seconds=timeout)
@@ -587,7 +611,10 @@ def run_steps(
                 cancel=ses.cancel,
                 max_output=MAX_LOG,
             )
-            if ran.stopped:
+            if ran.created:
+                end = refusal(ran, run.workdir)
+                run.emit("warning", message=f"`{cmd}`: {end}")
+            elif ran.stopped:
                 end = ran.stopped
             elif ran.code is None:
                 end = "not started"
@@ -595,7 +622,7 @@ def run_steps(
                 end = f"exit {ran.code}"
             run.emit("command_result", command=cmd, result=end)
             log.append(f"$ {cmd}\n{ran.text.rstrip()}\n[{end}]\n")
-            if ran.code != 0:
+            if ran.code != 0 or ran.created:
                 status = "cancelled" if ran.stopped == "cancelled" else "failed"
                 summary = f"`{cmd}` failed: {end}"
                 break
@@ -617,6 +644,49 @@ def commands(
     return Result(status, summary, (log,), run.used, run.run_id, network)
 
 
+# Files that implement a check, by a word in its command (after pma's accept.rs). A
+# coder that edits one can make any tree pass, so a fix that does needs a human.
+CHECK_FILES: Mapping[str, tuple[str, ...]] = {
+    **dict.fromkeys(("make", "gmake"), ("Makefile", "GNUmakefile", "makefile", "*.mk")),
+    "just": ("justfile", "Justfile", ".justfile"),
+    **dict.fromkeys(("npm", "yarn", "pnpm"), ("package.json",)),
+    "nox": ("noxfile.py",),
+    "tox": ("tox.ini",),
+    "pytest": ("conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"),
+}
+CHECK_WORD = re.compile(r"[\w./-]+")
+UNSCANNED = frozenset({"node_modules", "__pycache__", "site-packages"})  # and dot dirs
+
+
+def check_files(commands: Sequence[str], workdir: Path) -> tuple[str, ...]:
+    """Name patterns of the files that implement commands, and the workdir-relative
+    paths of scripts they name, such as scripts/check.sh."""
+    found: dict[str, None] = {}
+    for word in (w for c in commands for w in CHECK_WORD.findall(c)):
+        found.update(dict.fromkeys(CHECK_FILES.get(word.rsplit("/", 1)[-1], ())))
+        path = Path(os.path.realpath(workdir / word))
+        if "/" in word and path.is_relative_to(workdir) and path.is_file():
+            found[str(path.relative_to(workdir))] = None
+    return tuple(found)
+
+
+def snapshot(workdir: Path, patterns: Sequence[str]) -> dict[str, str]:
+    """The sha256 of each file under workdir whose name or relative path matches one
+    of patterns. Dot directories and UNSCANNED are skipped."""
+    hashes = {}
+    for top, dirs, files in os.walk(workdir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in UNSCANNED]
+        for name in files:
+            path = Path(top, name)
+            rel = str(path.relative_to(workdir))
+            if any(fnmatch.fnmatchcase(name, p) or rel == p for p in patterns):
+                try:
+                    hashes[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    hashes[rel] = ""
+    return hashes
+
+
 def check_fix_review(
     run: Run,
     objective: str,
@@ -625,6 +695,7 @@ def check_fix_review(
     network: bool = False,
     timeout: float = 600,
     check_to_fix: int = 0,
+    allow_check_edits: bool = False,
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
     **fix: Any,
@@ -633,8 +704,11 @@ def check_fix_review(
     again. A failing re-check goes back to fix_review at most check_to_fix times
     (graph.md 7.7). fix takes fix_review's other keyword arguments. network applies to the first run
     only: later runs execute code the coder wrote, so they run offline and reuse what
-    the first run fetched."""
+    the first run fetched. A fix that changes a file implementing check (check_files)
+    fails the run, unless allow_check_edits."""
     status, summary, log = run_steps(run, check, network, timeout)
+    patterns = check_files(check, run.workdir)
+    before = snapshot(run.workdir, patterns)
     review: Artifact | None = None
     goal = f"{objective}\n\nThe checks failed. Their output is the log input; make them pass."
     rounds = check_to_fix + 1
@@ -652,6 +726,17 @@ def check_fix_review(
         review = next((a for a in fixed.artifacts if a.name == "review"), review)
         if fixed.status != "done":
             status, summary = fixed.status, f"fix round {n}: {fixed.summary}"
+            break
+        after = snapshot(run.workdir, patterns)
+        edited = sorted(
+            k for k in before.keys() | after.keys() if before.get(k) != after.get(k)
+        )
+        if edited and not allow_check_edits:
+            status = "failed"
+            summary = (
+                f"fix round {n} changed {', '.join(edited)}, which the check runs; "
+                "review the change, or set allow_check_edits = true"
+            )
             break
         status, summary, log = run_steps(run, check, False, timeout)
     else:
@@ -1052,6 +1137,7 @@ WORKFLOWS = {
             {
                 **FIX_PARAMS,
                 "check_to_fix": non_negative_int,
+                "allow_check_edits": boolean,
                 "check": COMMANDS,
                 "network": boolean,
                 "timeout": positive_int,

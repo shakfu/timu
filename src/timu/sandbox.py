@@ -2,21 +2,23 @@
 runs under OS-enforced limits; the shell tool runs the result.
 
 Every backend denies network access unless the policy allows it, writes outside the
-policy's write roots, and writes inside `.git`. Reads are allowed except under the
-user's home, where only the policy's roots and the backend's extra_read paths are
-readable.
+policy's write roots, and writes inside `.git` outside the scratch roots. Reads are
+allowed except under the user's home, where only the policy's roots and the backend's
+extra_read paths are readable.
 
 - macOS (sandbox-exec): metadata (stat, readlink) stays allowed under home, so
-  symlinked toolchains and cd work. It denies writes to any path named `.git` and to
-  deny_write paths, even ones that do not exist yet. It denies LaunchServices opens,
+  symlinked toolchains and cd work. It denies writes to any path through a `.git`
+  outside the scratch roots, and to deny_write paths, even ones that do not exist
+  yet. It denies LaunchServices opens,
   Apple events and signals to processes outside the sandbox. It cannot stop a command
   reading the arguments and environment of the user's other processes
   (KERN_PROCARGS2), so secrets in timu's environment are readable.
 - Linux (bwrap): home and MASKED are empty tmpfs mounts with the readable paths
   bound into them; writes elsewhere in them are discarded. MASKED holds the host's
   Unix sockets (session bus, ssh-agent, docker), which a new network namespace does
-  not isolate. It protects `.git` at each write root and deny_write paths that exist when the command
-  starts; bwrap mounts only existing paths, so a command can create a new one.
+  not isolate. It protects only paths that exist when the command starts, so
+  shell.run_sh adds every existing `.git` outside the scratch roots to deny_write,
+  and removes the `.git` and deny_write paths a command creates.
 """
 
 from __future__ import annotations
@@ -38,12 +40,14 @@ RESOLV = Path("/etc/resolv.conf")
 
 @dataclass(frozen=True)
 class Policy:
-    """Resolved paths. Write roots are also readable. deny_write wins over them."""
+    """Resolved paths. Write roots are also readable. deny_write wins over them.
+    scratch lists the write roots where a command may create a `.git`."""
 
     read_roots: tuple[Path, ...]
     write_roots: tuple[Path, ...]
     deny_write: tuple[Path, ...] = ()
     network: bool = False
+    scratch: tuple[Path, ...] = ()
 
 
 class Sandbox(Protocol):
@@ -168,6 +172,9 @@ def mac_profile(
         f"(allow file-write* {writes} {dev})",
         '(deny file-write* (regex #"/\\.git(/|$)"))',
     ]
+    if policy.scratch:  # private and temporary: the user never runs git there
+        scratch = " ".join(f"(subpath {_q(p)})" for p in policy.scratch)
+        lines.append(f"(allow file-write* {scratch})")
     if policy.deny_write:  # subpath matches regardless of case on case-insensitive APFS
         denied = " ".join(f"(subpath {_q(p)})" for p in policy.deny_write)
         lines.append(f"(deny file-write* {denied})")
@@ -207,7 +214,8 @@ def bwrap_args(
             args += ["--ro-bind", str(p), str(p)]
     for p in policy.write_roots:
         args += ["--bind", str(p), str(p)]
-    frozen = [r / ".git" for r in policy.write_roots] + list(policy.deny_write)
+    guarded = [r for r in policy.write_roots if r not in policy.scratch]
+    frozen = [r / ".git" for r in guarded] + list(policy.deny_write)
     for p in frozen:
         if p.exists():
             args += ["--ro-bind", str(p), str(p)]

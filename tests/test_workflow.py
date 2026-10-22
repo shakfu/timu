@@ -33,6 +33,7 @@ from timu.workflow import (
     WORKFLOWS,
     Options,
     Run,
+    check_files,
     check_fix_review,
     commands,
     fix_review,
@@ -129,11 +130,17 @@ def test_write_report(tmp_path: Path) -> None:
         ("../R.md", "outside the workdir"),
         ("link.md", "is a symlink"),
         ("sub", "is a directory"),
+        (".git/config", "writes inside .git are not allowed"),
+        ("sub/.git/config", "writes inside .git are not allowed"),
+        ("timu.toml", "agents may not write it"),
+        (".timu/skills/s/SKILL.md", "agents may not write it"),
     ],
 )
 def test_write_report_refusals(tmp_path: Path, path: str, message: str) -> None:
     work = Path(os.path.realpath(tmp_path)) / "w"
-    (work / "sub").mkdir(parents=True)
+    (work / "sub" / ".git").mkdir(parents=True)
+    (work / ".git").mkdir()
+    (work / ".timu" / "skills" / "s").mkdir(parents=True)
     (work / "code.py").write_text("keep\n")
     (work / "link.md").symlink_to(work / "code.py")
     with pytest.raises(ReportError, match=message):
@@ -366,6 +373,18 @@ def test_command_timeout_and_budget(tmp_path: Path) -> None:
     )
 
 
+def test_commands_may_not_create_git_or_timu_files(tmp_path: Path) -> None:
+    run, _, events = make_run(tmp_path, [])
+    steps = ['git init -q "$TMPDIR/r"', "git init -q sub && mkdir .timu", "echo never"]
+    r = commands(run, "b", steps=steps)
+    assert r.status == "failed"
+    assert "created .timu, sub/.git; removed" in r.summary
+    assert not (tmp_path / ".timu").exists()
+    assert not (tmp_path / "sub" / ".git").exists() and (tmp_path / "sub").is_dir()
+    assert "echo never" not in r.artifacts[0].content
+    assert any("sub/.git" in e.data["message"] for e in events if e.kind == "warning")
+
+
 def test_commands_need_a_sandbox(tmp_path: Path) -> None:
     run = Run(tmp_path, lambda r: FakeProvider([]), lambda e: None)
     r = commands(run, "b", steps=["true"])
@@ -391,6 +410,55 @@ def test_check_fix_review_fixes_then_checks_again(tmp_path: Path) -> None:
     assert [a.name for a in r.artifacts] == ["log", "review"]
     coder_task = provider.requests[0].messages[1].content
     assert "The checks failed" in coder_task and "[exit 1]" in coder_task
+
+
+def test_check_files() -> None:
+    ws = Path("/nonexistent")
+    assert check_files(["make -C sub test"], ws) == (
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "*.mk",
+    )
+    assert "conftest.py" in check_files(["uv run python -m pytest -q"], ws)
+    assert check_files(["cargo test", "echo pytest-free"], ws) == ()
+
+
+def test_check_fix_review_refuses_a_fix_that_edits_the_check(tmp_path: Path) -> None:
+    (tmp_path / "Makefile").write_text("check:\n\ttest -f fixed.txt\n")
+    replies = [
+        calls(call("write", path="Makefile", content="check:\n\ttrue\n")),
+        text("fixed"),
+        text("VERDICT: APPROVE"),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    r = check_fix_review(run, "o", check=["make -s check"])
+    assert (r.status, r.summary) == (
+        "failed",
+        (
+            "fix round 1 changed Makefile, which the check runs; review the change, "
+            "or set allow_check_edits = true"
+        ),
+    )
+    run, _, _ = make_run(tmp_path, replies)
+    (tmp_path / "Makefile").write_text("check:\n\ttest -f fixed.txt\n")
+    r = check_fix_review(run, "o", check=["make -s check"], allow_check_edits=True)
+    assert r.status == "done", r.summary
+
+
+def test_check_fix_review_watches_a_script_the_check_names(tmp_path: Path) -> None:
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "check.sh").write_text("test -f fixed.txt\n")
+    (tmp_path / "conftest.py").write_text("")  # not a pytest check: not watched
+    replies = [
+        calls(call("write", path="conftest.py", content="# changed\n")),
+        calls(call("write", id="w2", path="scripts/check.sh", content="true\n")),
+        text("fixed"),
+        text("VERDICT: APPROVE"),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    r = check_fix_review(run, "o", check=["sh scripts/check.sh"])
+    assert r.summary.startswith("fix round 1 changed scripts/check.sh, which")
 
 
 def test_check_fix_review_checks_the_coders_code_offline(tmp_path: Path) -> None:

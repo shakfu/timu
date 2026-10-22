@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- On Linux, commands can no longer write an existing `.git` below the workspace root, such as a vendored repo's, or create a `.git`, `timu.toml` or `.timu` in the workspace. bwrap protects only the paths it is given, and it was given only the `.git` at each write root. A command could set `core.fsmonitor` in a nested repo's config, or in a repo it created, and git would run it unsandboxed the next time anything ran `git status` there. timu now mounts every existing `.git` under the write roots read-only, removes the entries a command created, and fails the call.
+
+  Commands may clone into `$TMPDIR` on both platforms; the macOS profile now allows `.git` there. Cloning into the workspace stays refused over allowing it: a repo there keeps agent-written config that the user's git later runs, and on macOS renaming a parent directory moves an existing `.git` out from under a per-path rule.
+
+- The report path now gets the same `.git`, `timu.toml` and `.timu` checks as the `write` tool. Before, `--report .git/config`, or a graph `report_path` bound to an upstream node's output, wrote the reviewer's text there.
+
+- The approval prompt shows the whole artifact, not its first 40 lines, and gives its line count. Injected text after line 40 was approved unseen. The prompt and the console also print control characters and bidi overrides as escapes such as `\x1b`. Web content could carry ANSI sequences that hide text or redraw the prompt.
+
 - `[provider] api_key_file` and `[search] api_key_file` read a key from a file instead of the environment. On macOS, a sandboxed command can read the environment of the user's processes, keys included. It cannot read files under `$HOME`. timu refuses a key file that other users can read.
 
 - timu no longer reads `./timu.toml`. Config comes only from the user file, `--config` and the environment. The file could still set models, `extra_body` and `[roles]`. On OpenRouter the model id picks the vendor that receives your code, and `extra_body` can change provider routing, so a cloned repo could choose where your code went. The file was also read from the current directory, not from `-C`. The coder could write `timu.toml` in a subdirectory, and a later run started there would load it.
@@ -33,6 +41,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Traces are created with mode 0600. Before, they followed the umask, usually 0644. Existing traces and the state directory are not changed.
 
 ### Added
+
+- `timu graph run --max-parallel N` runs up to N independent nodes at once, each in a thread. The session's counters, trace and approvals take one lock, so a prompt pauses the other nodes' output. Ctrl-C or a node error cancels the rest and gives them 5 seconds to stop their commands.
+
+- `timu graph run --resume RUN` reuses the nodes an earlier run finished. A node is reused only if its definition and project hash as before, everything it needs is reused, and its copy is still at the recorded commit. Node results in the trace now carry the copy, the base and the outputs. Matching on a hash, rather than reusing every node marked done, keeps a changed node and its descendants from passing on stale results.
+
+- `timu graph run --dry-run` prints each node in run order with its models and cost cap, and the most the run can spend. It names the nodes with no cost cap when `--max-cost` is not given. Graphs without caps still run.
+
+- `models = { role = "model" }` on a graph node sets a role's model for that node.
+
+- `check-fix-review` fails a fix round that changes a file the check runs: `Makefile` or `*.mk` for `make`, `conftest.py`, `pytest.ini`, `tox.ini`, `setup.cfg` or `pyproject.toml` for pytest, and the like, or a script the check names. An edit there can make any tree pass, and a model reviewer may not notice it. `allow_check_edits = true` accepts such a fix. The mapping is pma's (`crates/pma-core/src/accept.rs`); `docs/dev/pma-comparison.md` compares the two tools.
+
+- A graph node whose coder ran but changed nothing gets a warning.
+
+- `timu report [--by workflow|project|model]` totals every trace: runs, how many ended done, cost, tokens and time. Agent start events now record the model.
 
 - Each run prints its config sources on one line (`config: <file> + TIMU_MODEL`) and records them in the trace.
 

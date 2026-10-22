@@ -301,7 +301,8 @@ def test_tty_approve(answer: str, expected: bool) -> None:
     master, slave = os.openpty()
     try:
         os.write(master, answer.encode())
-        artifact = Artifact("research", "line\n" * 50, origin=Origin.NET, source="a1")
+        content = "line\n" * 50 + "\x1b[8mhidden\x1b[0m"
+        artifact = Artifact("research", content, origin=Origin.NET, source="a1")
         result: list[bool] = []
         t = threading.Thread(
             target=lambda: result.append(
@@ -312,8 +313,10 @@ def test_tty_approve(answer: str, expected: bool) -> None:
         t.join(5)
         shown = os.read(master, 65536).decode()
         assert result == [expected]
-        assert "untrusted research from a1" in shown
-        assert "[... 10 more lines]" in shown
+        assert "--- untrusted research from a1, 51 lines ---" in shown
+        assert shown.count("line") == 52  # every line, and the end marker
+        assert "\\x1b[8mhidden\\x1b[0m" in shown and "\x1b" not in shown
+        assert "--- end of untrusted research from a1, 51 lines ---" in shown
         assert "Pass this to the coder? [y/N]" in shown
     finally:
         os.close(master)

@@ -95,7 +95,7 @@ class Agent:
         streak: tuple[str, int] = ("", 0)  # signature of the last call, times in a row
         retried = False  # an unusable final answer gets one more try
         warned_cost = False
-        self._emit("start", goal=task.goal)
+        self._emit("start", goal=task.goal, model=getattr(self.provider, "model", ""))
         if isinstance(ctx.sandbox, NoSandbox):
             self._emit("warning", message="shell commands run without a sandbox")
         if "web_fetch" in self._tools and (proxy := proxy_warning()):

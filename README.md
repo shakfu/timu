@@ -175,8 +175,19 @@ timu graph run graph.toml
   params = { check = ["uv pip install ${wheel.wheel}", "make test"], network = true }
   ```
 
+- `check-fix-review` fails a fix that changes a file the check runs, such as `Makefile` for `make test`, `conftest.py` or `pyproject.toml` for pytest, or a script the check names. Such an edit can make any tree pass. Set `allow_check_edits = true` in `params` to accept it.
 - `budget = { cost_usd = 1.0 }` on a node, or under `[defaults]`, caps that node's agents. `--max-cost` caps the whole graph.
+- `models = { reviewer = "<model id>" }` on a node sets a role's model for that node, over the user config.
 - Several nodes may use one project. A node starts from the branch of its nearest ancestor on that project.
+
+```sh
+timu graph run --dry-run graph.toml          # nodes in order, models, cost caps, ceiling
+timu graph run --max-parallel 3 graph.toml   # up to 3 independent nodes at once
+timu graph run --resume <run id> graph.toml  # reuse the nodes that run finished
+```
+
+- `--max-parallel` runs ready nodes in threads. Console lines then start with the node id. Approval prompts come one at a time, and other nodes' output waits while you answer.
+- `--resume` reuses a node that ended `done` in the earlier run, if its definition and project are unchanged, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again.
 
 ## Traces
 
@@ -185,7 +196,11 @@ Every run writes a JSONL trace to `~/.local/state/timu/runs/`, outside the works
 ```sh
 timu trace              # the latest run: agent tree, status and cost
 timu trace <run id>
+timu report             # every trace: runs, done, cost, tokens and time per workflow
+timu report --by model  # per model, counting agents; or --by project
 ```
+
+`timu report` counts each `timu run` and each graph node once; a reused node does not count again.
 
 ## Develop
 
