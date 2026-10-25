@@ -100,11 +100,11 @@ def test_a_hidden_directory_is_still_scanned(dirs: tuple[Path, Path, Path]) -> N
     (ws / "own").mkdir(mode=0o300)  # the user's, unreadable before the command
     out = sh(ctx_for(dirs, NoSandbox()), "git init -q a/b && chmod 000 a/b a")
     assert out.is_error and "created a/b/.git; removed" in out.text
-    assert not (ws / "a" / "b" / ".git").exists()
     assert (ws / "own").stat().st_mode & 0o777 == 0o300  # restored
     assert (ws / "a").stat().st_mode & 0o777 == 0
-    for d in ("a", "a/b", "own"):  # so pytest can delete them
+    for d in ("a", "a/b", "own"):  # so stat and pytest's cleanup can enter
         os.chmod(ws / d, 0o700)
+    assert not (ws / "a" / "b" / ".git").exists()
 
 
 def test_existing_git_entries_are_read_only(dirs: tuple[Path, Path, Path]) -> None:
