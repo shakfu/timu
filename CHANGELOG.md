@@ -6,7 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `timu run` now works on a clone and commits to a branch there, as graph nodes do. `--in-place` keeps the old behavior and is required outside a git repo. Path rules could not keep an agent-edited checkout safe for the user's git: a bare repo, or a nested repo moved to `$TMPDIR` and back, planted config that git later ran unsandboxed. The cost is that a run starts from `HEAD`, without uncommitted or gitignored files.
+
+### Added
+
+- A graph file's top-level `[budget]` sets the total for all nodes. Before, the total was fixed at 200 turns and 2M tokens, and a node budget could only lower it. `--dry-run` prints it.
+- `timu clean --older-than DAYS` lists old copies and traces, and `--yes` deletes them.
+- `check-fix-review` takes `check_paths`, globs of files a fix may not change. Opt-in over protecting tests by default, because a fix often adds a regression test.
+
+### Fixed
+
+- On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays.
+- A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
+- `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
+- A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
+- `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
+- A lone surrogate in model text crashed the console. A 429 whose text mentions too many tokens counted as a context overflow and was not retried.
+
 ### Security
+
+- A commit now fails if the files changed after the last review. On macOS a process that calls `setsid` outlives `_kill_group`, so it could change an approved tree. The hash covers what a commit would see, not ignored files, and is dropped when a graph command runs after the review.
+- A commit now fails if the tree holds a bare git repo layout.
+- macOS commands can no longer read the pasteboard. The profile starts from `(allow default)`; other per-user services are not audited.
+- The provider no longer follows redirects, and `web_search` drops its key on a cross-origin redirect. urllib copied credentials to the target.
+- `timu trace` escapes control characters, as the console already did.
+- `search` runs its regex in a killable subprocess with a 30 s limit, and `read` refuses files over 16 MB. Both ran unbounded in timu's own process.
+- `~/.local/state/timu` is now mode 0700. Trace files were private, but graph copies followed the umask.
 
 - On Linux, commands can no longer write an existing `.git` below the workspace root, such as a vendored repo's, or create a `.git`, `timu.toml` or `.timu` in the workspace. bwrap protects only the paths it is given, and it was given only the `.git` at each write root. A command could set `core.fsmonitor` in a nested repo's config, or in a repo it created, and git would run it unsandboxed the next time anything ran `git status` there. timu now mounts every existing `.git` under the write roots read-only, removes the entries a command created, and fails the call.
 

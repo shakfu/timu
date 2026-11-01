@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import fnmatch
 import itertools
+import json
 import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,26 @@ READ_LINES = 2000
 MAX_ENTRIES = 1000
 MAX_MATCHES = 500
 MAX_LINE = 300  # characters of a matching line that search shows
+SEARCH_TIMEOUT = 30  # seconds
+# Runs apart from timu, so a slow regex can be killed and does not hold timu's GIL.
+SEARCH_WORKER = """
+import json, re, sys
+q = json.load(sys.stdin)
+rx, hits = re.compile(q["pattern"], q["flags"]), []
+for i, path in enumerate(q["files"]):
+    if len(hits) > q["max"]:
+        break
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                if rx.search(line):
+                    hits.append([i, n, line.rstrip()[:q["width"]]])
+                    if len(hits) > q["max"]:
+                        break
+    except OSError:
+        pass
+json.dump(hits, sys.stdout)
+"""
 
 
 class FsError(Exception):
@@ -225,6 +248,8 @@ def _read(ctx: Context, args: Mapping[str, Any]) -> ToolOutput:
         raise FsError(f"{raw}: is a directory; use list")
     if not stat.S_ISREG(st.st_mode):
         raise FsError(f"{raw}: not a regular file")
+    if st.st_size > MAX_FILE:  # one long line would be read whole
+        raise FsError(f"{raw}: larger than {MAX_FILE // (1024 * 1024)} MB")
     if _is_binary(path):
         raise FsError(f"{raw}: is binary")
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
@@ -270,27 +295,64 @@ def _search(ctx: Context, args: Mapping[str, Any]) -> ToolOutput:
     glob = _str(args, "glob") if "glob" in args else None
     flags = re.IGNORECASE if args.get("ignore_case") is True else 0
     try:
-        rx = re.compile(raw_pattern, flags)
+        re.compile(raw_pattern, flags)
     except re.error as e:
         raise FsError(f"invalid regex: {e}") from None
-    hits: list[str] = []
+    files: list[Path] = []
     for path in _files(ctx, base):
-        if ctx.cancel.is_set() or len(hits) > MAX_MATCHES:
-            break
+        if ctx.cancel.is_set():
+            raise FsError("cancelled")
         if glob and not _matches(ctx, path, glob):
             continue
         if path.stat().st_size > MAX_FILE or _is_binary(path):
             continue
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for n, line in enumerate(f, 1):
-                if rx.search(line):
-                    hits.append(f"{shown(ctx, path)}:{n}:{line.rstrip()[:MAX_LINE]}")
-                    if len(hits) > MAX_MATCHES:
-                        break
+        files.append(path)
+    hits = [
+        f"{shown(ctx, files[i])}:{n}:{line}"
+        for i, n, line in _scan(ctx, raw_pattern, flags, files)
+    ]
     if not hits:
         return ToolOutput("no matches")
     note = f"\n[stopped after {MAX_MATCHES} matches]" if len(hits) > MAX_MATCHES else ""
     return ToolOutput("\n".join(hits[:MAX_MATCHES]) + note)
+
+
+def _scan(ctx: Context, pattern: str, flags: int, files: list[Path]) -> list[list[Any]]:
+    """[file index, line number, text] per match, from SEARCH_WORKER. -I and cwd keep
+    workspace modules from being imported. Raises FsError on timeout or cancel."""
+    query = {
+        "pattern": pattern,
+        "flags": int(flags),
+        "files": [str(f) for f in files],
+        "max": MAX_MATCHES,
+        "width": MAX_LINE,
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", SEARCH_WORKER],
+        cwd="/",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    data: bytes | None = json.dumps(query).encode()
+    deadline = time.monotonic() + SEARCH_TIMEOUT
+    while True:
+        try:
+            out, _ = proc.communicate(data, timeout=0.05)
+            break
+        except subprocess.TimeoutExpired:
+            data = None  # already sent; communicate must not get it twice
+            stop = "cancelled" if ctx.cancel.is_set() else ""
+            if not stop and time.monotonic() >= deadline:
+                stop = f"search timed out after {SEARCH_TIMEOUT}s; simplify the pattern"
+            if stop:
+                proc.kill()
+                proc.communicate()
+                raise FsError(stop) from None
+    if proc.returncode != 0:
+        raise FsError(f"search failed: exit {proc.returncode}")
+    hits: list[list[Any]] = json.loads(out)
+    return hits
 
 
 @_guard

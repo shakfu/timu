@@ -37,6 +37,7 @@ from timu.roles import (
 )
 from timu.sandbox import Policy, Sandbox
 from timu.tool import PROTECTED, DelegateError, Tool
+from timu.tools.fs import _git_files
 from timu.tools.shell import refusal, run_sh, scrubbed_env
 from timu.tools.web import WEB_FETCH
 from timu.types import Artifact, Budget, Capability, Origin, Result, Status, Task, Usage
@@ -188,6 +189,7 @@ class Run:
         self._tainted: set[str] = (
             set()
         )  # agents that received an untrusted child result
+        self._reviewed: tuple[str, str] | None = None  # (tree hash, report path)
 
     def at(self, workdir: Path, roles: Mapping[str, Role] | None = None) -> Run:
         """A Run on workdir in the same session. Delegate inputs and roles are not
@@ -241,6 +243,18 @@ class Run:
         if result.untrusted and parent_id:
             self._tainted.add(parent_id)
         return result
+
+    def mark_reviewed(self, report_path: str = "") -> None:
+        """Record the tree a review is about to judge. A process that outlives a coder's
+        command can still write, so the verdict holds only for this tree."""
+        tree = tree_hash(self.workdir, report_path)
+        self._reviewed = None if tree is None else (tree, report_path)
+
+    def changed_after_review(self) -> bool:
+        if self._reviewed is None:
+            return False
+        tree, report_path = self._reviewed
+        return tree_hash(self.workdir, report_path) != tree
 
     def _charge(self, delta: Usage) -> None:
         self.used += delta
@@ -318,6 +332,7 @@ class Run:
             coded.untrusted,
         )
         task = Task(f"Review the {name}'s work on this goal:\n\n{goal}", (work,))
+        self.mark_reviewed()
         reviewed = self.run_agent(self.roles[CHECKER], task, parent_id, depth + 1)
         status = reviewed.status
         if status == "done" and verdict(reviewed.summary) != "APPROVE":
@@ -392,6 +407,30 @@ def _remainder(want: Budget, b: Budget, u: Usage, elapsed: float) -> Budget | No
     return None if exhausted or (cost is not None and cost <= 0) else child
 
 
+def tree_hash(workdir: Path, exclude: str = "") -> str | None:
+    """A hash of what a commit under workdir would see: paths, and file contents or link
+    targets, without ignored files and exclude. None outside a git repo."""
+    files = _git_files(workdir)
+    if files is None:
+        return None
+    skip = os.path.normpath(exclude) if exclude else ""
+    h = hashlib.sha256()
+    for path in files:
+        rel = os.path.relpath(path, workdir)
+        if rel == skip:
+            continue
+        h.update(os.fsencode(rel) + b"\0")
+        try:
+            if path.is_symlink():
+                h.update(os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                h.update(hashlib.sha256(path.read_bytes()).digest())
+        except OSError:
+            pass  # removed since it was listed; the next hash differs
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def verdict(report: str) -> str | None:
     """APPROVE or CHANGES from the report's first three non-empty lines, else None."""
     for line in [x for x in report.splitlines() if x.strip()][:3]:
@@ -462,6 +501,7 @@ def fix_review(
             coded.trace_id,
             coded.untrusted,
         )
+        run.mark_reviewed(report_path)
         reviewed = run.run_agent(reviewer, Task(review_goal, (work,)))
         if reviewed.status != "done":
             return done(
@@ -578,6 +618,7 @@ def run_steps(
     ses = run.session
     if ses.sandbox is None:
         return "failed", "command steps need a sandbox", Artifact("log", "", "log")
+    run._reviewed = None  # commands may write build output after a review
     policy = Policy(
         (run.workdir, *run.reads),
         (run.workdir,),
@@ -649,6 +690,8 @@ def commands(
 CHECK_FILES: Mapping[str, tuple[str, ...]] = {
     **dict.fromkeys(("make", "gmake"), ("Makefile", "GNUmakefile", "makefile", "*.mk")),
     "just": ("justfile", "Justfile", ".justfile"),
+    "cargo": ("Cargo.toml", "build.rs"),
+    "go": ("go.mod",),
     **dict.fromkeys(("npm", "yarn", "pnpm"), ("package.json",)),
     "nox": ("noxfile.py",),
     "tox": ("tox.ini",),
@@ -665,21 +708,24 @@ def check_files(commands: Sequence[str], workdir: Path) -> tuple[str, ...]:
     for word in (w for c in commands for w in CHECK_WORD.findall(c)):
         found.update(dict.fromkeys(CHECK_FILES.get(word.rsplit("/", 1)[-1], ())))
         path = Path(os.path.realpath(workdir / word))
-        if "/" in word and path.is_relative_to(workdir) and path.is_file():
+        if path.is_relative_to(workdir) and path.is_file():
             found[str(path.relative_to(workdir))] = None
     return tuple(found)
 
 
 def snapshot(workdir: Path, patterns: Sequence[str]) -> dict[str, str]:
     """The sha256 of each file under workdir whose name or relative path matches one
-    of patterns. Dot directories and UNSCANNED are skipped."""
+    of patterns, where "*" also matches "/". Dot directories and UNSCANNED are skipped."""
     hashes = {}
     for top, dirs, files in os.walk(workdir):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in UNSCANNED]
         for name in files:
             path = Path(top, name)
             rel = str(path.relative_to(workdir))
-            if any(fnmatch.fnmatchcase(name, p) or rel == p for p in patterns):
+            if any(
+                fnmatch.fnmatchcase(name, p) or fnmatch.fnmatchcase(rel, p)
+                for p in patterns
+            ):
                 try:
                     hashes[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
                 except OSError:
@@ -696,6 +742,7 @@ def check_fix_review(
     timeout: float = 600,
     check_to_fix: int = 0,
     allow_check_edits: bool = False,
+    check_paths: Sequence[str] = (),
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
     **fix: Any,
@@ -705,9 +752,9 @@ def check_fix_review(
     (graph.md 7.7). fix takes fix_review's other keyword arguments. network applies to the first run
     only: later runs execute code the coder wrote, so they run offline and reuse what
     the first run fetched. A fix that changes a file implementing check (check_files)
-    fails the run, unless allow_check_edits."""
+    or one matching check_paths fails the run, unless allow_check_edits."""
     status, summary, log = run_steps(run, check, network, timeout)
-    patterns = check_files(check, run.workdir)
+    patterns = (*check_files(check, run.workdir), *check_paths)
     before = snapshot(run.workdir, patterns)
     review: Artifact | None = None
     goal = f"{objective}\n\nThe checks failed. Their output is the log input; make them pass."
@@ -966,6 +1013,7 @@ def review_validate_fix(
             coded.untrusted,
         )
         todo_ids = [f.id for f in todo]
+        run.mark_reviewed(report_path)
         verified = step(
             "verify",
             verifier,
@@ -1057,6 +1105,12 @@ def boolean(v: Any) -> bool:
     return v
 
 
+def paths(v: Any) -> tuple[str, ...]:
+    if not isinstance(v, list | tuple) or not all(isinstance(p, str) and p for p in v):
+        raise ValueError("must be a list of non-empty path globs")
+    return tuple(v)
+
+
 class Commands:
     """A list of shell commands. The graph may substitute outputs into them
     (graph.md 7.7); this converter sees them after substitution."""
@@ -1138,6 +1192,7 @@ WORKFLOWS = {
                 **FIX_PARAMS,
                 "check_to_fix": non_negative_int,
                 "allow_check_edits": boolean,
+                "check_paths": paths,
                 "check": COMMANDS,
                 "network": boolean,
                 "timeout": positive_int,

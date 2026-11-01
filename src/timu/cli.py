@@ -7,13 +7,16 @@ outside the workspace, so the agents being traced cannot read or change them.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -27,10 +30,13 @@ from timu.graph import (
     GraphError,
     GraphResult,
     NodeResult,
+    _git,
     find_projects,
     load_graph,
+    provision,
     resumable,
     run_graph,
+    seal,
     serial_order,
 )
 from timu.provider.base import Provider
@@ -39,8 +45,15 @@ from timu.role import Role, RoleError
 from timu.sandbox import NoSandbox, Sandbox, detect, why_none
 from timu.tool import Tool
 from timu.trace import BY, TraceError, load, render, totals
-from timu.types import Artifact, Result
-from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Options, Session, new_run_id
+from timu.types import Artifact, Budget, Result
+from timu.workflow import (
+    WORKFLOW_BUDGET,
+    WORKFLOWS,
+    Options,
+    Session,
+    Workflow,
+    new_run_id,
+)
 
 EXIT = {
     "done": 0,
@@ -53,8 +66,11 @@ EXIT = {
 T = TypeVar("T")
 USAGE_ERROR = 2
 # C0 and C1 controls but newline and tab, and bidi overrides: on a terminal they can
-# move the cursor, hide text or reorder it
-CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+# move the cursor, hide text or reorder it. Lone surrogates cannot be encoded at all.
+CONTROL = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff]"
+)
+RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
 # workflow param -> `timu run` argument; a workflow gets the ones it declares
 RUN_PARAMS = {
     "review_to_fix": "review_to_fix",
@@ -225,6 +241,12 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("-C", "--workdir", type=Path, default=Path("."), help="default: .")
     run.add_argument(
+        "--in-place",
+        action="store_true",
+        help="work in the checkout itself, not a copy; agents can then plant code that "
+        "your git runs (see README)",
+    )
+    run.add_argument(
         "--report", default="REVIEW.md", help="report path (default: REVIEW.md)"
     )
     run.add_argument(
@@ -284,6 +306,19 @@ def parser() -> argparse.ArgumentParser:
         help="group workflow runs and graph nodes by workflow or project, or agents "
         "by model (default: workflow)",
     )
+    clean = sub.add_parser("clean", help="list or delete old copies and traces")
+    clean.add_argument(
+        "--older-than",
+        type=positive,
+        required=True,
+        metavar="DAYS",
+        help="runs last changed more than this many days ago",
+    )
+    clean.add_argument(
+        "--yes",
+        action="store_true",
+        help="delete them, including branches not yet fetched; default: only list them",
+    )
     return ap
 
 
@@ -295,6 +330,11 @@ def main(
 ) -> int:
     """Entry point. provider_for replaces the configured providers, for tests."""
     args = parser().parse_args(argv)
+    for stream in (out, err):  # model text may not fit the terminal's encoding
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="backslashreplace")
+    if args.command == "clean":
+        return clean_state(args.older_than, args.yes, out)
     if args.command == "trace":
         return show_trace(args.run, out, err)
     if args.command == "report":
@@ -324,12 +364,25 @@ def main(
             err.write(f"timu: {flag} {e}\n")
             return USAGE_ERROR
 
+    source = Path(os.path.realpath(args.workdir))
+    top = source
+    if not args.in_place:
+        try:
+            top = Path(
+                os.path.realpath(_git(source, "rev-parse", "--show-toplevel").strip())
+            )
+        except GraphError:
+            err.write(f"timu: {source} is not in a git repo; use --in-place\n")
+            return USAGE_ERROR
+
     def body(session: Session) -> Result:
-        run = session.at(args.workdir)
-        session.emit("run", workflow=workflow.name, workdir=str(run.workdir))
         search = _search(session, config, workflow.roles)
         options = Options(config.role_skills, search, given)
-        return workflow.run(run, args.objective, options)
+        if args.in_place:
+            run = session.at(source)
+            session.emit("run", workflow=workflow.name, workdir=str(run.workdir))
+            return workflow.run(run, args.objective, options)
+        return _run_on_copy(session, args, workflow, options, source, top, err)
 
     done = _execute(
         args,
@@ -345,6 +398,54 @@ def main(
     result, trace = done
     _report(result, trace, err)
     return EXIT[result.status]
+
+
+def _run_on_copy(
+    session: Session,
+    args: argparse.Namespace,
+    workflow: Workflow,
+    options: Options,
+    source: Path,
+    top: Path,
+    err: TextIO,
+) -> Result:
+    """Run workflow on a clone of top, and commit its changes on a branch there. The
+    checkout stays unchanged, so nothing an agent plants in the copy runs under the
+    user's git unless the user goes there. Raises GraphError."""
+    rel = source.relative_to(top)
+    copy = trace_dir().parent / "work" / session.run_id / "run"
+    branch = f"timu/{session.run_id}/run"
+    try:
+        base, dirty = provision(top, copy, "HEAD", branch)
+    except GraphError as e:
+        raise GraphError(f"{e}; commit first, or use --in-place") from None
+    if not (copy / rel).is_dir():
+        raise GraphError(f"{rel} is not in HEAD; commit it, or use --in-place")
+    run = session.at(copy / rel)
+    session.emit("run", workflow=workflow.name, workdir=str(source))
+    if dirty:
+        session.emit(
+            "warning",
+            message=f"{top} has uncommitted changes; the copy starts from HEAD",
+        )
+    result = workflow.run(run, args.objective, options)
+    report = options.params.get("report_path")
+    exclude = (os.path.normpath(rel / report),) if report else ()
+    message = f"timu: {args.objective.splitlines()[0][:60]}\n\n"
+    message += (
+        f"{workflow.name} {result.status}: {result.summary}\n\nrun {session.run_id}"
+    )
+    try:
+        new_head = seal(run, copy, base, branch, message, exclude, result.status)
+    except GraphError as e:
+        session.emit("workflow_result", status="failed", summary=str(e))
+        result = replace(result, status="failed", summary=str(e))
+        new_head = base
+    if report and (copy / rel / report).is_file():
+        err.write(f"timu: report {copy / rel / report}\n")
+    if new_head != base:
+        err.write(f"timu: git -C {top} fetch {copy} {branch}:{branch}\n")
+    return result
 
 
 def run_graph_file(
@@ -382,12 +483,16 @@ def run_graph_file(
     prior: dict[str, NodeResult] = {}
     if args.resume:
         try:
-            prior = resumable(load(_trace_path(args.resume)), graph, projects)
+            why_not: dict[str, str] = {}
+            prior = resumable(load(_trace_path(args.resume)), graph, projects, why_not)
         except TraceError as e:
             err.write(f"timu: {e}\n")
             return USAGE_ERROR
         err.write(
             f"timu: from {args.resume}, reusing {', '.join(prior) or 'no nodes'}\n"
+        )
+        err.writelines(
+            f"timu: running {nid} again: {why}\n" for nid, why in why_not.items()
         )
     if args.dry_run:
         out.write(
@@ -412,7 +517,9 @@ def run_graph_file(
         )
 
     gate = any(w.approve_untrusted for w in workflows)
-    done = _execute(args, config, (provider_for, model_provider), gate, out, err, body)
+    done = _execute(
+        args, config, (provider_for, model_provider), gate, out, err, body, graph.budget
+    )
     if isinstance(done, int):
         return done
     result, trace = done
@@ -462,6 +569,11 @@ def plan(
             uncapped.append(nid)
         else:
             caps += cap
+    total = graph.budget or WORKFLOW_BUDGET
+    lines.append(
+        f"graph limits: {total.turns} turns, {total.tool_calls} tool calls, "
+        f"{total.tokens} tokens, {total.wall_seconds:g} s"
+    )
     if uncapped and max_cost is None:
         lines.append(
             f"ceiling: none; {', '.join(uncapped)} set no budget.cost_usd and "
@@ -529,6 +641,7 @@ def _execute(
     out: TextIO,
     err: TextIO,
     body: Callable[[Session], T],
+    budget: Budget | None = None,
 ) -> tuple[T, Path] | int:
     """Run body in a Session that writes a trace and streams to the console, with
     Ctrl-C handling. Returns body's result and the trace, or an exit code."""
@@ -543,6 +656,7 @@ def _execute(
     run_id = new_run_id()
     trace = trace_dir() / f"{run_id}.jsonl"
     trace.parent.mkdir(parents=True, exist_ok=True)
+    trace.parent.parent.chmod(0o700)  # traces and copies hold workspace contents
     cancel = threading.Event()
     console = ConsoleSink(out, err, args.verbose, getattr(args, "max_parallel", 1) > 1)
 
@@ -563,7 +677,7 @@ def _execute(
             session = Session(
                 providers[0],
                 sink,
-                replace(WORKFLOW_BUDGET, cost_usd=args.max_cost),
+                _session_budget(budget, args.max_cost),
                 run_id=run_id,
                 cancel=cancel,
                 approve=tty_approve if gate else None,
@@ -572,7 +686,7 @@ def _execute(
             )
             session.emit("config", source=config.source)
             result = body(session)
-    except (RoleError, ReportError) as e:
+    except (RoleError, ReportError, GraphError) as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
     except KeyboardInterrupt:
@@ -581,6 +695,12 @@ def _execute(
     finally:
         signal.signal(signal.SIGINT, previous)
     return result, trace
+
+
+def _session_budget(budget: Budget | None, max_cost: float | None) -> Budget:
+    """budget or the default; --max-cost, if given, wins over its cost."""
+    total = budget or WORKFLOW_BUDGET
+    return total if max_cost is None else replace(total, cost_usd=max_cost)
 
 
 def tty_approve(artifact: Artifact, role: Role, tty: str = "/dev/tty") -> bool:
@@ -621,7 +741,7 @@ def show_trace(run: str | None, out: TextIO, err: TextIO) -> int:
     else:
         path = _trace_path(run)
     try:
-        out.write(render(load(path)) + "\n")
+        out.write(printable(render(load(path))) + "\n")
     except TraceError as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
@@ -644,6 +764,33 @@ def show_report(by: str, out: TextIO, err: TextIO) -> int:
     out.write(printable(totals(traces, by)) + "\n")
     if unreadable:
         err.write(f"timu: skipped {unreadable} unreadable traces in {runs}\n")
+    return 0
+
+
+def clean_state(days: int, delete: bool, out: TextIO) -> int:
+    """List, or with delete remove, the copies and traces of runs last changed more than
+    days ago. Only entries named like a run are touched."""
+    cutoff = time.time() - days * 86400
+    state = trace_dir().parent
+    found = [
+        p
+        for p in (
+            *sorted((state / "work").glob("*")),
+            *sorted((state / "runs").glob("*.jsonl")),
+        )
+        if RUN_ID.fullmatch(p.name.removesuffix(".jsonl"))
+        and p.lstat().st_mtime < cutoff
+    ]
+    for p in found:
+        out.write(f"{'removed' if delete else 'would remove'} {p}\n")
+        if not delete:
+            continue
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    if found and not delete:
+        out.write("copies may hold branches not yet fetched; pass --yes to delete\n")
     return 0
 
 

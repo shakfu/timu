@@ -9,7 +9,7 @@ extra_read paths are readable.
 - macOS (sandbox-exec): metadata (stat, readlink) stays allowed under home, so
   symlinked toolchains and cd work. It denies writes to any path through a `.git`
   outside the scratch roots, and to deny_write paths, even ones that do not exist
-  yet. It denies LaunchServices opens,
+  yet. It denies LaunchServices opens, the pasteboard,
   Apple events and signals to processes outside the sandbox. It cannot stop a command
   reading the arguments and environment of the user's other processes
   (KERN_PROCARGS2), so secrets in timu's environment are readable.
@@ -165,6 +165,8 @@ def mac_profile(
         # launchd runs what LaunchServices or Apple events start outside the sandbox.
         "(deny lsopen)",
         "(deny appleevent-send)",
+        '(deny mach-lookup (global-name "com.apple.pasteboard.1"))',
+        '(deny mach-lookup (global-name "com.apple.pboard"))',
         "(deny signal)",
         "(allow signal (target same-sandbox))",
         *([] if policy.network else ["(deny network*)"]),

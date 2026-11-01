@@ -29,7 +29,7 @@ from timu.events import Event
 from timu.report import ReportError
 from timu.role import RoleError
 from timu.types import Artifact, Budget, Origin
-from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Commands, Options, Session
+from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Commands, Options, Run, Session
 
 ID = re.compile(r"[a-z0-9][a-z0-9_-]*")
 REPO = re.compile(r"(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9_][A-Za-z0-9_.-]*)")
@@ -94,6 +94,7 @@ class Node:
 @dataclass(frozen=True)
 class Graph:
     nodes: Mapping[str, Node]  # in file order
+    budget: Budget | None = None  # the total for every node; default WORKFLOW_BUDGET
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,7 @@ def load_graph(path: Path) -> Graph:
 
 def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
     """Check raw against graph.md section 4. Raises GraphError naming the key."""
-    _only(raw, {"nodes", "defaults"}, src)
+    _only(raw, {"nodes", "defaults", "budget"}, src)
     defaults = _table(raw, "defaults", src)
     _only(defaults, {"budget"}, f"{src}: defaults")
     default_budget = _budget(defaults, f"{src}: defaults")
@@ -152,7 +153,7 @@ def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
         TopologicalSorter({n.id: n.needs for n in nodes.values()}).prepare()
     except CycleError as e:
         raise GraphError(f"{src}: cycle: {' -> '.join(e.args[1])}") from None
-    graph = Graph(nodes)
+    graph = Graph(nodes, _budget(raw, src))
     for nid, models in model_ancestors(graph).items():
         node = nodes[nid]
         if models and node.params.get("network") is True and not node.trust_upstream:
@@ -442,6 +443,44 @@ def commit(ws: Path, message: str, exclude: Sequence[str] = ()) -> str:
     return head(ws)
 
 
+def bare_repos(ws: Path) -> list[str]:
+    """Directories under ws laid out as a bare repo. Git would read their config if run
+    there, and no path named .git marks them."""
+    found = []
+    for top, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d.casefold() != ".git"]
+        if "HEAD" in files and {"objects", "refs"} <= set(dirs):
+            found.append(str(Path(top).relative_to(ws)))
+    return found
+
+
+def seal(
+    run: Run,
+    ws: Path,
+    base: str,
+    branch: str,
+    message: str,
+    exclude: Sequence[str],
+    status: str,
+) -> str:
+    """Commit a finished workflow's changes on branch in the copy ws and return HEAD.
+    Raises GraphError, committing nothing, if an agent committed, if the tree holds a
+    bare repo, or if a done workflow's tree changed after its last review."""
+    if _git(ws, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").split() != [
+        base,
+        f"refs/heads/{branch}",
+    ]:
+        raise GraphError("HEAD moved during the workflow; agents may not commit")
+    if found := bare_repos(ws):
+        raise GraphError(f"cannot commit: bare git repos at {', '.join(found)}")
+    if status == "done" and run.changed_after_review():
+        raise GraphError("the files changed after the review; a process may still run")
+    try:
+        return commit(ws, message, exclude)
+    except GraphError as e:
+        raise GraphError(f"cannot commit: {e}") from None
+
+
 def head(ws: Path) -> str:
     return _git(ws, "rev-parse", "HEAD").strip()
 
@@ -489,7 +528,8 @@ def _git(cwd: Path, *args: str, ok: tuple[int, ...] = (0,)) -> str:
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",  # a diff may hold any bytes
             timeout=GIT_TIMEOUT,
             check=False,
         )
@@ -716,10 +756,15 @@ def node_record(node: Node, project: Path, r: NodeResult) -> dict[str, Any]:
 
 
 def resumable(
-    events: Sequence[Event], graph: Graph, projects: Mapping[str, Path]
+    events: Sequence[Event],
+    graph: Graph,
+    projects: Mapping[str, Path],
+    why_not: dict[str, str] | None = None,
 ) -> dict[str, NodeResult]:
     """The done results in an earlier run's events that a run of graph may reuse: same
-    spec, every need reused too, and a copy still at the recorded head."""
+    spec, same base commit, every need reused too, and a copy still at the recorded
+    head. why_not, if given, receives the reason for each other node."""
+    why_not = {} if why_not is None else why_not
     found = {
         e.data.get("node"): e.data
         for e in events
@@ -727,15 +772,25 @@ def resumable(
     }
     reuse: dict[str, NodeResult] = {}
     deps = {n.id: n.needs for n in graph.nodes.values()}
+    parents = chains(graph, projects)
     for nid in TopologicalSorter(deps).static_order():
         node, d = graph.nodes[nid], found.get(nid)
-        if not d or d.get("spec") != spec(node, projects[nid]):
+        if not d:
+            why_not[nid] = "it did not finish done in that run"
+            continue
+        if d.get("spec") != spec(node, projects[nid]):
+            why_not[nid] = "its definition or project path changed"
+            continue
+        if not parents[nid] and not _same_base(projects[nid], node.ref, d.get("base")):
+            why_not[nid] = f"{node.ref} is at a different commit now"
             continue
         if not all(n in reuse for n in node.needs):
+            why_not[nid] = "a node it needs is not reused"
             continue
         try:
             workdir = Path(d["workdir"])
             if head(workdir) != d["head"]:
+                why_not[nid] = "its copy has moved"
                 continue
             outputs = {
                 o["name"]: Artifact(
@@ -760,8 +815,19 @@ def resumable(
                 reused=True,
             )
         except (GraphError, KeyError, TypeError, ValueError):
+            why_not[nid] = "its copy or record is unusable"
             continue  # a trace from before resume, or a copy that is gone
     return reuse
+
+
+def _same_base(project: Path, ref: str, base: Any) -> bool:
+    """Whether ref in project is still the commit an earlier run started from."""
+    try:
+        return bool(
+            _git(project, "rev-parse", "--verify", f"{ref}^{{commit}}").strip() == base
+        )
+    except GraphError:
+        return False
 
 
 def serial_order(graph: Graph) -> list[str]:
@@ -836,23 +902,14 @@ def _run_node(
         status, summary = r.status, r.summary
     except (RoleError, ReportError) as e:
         status, summary = "failed", str(e)
+    except Exception as e:  # noqa: BLE001 - one node's bug must not stop the others
+        status, summary = "failed", f"{type(e).__name__}: {e}"
+    message = f"timu {node.id}: {node.objective.splitlines()[0][:60]}\n\n"
+    message += f"{node.workflow} {status}: {summary}\n\nrun {session.run_id}"
     try:
-        if _git(
-            run.workdir, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD"
-        ).split() != [
-            base,
-            f"refs/heads/{branch}",
-        ]:
-            return copy(
-                "failed",
-                "HEAD moved during the workflow; agents may not commit",
-                head=base,
-            )
-        message = f"timu {node.id}: {node.objective.splitlines()[0][:60]}\n\n"
-        message += f"{node.workflow} {status}: {summary}\n\nrun {session.run_id}"
-        new_head = commit(run.workdir, message, exclude)
+        new_head = seal(run, run.workdir, base, branch, message, exclude, status)
     except GraphError as e:
-        return copy("failed", f"cannot commit: {e}", head=base)
+        return copy("failed", str(e), head=base)
     coded = any(role.name == "coder" for role, _ in run.results.values())
     if status == "done" and new_head == base and coded:
         run.emit("warning", message=f"node {node.id} changed nothing")

@@ -421,7 +421,7 @@ def test_check_files() -> None:
         "*.mk",
     )
     assert "conftest.py" in check_files(["uv run python -m pytest -q"], ws)
-    assert check_files(["cargo test", "echo pytest-free"], ws) == ()
+    assert check_files(["ninja test", "echo pytest-free"], ws) == ()
 
 
 def test_check_fix_review_refuses_a_fix_that_edits_the_check(tmp_path: Path) -> None:

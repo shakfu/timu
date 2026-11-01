@@ -77,13 +77,15 @@ def scrubbed_env(tmp: Path, workspace_writable: bool = True) -> dict[str, str]:
 @dataclass(frozen=True)
 class Ran:
     """How a command ended. code is None if it was stopped or could not start.
-    created lists the guarded paths the command made; left, those not removed."""
+    created lists the guarded paths the command made; left, those not removed.
+    moved lists existing .git entries the command renamed; they are kept."""
 
     text: str
     code: int | None
     stopped: str = ""  # why it was stopped: cancelled, or timed out after N s
     created: tuple[Path, ...] = ()
     left: tuple[Path, ...] = ()
+    moved: tuple[Path, ...] = ()
 
 
 def git_entries(roots: Sequence[Path], opened: list[tuple[Path, int]]) -> list[Path]:
@@ -111,6 +113,14 @@ def git_entries(roots: Sequence[Path], opened: list[tuple[Path, int]]) -> list[P
             elif e.is_dir(follow_symlinks=False):
                 stack.append(Path(e.path))
     return sorted(found)
+
+
+def _identity(p: Path) -> tuple[int, int] | None:
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    return st.st_dev, st.st_ino
 
 
 def _open(d: Path, bits: int, opened: list[tuple[Path, int]]) -> bool:
@@ -179,12 +189,15 @@ def run_sh(
     Outside policy.scratch, every existing .git under the write roots is read-only
     to the command, and a .git or deny_write path it creates is removed after it.
     Git runs code from a .git's config and hooks outside any sandbox, and bwrap
-    protects only paths that exist."""
+    protects only paths that exist. A .git that existed before and has a new path was
+    renamed with its parent; it may hold the only copy of a repo's history, so it stays.
+    """
     guard = [r for r in policy.write_roots if r not in policy.scratch]
     absent = [p for p in policy.deny_write if not os.path.lexists(p)]
     opened: list[tuple[Path, int]] = []
     before = git_entries(guard, opened)
     _restore(opened)
+    existing = {_identity(p) for p in before}
     deny = dict.fromkeys((*policy.deny_write, *before))
     ran = _run(
         cmd,
@@ -199,7 +212,10 @@ def run_sh(
     opened.clear()
     try:
         new = sorted(set(git_entries(guard, opened)) - set(before))
-        created = (*(p for p in absent if os.path.lexists(p)), *new)
+        moved = tuple(p for p in new if _identity(p) in existing)
+        made = [p for p in new if p not in moved]
+        created = (*(p for p in absent if os.path.lexists(p)), *made)
+        ran = replace(ran, moved=moved)
         if not created:
             return ran
         return replace(ran, created=created, left=_remove(created, opened))
@@ -332,6 +348,8 @@ def _shell(ctx: Context, args: Mapping[str, Any]) -> ToolOutput:
     nl = "\n" if text and not text.endswith("\n") else ""
     end = f"{ran.stopped}; killed" if ran.stopped else f"exit {ran.code}"
     text = f"{text}{nl}[{end}]"
+    if ran.moved:
+        text += f"\n[moved a git repo; kept {', '.join(map(str, ran.moved))}]"
     if ran.created:  # first, so the console's one-line error shows it
         return ToolOutput(f"{refusal(ran, ctx.workdir)}\n{text}", is_error=True)
     return ToolOutput(text, is_error=ran.code != 0)  # None when stopped

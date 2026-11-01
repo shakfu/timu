@@ -271,6 +271,7 @@ def test_cli_research_with_denied_approval(
     code = main(
         [
             "run",
+            "--in-place",
             "--config",
             str(toml),
             "-C",

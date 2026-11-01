@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,13 @@ def cli(
 ) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     provider = FakeProvider(replies)
-    args = ["run", "--config", str(config(tmp_path, kw.pop("toml", ""))), *argv]
+    args = [
+        "run",
+        "--in-place",
+        "--config",
+        str(config(tmp_path, kw.pop("toml", ""))),
+        *argv,
+    ]
     code = main(args, provider_for=lambda role: provider, out=out, err=err)
     return code, out.getvalue(), err.getvalue()
 
@@ -98,6 +105,30 @@ def test_run_fixes_a_seeded_bug(tmp_path: Path, repo: Path, state: Path) -> None
     ]
     assert {e["role"] for e in shells} == {"coder", "reviewer"}  # both ran the tests
     assert events[-1]["kind"] == "workflow_result"
+
+
+@mac_only
+def test_run_on_a_copy_in_the_real_sandbox(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-gitconfig"))
+    base = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run([*base, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*base, "add", "."], cwd=repo, check=True)
+    subprocess.run([*base, "commit", "-qm", "seed"], cwd=repo, check=True)
+    prefixes = sorted({os.path.realpath(p) for p in (sys.prefix, sys.base_prefix)})
+    out, err = io.StringIO(), io.StringIO()
+    provider = FakeProvider(FIX + REVIEW)
+    toml = config(tmp_path, f"[sandbox]\nextra_read = {json.dumps(prefixes)}\n")
+    code = main(
+        ["run", "--config", str(toml), "-C", str(repo), "fix the bug in add()"],
+        provider_for=lambda role: provider,
+        out=out,
+        err=err,
+    )
+    assert code == 0, err.getvalue()
+    assert "a - b" in (repo / "calc.py").read_text()  # the checkout is unchanged
+    assert " fetch " in err.getvalue()
 
 
 def test_run_without_a_sandbox_flag(tmp_path: Path, repo: Path) -> None:

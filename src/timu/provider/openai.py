@@ -46,6 +46,16 @@ class _Failure:
     delay: float | None = None  # from Retry-After
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would send the Authorization header to any redirect target."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class OpenAIProvider:
     """extra_body is merged into every request body, e.g. OpenRouter's
     {"cache_control": {"type": "ephemeral"}} or {"reasoning": {...}}."""
@@ -117,7 +127,7 @@ class OpenAIProvider:
         req = urllib.request.Request(self.url, data, headers, method="POST")
         stream = _Stream(on_text)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            with _OPENER.open(req, timeout=self.timeout) as r:
                 if "text/event-stream" not in r.headers.get("content-type", ""):
                     raw = r.read(MAX_RESPONSE + 1)  # the server ignored "stream"
                     if len(raw) > MAX_RESPONSE:
@@ -132,7 +142,7 @@ class OpenAIProvider:
         except urllib.error.HTTPError as e:
             with e:
                 text = _clean(e.read(64 * 1024))
-            if _is_context_error(text):
+            if e.code != 429 and _is_context_error(text):
                 return _Failure(
                     f"context length exceeded: {text[:500]}", retryable=False
                 )

@@ -16,6 +16,8 @@ import ipaddress
 import json
 import re
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,8 +30,10 @@ from timu.tool import Context, Tool, ToolOutput
 from timu.types import Capability
 
 MAX_FETCH = 2 * 1024 * 1024  # bytes read from a response
-TIMEOUT = 30  # seconds
+TIMEOUT = 30  # seconds, per socket operation
+TOTAL_TIMEOUT = 120  # seconds, for one response; a server can send slowly for ever
 USER_AGENT = "timu (research agent)"
+CREDENTIALS = ("X-subscription-token", "Authorization")  # as urllib capitalizes them
 BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
@@ -138,20 +142,38 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
             raise urllib.error.HTTPError(
                 newurl, code, f"redirect refused: {e}", headers, fp
             ) from None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        origin = urllib.parse.urlsplit(req.full_url)[:2]
+        if new and urllib.parse.urlsplit(newurl)[:2] != origin:
+            for name in CREDENTIALS:
+                new.remove_header(name)
+        return new
 
 
 def _get(
-    url: str, headers: Mapping[str, str], allow_private: bool
+    url: str,
+    headers: Mapping[str, str],
+    allow_private: bool,
+    cancel: threading.Event | None = None,
 ) -> tuple[bytes, str, bool]:
-    """(body up to MAX_FETCH, content type, truncated). Raises WebError."""
+    """(body up to MAX_FETCH, content type, truncated). Raises WebError, also past
+    TOTAL_TIMEOUT or on cancel, which it checks between reads."""
     check_url(url, allow_private)
     checked = () if allow_private else (_HTTP(), _HTTPS())
     opener = urllib.request.build_opener(*checked, _Redirects(allow_private))
     req = urllib.request.Request(url, headers={"user-agent": USER_AGENT, **headers})
     try:
         with opener.open(req, timeout=TIMEOUT) as r:
-            body = r.read(MAX_FETCH + 1)
+            deadline = time.monotonic() + TOTAL_TIMEOUT
+            body = b""
+            while len(body) <= MAX_FETCH and (
+                chunk := r.read1(MAX_FETCH + 1 - len(body))
+            ):
+                body += chunk
+                if cancel is not None and cancel.is_set():
+                    raise WebError("cancelled")
+                if time.monotonic() >= deadline:
+                    raise WebError(f"{url} took over {TOTAL_TIMEOUT} s")
             ctype = r.headers.get("content-type", "")
     except urllib.error.HTTPError as e:
         raise WebError(f"http {e.code}: {e.reason}") from None
@@ -258,7 +280,7 @@ def web_fetch_tool(allow_private: bool = False) -> Tool:
         if not isinstance(url, str) or not url:
             return ToolOutput("url must be a non-empty string", is_error=True)
         try:
-            body, ctype, truncated = _get(url, {}, allow_private)
+            body, ctype, truncated = _get(url, {}, allow_private, ctx.cancel)
         except WebError as e:
             return ToolOutput(str(e), is_error=True)
         kind = ctype.split(";")[0].strip().lower()
@@ -310,7 +332,7 @@ def web_search_tool(
         url = f"{base_url}?{urllib.parse.urlencode({'q': query, 'count': count})}"
         headers = {"accept": "application/json", "x-subscription-token": api_key}
         try:
-            body, _, _ = _get(url, headers, allow_private)
+            body, _, _ = _get(url, headers, allow_private, ctx.cancel)
             data = json.loads(body)
         except WebError as e:
             return ToolOutput(f"search failed: {e}", is_error=True)

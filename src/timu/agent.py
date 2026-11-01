@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from timu.events import Event, EventSink
-from timu.provider.base import Message, Provider, ToolCall
+from timu.provider.base import Message, Provider, Reply, ToolCall
 from timu.role import Role, make_context
 from timu.sandbox import NoSandbox, Sandbox
 from timu.skills import prompt_section
@@ -24,6 +24,7 @@ from timu.tools.web import proxy_warning
 from timu.types import Capability, Result, Status, Task, Usage
 
 REPEAT_LIMIT = 3  # identical consecutive tool calls before the run stops
+CANCEL_POLL = 0.05  # seconds between checks while waiting for the model
 
 
 class Agent:
@@ -121,15 +122,20 @@ class Agent:
         while True:
             if self.cancel.is_set():
                 return finish("cancelled", with_last("cancelled", last_text))
-            limit = usage.exceeds(budget, self._clock() - start)
+            elapsed = self._clock() - start
+            limit = usage.exceeds(budget, elapsed)
             if limit := limit or (self._outer_limit and self._outer_limit(True)):
                 return finish(
                     "budget", with_last(f"budget reached ({limit})", last_text)
                 )
 
-            reply = self.provider.complete(
-                messages, self.role.tools, lambda t: self._emit("model_delta", text=t)
-            )
+            reply = self._complete(messages, budget.wall_seconds - elapsed)
+            if reply is None:
+                if self.cancel.is_set():
+                    return finish("cancelled", with_last("cancelled", last_text))
+                return finish(
+                    "budget", with_last("budget reached (wall_seconds)", last_text)
+                )
             usage += self._charge(replace(reply.usage, turns=1, tool_calls=0))
             if budget.cost_usd is not None and not reply.cost_known and not warned_cost:
                 warned_cost = True
@@ -218,6 +224,38 @@ class Agent:
                 )
             if stop is not None:
                 return finish(stop[0], with_last(stop[1], last_text))
+
+    def _complete(self, messages: list[Message], seconds: float) -> Reply | None:
+        """The model's reply, or None on cancel or after seconds. Blocking socket reads
+        cannot be interrupted, so the call runs in a thread that is left behind; its
+        text is dropped, and what it spends is not charged."""
+        outcome: list[Reply | BaseException] = []
+        done = threading.Event()
+        abandoned = threading.Event()
+
+        def on_text(text: str) -> None:
+            if not abandoned.is_set():
+                self._emit("model_delta", text=text)
+
+        def call() -> None:
+            try:
+                outcome.append(
+                    self.provider.complete(messages, self.role.tools, on_text)
+                )
+            except BaseException as e:  # noqa: BLE001 - re-raised by the caller
+                outcome.append(e)
+            done.set()
+
+        name = f"{threading.current_thread().name}/model"
+        threading.Thread(target=call, name=name, daemon=True).start()
+        deadline = time.monotonic() + seconds
+        while not done.wait(CANCEL_POLL):
+            if self.cancel.is_set() or time.monotonic() >= deadline:
+                abandoned.set()
+                return None
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        return outcome[0]
 
     def _charge(self, delta: Usage) -> Usage:
         if self._on_usage:

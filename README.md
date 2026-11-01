@@ -107,7 +107,11 @@ timu run --workflow research-fix-review "upgrade to the current tomllib API"
 timu run --workflow lead "add a --json flag to the report command"
 ```
 
-`--workflow` picks one of the workflows above. The reviewer's report goes to `REVIEW.md`, or `--report PATH`. Add it to `.gitignore`; timu warns if it is not ignored.
+`--workflow` picks one of the workflows above.
+
+A run works on a `git clone --local` copy under `~/.local/state/timu/work/`, so your checkout does not change. timu commits the changes on a branch in the copy and prints the `git fetch` command that brings it back. The copy starts from `HEAD`: uncommitted changes and gitignored files, such as `.env`, are not in it, and timu warns if the checkout is dirty. The reviewer's report goes to `REVIEW.md` in the copy, or `--report PATH`, and timu prints its path. It stays out of the commit. A run fails without committing if the tree holds a bare git repo, or if files change after the last review.
+
+`--in-place` works in the checkout itself, and is the only choice outside a git repo. Use it only for work you trust. An agent can then plant a repo config, by moving a nested repo or creating a bare one, and git runs that config's commands outside the sandbox when you next run git there.
 
 Useful flags:
 
@@ -175,8 +179,8 @@ timu graph run graph.toml
   params = { check = ["uv pip install ${wheel.wheel}", "make test"], network = true }
   ```
 
-- `check-fix-review` fails a fix that changes a file the check runs, such as `Makefile` for `make test`, `conftest.py` or `pyproject.toml` for pytest, or a script the check names. Such an edit can make any tree pass. Set `allow_check_edits = true` in `params` to accept it.
-- `budget = { cost_usd = 1.0 }` on a node, or under `[defaults]`, caps that node's agents. `--max-cost` caps the whole graph.
+- `check-fix-review` fails a fix that changes a file the check runs, such as `Makefile` for `make test`, `conftest.py` or `pyproject.toml` for pytest, or a script the check names. Such an edit can make any tree pass. Set `allow_check_edits = true` in `params` to accept it. Test files are not covered unless you list them: `check_paths = ["tests/*"]` in `params` fails a fix that adds, edits or removes a match.
+- `budget = { cost_usd = 1.0 }` on a node, or under `[defaults]`, caps that node's agents. A top-level `[budget]` table sets the total for every node together, by default 200 turns, 400 tool calls, 2,000,000 tokens and 3600 seconds. A node budget cannot exceed it. `--max-cost` caps the whole graph's cost.
 - `models = { reviewer = "<model id>" }` on a node sets a role's model for that node, over the user config.
 - Several nodes may use one project. A node starts from the branch of its nearest ancestor on that project.
 
@@ -187,7 +191,7 @@ timu graph run --resume <run id> graph.toml  # reuse the nodes that run finished
 ```
 
 - `--max-parallel` runs ready nodes in threads. Console lines then start with the node id. Approval prompts come one at a time, and other nodes' output waits while you answer.
-- `--resume` reuses a node that ended `done` in the earlier run, if its definition and project are unchanged, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again.
+- `--resume` reuses a node that ended `done` in the earlier run, if its definition is unchanged, its `ref` is at the same commit, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again, and timu prints why.
 
 ## Traces
 
@@ -201,6 +205,8 @@ timu report --by model  # per model, counting agents; or --by project
 ```
 
 `timu report` counts each `timu run` and each graph node once; a reused node does not count again.
+
+Copies and traces stay until you remove them. `timu clean --older-than DAYS` lists those of older runs; `--yes` deletes them, including branches not yet fetched.
 
 ## Develop
 

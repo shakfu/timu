@@ -124,6 +124,7 @@ def run_scenario(
     err = io.StringIO()
     argv = [
         "run",
+        "--in-place",
         "--config",
         str(toml),
         "-C",

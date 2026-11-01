@@ -975,19 +975,25 @@ def test_models_errors(models: str, message: str) -> None:
 
 
 class PerThread:
-    """A FakeProvider per thread, so parallel nodes each get the whole script. The
-    first call in each thread waits until parties threads have made one."""
+    """A FakeProvider per node thread, so parallel nodes each get the whole script. The
+    first call for each node waits until parties nodes have made one. An agent calls
+    its provider on a worker named after the node's thread."""
 
     def __init__(self, script: list[Reply], parties: int) -> None:
-        self.script, self.local = script, threading.local()
+        self.script: list[Reply] = script
+        self.fakes: dict[str, FakeProvider] = {}
+        self.lock = threading.Lock()
         self.barrier = threading.Barrier(parties, timeout=10)
 
     def complete(self, messages: Any, tools: Any, on_text: Any = None) -> Reply:
-        if not hasattr(self.local, "fake"):
-            self.local.fake = FakeProvider(self.script)
+        node_thread = threading.current_thread().name.split("/")[0]
+        with self.lock:
+            first = node_thread not in self.fakes
+            if first:
+                self.fakes[node_thread] = FakeProvider(self.script)
+        if first:
             self.barrier.wait()  # breaks, failing the node, unless both run at once
-        fake: FakeProvider = self.local.fake
-        return fake.complete(messages, tools, on_text)
+        return self.fakes[node_thread].complete(messages, tools, on_text)
 
 
 PARALLEL = BASE + '[nodes.c]\nrepo = "c"\nworkflow = "fix-review"\nobjective = "o"\n'
@@ -1131,6 +1137,7 @@ def test_cli_dry_run_prints_the_plan_and_runs_nothing(tmp_path: Path) -> None:
         f"  2. b: fix-review on {projects / 'b'} after a\n"
         "       coder c, reviewer r\n"
         "       cost cap none\n"
+        "graph limits: 200 turns, 400 tool calls, 2000000 tokens, 3600 s\n"
         "ceiling: none; b set no budget.cost_usd and --max-cost is not given\n"
     )
     assert not (tmp_path / "state").exists()  # no trace, no copies

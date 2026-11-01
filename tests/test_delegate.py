@@ -417,6 +417,7 @@ def test_cli_lead(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     code = main(
         [
             "run",
+            "--in-place",
             "--config",
             str(toml),
             "-C",
@@ -490,6 +491,7 @@ def test_gate_default(
     provider = FakeProvider(replies)
     argv = [
         "run",
+        "--in-place",
         "--config",
         str(toml),
         "-C",
