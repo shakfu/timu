@@ -206,7 +206,7 @@ timu report --by model  # per model, counting agents; or --by project
 
 `timu report` counts each `timu run` and each graph node once; a reused node does not count again.
 
-Copies and traces stay until you remove them. `timu clean --older-than DAYS` lists those of older runs; `--yes` deletes them, including branches not yet fetched.
+Copies, traces and quarantined entries stay until you remove them. `timu clean --older-than DAYS` lists those of older runs; `--yes` deletes them, including branches not yet fetched.
 
 ## Develop
 

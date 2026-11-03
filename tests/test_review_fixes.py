@@ -34,7 +34,7 @@ from timu.provider.openai import OpenAIProvider
 from timu.sandbox import MacSandbox, NoSandbox, Policy, detect
 from timu.tool import PROTECTED, Context
 from timu.tools.fs import READ, SEARCH
-from timu.tools.shell import run_sh, scrubbed_env
+from timu.tools.shell import refusal, run_sh, scrubbed_env
 from timu.tools.web import WebError, _get
 from timu.workflow import WORKFLOW_BUDGET, Session, check_files, check_fix_review
 
@@ -195,11 +195,32 @@ def test_moving_a_nested_repo_keeps_its_history(tmp_path: Path) -> None:
     assert "first" in git(ws / "sub2", "log", "--format=%s")
 
 
-def test_a_new_git_dir_is_still_removed(tmp_path: Path) -> None:
+def test_a_new_git_dir_is_quarantined_with_its_history(tmp_path: Path) -> None:
     ws = repo(tmp_path / "ws")
-    ran = sh(ws, "git init -q fresh")
+    ran = sh(
+        ws,
+        "git init -q fresh && cd fresh && touch f && git add f && "
+        "git -c user.name=t -c user.email=t@e commit -qm work",
+    )
     assert [p.parent.name for p in ran.created] == ["fresh"]
     assert not (ws / "fresh" / ".git").exists()
+    assert not ran.left
+    assert ran.quarantine is not None
+    assert ran.quarantine.parent == tmp_path / "state" / "timu" / "quarantine"
+    assert ran.quarantine.stat().st_mode & 0o777 == 0o700
+    kept = ran.quarantine / (ws / "fresh" / ".git").relative_to("/")
+    assert "work" in git(kept, "log", "--format=%s")
+
+
+def test_no_quarantine_inside_a_write_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = repo(tmp_path / "ws")
+    monkeypatch.setenv("XDG_STATE_HOME", str(ws / "state"))
+    ran = sh(ws, "git init -q fresh")
+    assert ran.quarantine is None
+    assert ran.left == ran.created
+    assert "could not move fresh/.git" in refusal(ran, ws)
 
 
 # ---- review snapshot (F4) ----
@@ -493,6 +514,7 @@ def test_clean_lists_until_told_to_delete(tmp_path: Path) -> None:
     run = "20200101-000000-abcd"
     (state / "work" / run / "run").mkdir(parents=True)
     (state / "runs").mkdir()
+    (state / "quarantine" / run / "ws" / ".git").mkdir(parents=True)
     trace = state / "runs" / f"{run}.jsonl"
     trace.write_text("")
     keep = state / "runs" / "keep-me.jsonl"  # not named like a run
@@ -500,7 +522,7 @@ def test_clean_lists_until_told_to_delete(tmp_path: Path) -> None:
     fresh = state / "runs" / "20990101-000000-abcd.jsonl"
     fresh.write_text("")
     old = time.time() - 40 * 86400
-    for p in (state / "work" / run, trace, keep):
+    for p in (state / "work" / run, trace, keep, state / "quarantine" / run):
         os.utime(p, (old, old))
 
     out = io.StringIO()
@@ -512,6 +534,7 @@ def test_clean_lists_until_told_to_delete(tmp_path: Path) -> None:
     assert main(["clean", "--older-than", "30", "--yes"], out=out) == 0
     assert not trace.exists()
     assert not (state / "work" / run).exists()
+    assert not (state / "quarantine" / run).exists()
     assert keep.exists()
     assert fresh.exists()
 

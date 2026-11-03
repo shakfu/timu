@@ -378,7 +378,7 @@ def test_commands_may_not_create_git_or_timu_files(tmp_path: Path) -> None:
     steps = ['git init -q "$TMPDIR/r"', "git init -q sub && mkdir .timu", "echo never"]
     r = commands(run, "b", steps=steps)
     assert r.status == "failed"
-    assert "created .timu, sub/.git; removed" in r.summary
+    assert "created .timu, sub/.git; moved to " in r.summary
     assert not (tmp_path / ".timu").exists()
     assert not (tmp_path / "sub" / ".git").exists() and (tmp_path / "sub").is_dir()
     assert "echo never" not in r.artifacts[0].content

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import select
 import shutil
 import signal
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from timu.sandbox import Policy, Sandbox
-from timu.tool import PROTECTED, Context, Tool, ToolOutput
+from timu.tool import PROTECTED, Context, Tool, ToolOutput, state_dir
 from timu.types import Capability
 
 SHELL_TIMEOUT_MAX = 600  # seconds
@@ -77,7 +78,8 @@ def scrubbed_env(tmp: Path, workspace_writable: bool = True) -> dict[str, str]:
 @dataclass(frozen=True)
 class Ran:
     """How a command ended. code is None if it was stopped or could not start.
-    created lists the guarded paths the command made; left, those not removed.
+    created lists the guarded paths the command made; left, those not moved to the
+    quarantine directory.
     moved lists existing .git entries the command renamed; they are kept."""
 
     text: str
@@ -86,6 +88,7 @@ class Ran:
     created: tuple[Path, ...] = ()
     left: tuple[Path, ...] = ()
     moved: tuple[Path, ...] = ()
+    quarantine: Path | None = None
 
 
 def git_entries(roots: Sequence[Path], opened: list[tuple[Path, int]]) -> list[Path]:
@@ -143,20 +146,40 @@ def _restore(opened: list[tuple[Path, int]]) -> None:
             os.chmod(d, mode)
 
 
-def _remove(paths: Sequence[Path], opened: list[tuple[Path, int]]) -> tuple[Path, ...]:
-    """Remove each path; return those that remain. If a first try fails, the path's
-    directories and its parent are opened, as git_entries does, for a second."""
+def _quarantine(
+    paths: Sequence[Path], opened: list[tuple[Path, int]], guard: Sequence[Path]
+) -> tuple[Path | None, tuple[Path, ...]]:
+    """Move each path under a new directory in state_dir()/quarantine, at its absolute
+    path. Return that directory and the paths that remain. Nothing moves if the
+    quarantine is under a guard root, where later commands could reach it. If a first
+    try fails, the path's directories and its parent are opened, as git_entries does."""
 
-    def remove(p: Path) -> None:
-        if p.is_dir() and not p.is_symlink():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
+    def move(p: Path, target: Path) -> None:
+        if target.is_dir() and not target.is_symlink():  # a failed cross-device move
+            shutil.rmtree(target)
+        elif os.path.lexists(target):
+            target.unlink()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(p, target)
 
+    root = state_dir() / "quarantine"
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root = Path(os.path.realpath(root))
+        if any(root.is_relative_to(g) for g in guard):
+            return None, tuple(paths)
+        while True:  # named like a run, so `timu clean` ages it out
+            dest = root / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+            with suppress(FileExistsError):
+                dest.mkdir(mode=0o700)
+                break
+    except OSError:
+        return None, tuple(paths)
     left = []
     for p in paths:
+        target = dest / p.relative_to(p.anchor)
         try:
-            remove(p)
+            move(p, target)
             continue
         except OSError:
             pass
@@ -166,10 +189,10 @@ def _remove(paths: Sequence[Path], opened: list[tuple[Path, int]]) -> tuple[Path
             for d in subdirs:
                 _open(Path(top, d), stat.S_IRWXU, opened)
         try:
-            remove(p)
+            move(p, target)
         except OSError:
             left.append(p)
-    return tuple(left)
+    return dest, tuple(left)
 
 
 def run_sh(
@@ -187,7 +210,8 @@ def run_sh(
     and capped at max_output. Timeout and cancel kill the whole process group.
 
     Outside policy.scratch, every existing .git under the write roots is read-only
-    to the command, and a .git or deny_write path it creates is removed after it.
+    to the command, and a .git or deny_write path it creates is moved to a quarantine
+    directory after it. Deleting it could destroy commits the command made.
     Git runs code from a .git's config and hooks outside any sandbox, and bwrap
     protects only paths that exist. A .git that existed before and has a new path was
     renamed with its parent; it may hold the only copy of a repo's history, so it stays.
@@ -218,7 +242,8 @@ def run_sh(
         ran = replace(ran, moved=moved)
         if not created:
             return ran
-        return replace(ran, created=created, left=_remove(created, opened))
+        kept, left = _quarantine(created, opened, guard)
+        return replace(ran, created=created, left=left, quarantine=kept)
     finally:
         _restore(opened)
 
@@ -292,8 +317,8 @@ def refusal(ran: Ran, cwd: Path) -> str:
     text += f"timu.toml or .timu; created {names(ran.created)}"
     if ran.left:
         left = names(ran.left)
-        return f"{text}; could not remove {left}, delete it before running git or timu"
-    return f"{text}; removed"
+        return f"{text}; could not move {left}, delete it before running git or timu"
+    return f"{text}; moved to {ran.quarantine}"
 
 
 def _kill_group(proc: subprocess.Popen[bytes], gently: bool) -> None:

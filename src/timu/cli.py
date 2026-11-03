@@ -43,7 +43,7 @@ from timu.provider.base import Provider
 from timu.report import ReportError
 from timu.role import Role, RoleError
 from timu.sandbox import NoSandbox, Sandbox, detect, why_none
-from timu.tool import Tool
+from timu.tool import Tool, state_dir
 from timu.trace import BY, TraceError, load, render, totals
 from timu.types import Artifact, Budget, Result
 from timu.workflow import (
@@ -178,10 +178,7 @@ def _brief(args: Any, width: int = 100) -> str:
 
 
 def trace_dir(env: dict[str, str] | os._Environ[str] = os.environ) -> Path:
-    base = env.get("XDG_STATE_HOME") or str(
-        Path(env.get("HOME", ".")) / ".local" / "state"
-    )
-    return Path(base) / "timu" / "runs"
+    return state_dir(env) / "runs"
 
 
 def positive(v: str) -> int:
@@ -768,8 +765,8 @@ def show_report(by: str, out: TextIO, err: TextIO) -> int:
 
 
 def clean_state(days: int, delete: bool, out: TextIO) -> int:
-    """List, or with delete remove, the copies and traces of runs last changed more than
-    days ago. Only entries named like a run are touched."""
+    """List, or with delete remove, the copies, traces and quarantined entries last
+    changed more than days ago. Only entries named like a run are touched."""
     cutoff = time.time() - days * 86400
     state = trace_dir().parent
     found = [
@@ -777,6 +774,7 @@ def clean_state(days: int, delete: bool, out: TextIO) -> int:
         for p in (
             *sorted((state / "work").glob("*")),
             *sorted((state / "runs").glob("*.jsonl")),
+            *sorted((state / "quarantine").glob("*")),
         )
         if RUN_ID.fullmatch(p.name.removesuffix(".jsonl"))
         and p.lstat().st_mtime < cutoff

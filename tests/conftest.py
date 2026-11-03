@@ -48,6 +48,15 @@ TEST_ROLE = Role("tester", "You are a test agent.", (ECHO, ADD, CANCEL, BOOM, BI
 MakeAgent = Callable[..., tuple[Agent, FakeProvider, list[Event]]]
 
 
+@pytest.fixture(autouse=True)
+def private_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep traces and quarantined entries out of the user's state dir. Not under
+    tmp_path, which some tests use as the workspace."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path_factory.mktemp("state")))
+
+
 @pytest.fixture
 def make_agent(tmp_path: Path) -> MakeAgent:
     """make_agent(replies, budget=None, **agent_kwargs) -> (agent, provider, events)."""

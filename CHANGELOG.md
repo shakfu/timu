@@ -13,12 +13,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - A graph file's top-level `[budget]` sets the total for all nodes. Before, the total was fixed at 200 turns and 2M tokens, and a node budget could only lower it. `--dry-run` prints it.
-- `timu clean --older-than DAYS` lists old copies and traces, and `--yes` deletes them.
+- `timu clean --older-than DAYS` lists old copies, traces and quarantined entries, and `--yes` deletes them.
 - `check-fix-review` takes `check_paths`, globs of files a fix may not change. Opt-in over protecting tests by default, because a fix often adds a regression test.
 
 ### Fixed
 
-- On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays.
+- On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays. A new `.git`, `timu.toml` or `.timu` is moved to `~/.local/state/timu/quarantine` instead of deleted, since it may hold commits the command made. If the quarantine lies under a write root, the entry stays in place and the call says so.
 - A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
 - `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
 - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.

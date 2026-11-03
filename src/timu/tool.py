@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,6 +25,15 @@ class ToolOutput:
 
 PROTECTED = ("timu.toml", ".timu")
 """Workdir entries that later runs read as config and skills; no agent may write them."""
+
+
+def state_dir(env: Mapping[str, str] = os.environ) -> Path:
+    """$XDG_STATE_HOME/timu (default ~/.local/state/timu): traces, copies, quarantine."""
+    base = env.get("XDG_STATE_HOME") or str(
+        Path(env.get("HOME", ".")) / ".local" / "state"
+    )
+    return Path(base) / "timu"
+
 
 Delegate = Callable[[str, str, str, tuple[str, ...]], Result]
 """delegate(role, goal, accept, input ids) -> the child's Result. Raises DelegateError."""

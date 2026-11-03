@@ -21,6 +21,7 @@ from timu.provider.fake import FakeProvider, call, calls, text
 from timu.role import make_context
 from timu.sandbox import MacSandbox, NoSandbox, Policy, Sandbox, detect, mac_profile
 from timu.skills import find
+from timu.tool import state_dir
 from timu.tools.fs import EDIT, READ, WRITE
 from timu.tools.shell import SHELL, Ran, refusal, run_sh
 
@@ -83,10 +84,13 @@ def test_new_git_and_timu_entries_are_removed(dirs: tuple[Path, Path, Path]) -> 
     out = sh(ctx, "git init -q sub && echo x > timu.toml && mkdir .timu && echo ok")
     assert out.is_error
     first, rest = out.text.split("\n", 1)
-    assert first == (
+    assert first.startswith(
         "refused: commands may create .git only under $TMPDIR, and never "
-        "timu.toml or .timu; created timu.toml, .timu, sub/.git; removed"
+        "timu.toml or .timu; created timu.toml, .timu, sub/.git; moved to "
     )
+    kept = Path(first.rsplit(" ", 1)[1])
+    assert kept.parent == state_dir() / "quarantine"
+    assert (kept / (ws / "sub" / ".git").relative_to("/") / "HEAD").is_file()
     assert rest == "ok\n[exit 0]"
     assert not (ws / "timu.toml").exists() and not (ws / ".timu").exists()
     assert not (ws / "sub" / ".git").exists() and (ws / "sub").is_dir()
@@ -99,7 +103,7 @@ def test_a_hidden_directory_is_still_scanned(dirs: tuple[Path, Path, Path]) -> N
     ws = dirs[0]
     (ws / "own").mkdir(mode=0o300)  # the user's, unreadable before the command
     out = sh(ctx_for(dirs, NoSandbox()), "git init -q a/b && chmod 000 a/b a")
-    assert out.is_error and "created a/b/.git; removed" in out.text
+    assert out.is_error and "created a/b/.git; moved to " in out.text
     assert (ws / "own").stat().st_mode & 0o777 == 0o300  # restored
     assert (ws / "a").stat().st_mode & 0o777 == 0
     for d in ("a", "a/b", "own"):  # so stat and pytest's cleanup can enter
@@ -141,7 +145,7 @@ def test_existing_git_entries_are_read_only(dirs: tuple[Path, Path, Path]) -> No
 def test_refusal_names_what_was_left() -> None:
     ran = Ran("", 0, created=(Path("/w/.timu"),), left=(Path("/w/.timu"),))
     assert refusal(ran, Path("/w")).endswith(
-        "could not remove .timu, delete it before running git or timu"
+        "could not move .timu, delete it before running git or timu"
     )
 
 
