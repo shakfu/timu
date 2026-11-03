@@ -393,8 +393,8 @@ def test_provider_does_not_follow_redirects(
 def test_provider_survives_a_reset_while_reading_an_error_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class Reset(io.RawIOBase):
-        def readinto(self, b: Any) -> int:
+    class Reset(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
             raise ConnectionResetError(54, "Connection reset by peer")
 
     def open_(req: Any, timeout: float) -> Any:
