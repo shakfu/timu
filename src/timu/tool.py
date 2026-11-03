@@ -24,7 +24,7 @@ class ToolOutput:
 
 
 PROTECTED = ("timu.toml", ".timu")
-"""Workdir entries that later runs read as config and skills; no agent may write them."""
+"""Workdir entries reserved for timu config and skills; no agent may write them."""
 
 
 def state_dir(env: Mapping[str, str] = os.environ) -> Path:

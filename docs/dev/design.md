@@ -208,7 +208,7 @@ In mode A, the report path is a file write root. A file root allows writes to th
 
 In mode B, the report is the reviewer's final message, capped at 256 KB.
 
-In both modes the report's first line is `VERDICT: APPROVE` or `VERDICT: CHANGES`, and the workflow reads it. A report without one fails the run. Guessing would either loop or approve by accident. In mode A, a report file left unchanged by a review round also fails the run, so a stale report from an earlier round is never read as the new one.
+In both modes one of the report's first three non-empty lines is `VERDICT: APPROVE` or `VERDICT: CHANGES`, and the workflow reads it. A report without one fails the run. Guessing would either loop or approve by accident. In mode A, a report file left unchanged by a review round also fails the run, so a stale report from an earlier round is never read as the new one.
 
 The reviewer's shell writes only to a private temp dir. Build tools that write into the tree (`__pycache__`, `.pytest_cache`, `build/`) must therefore be redirected there, for example with `PYTHONDONTWRITEBYTECODE=1` and `-p no:cacheprovider`. If that proves too fragile, run the reviewer on a throwaway copy of the workspace instead.
 

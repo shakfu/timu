@@ -32,7 +32,7 @@ The built-in workflows for `timu run`, in `src/timu/workflow.py`:
 
 | Workflow | Kind | Steps |
 |-|-|-|
-| `fix-review` (default) | pipeline | Coder, then reviewer. The report's first line is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. |
+| `fix-review` (default) | pipeline | Coder, then reviewer. One of the report's first three non-empty lines is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. |
 | `research-fix-review` | pipeline | Researcher first. Its findings and source URLs go to the coder as untrusted inputs. Then `fix-review`. |
 | `review-validate-fix` | pipeline | Reviewer, validator, coder, verifier. The reviewer reports findings. The validator confirms or rejects each one. The coder fixes the confirmed ones, most severe first. The verifier checks each fix. `--verify-to-fix N` sends unfixed findings back to the coder up to N times. The report lists every finding with each step's verdict. |
 | `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Every coder result includes a review, which timu runs, not the lead. Delegation depth is at most 2. |

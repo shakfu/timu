@@ -129,7 +129,7 @@ def reserved(workdir: Path, real: Path) -> str | None:
         return "writes inside .git are not allowed"
     rel = real.relative_to(workdir).parts if real.is_relative_to(workdir) else ()
     if rel and rel[0].casefold() in PROTECTED:
-        return "timu reads this on later runs; agents may not write it"
+        return "reserved for timu config and skills; agents may not write it"
     return None
 
 

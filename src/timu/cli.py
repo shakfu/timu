@@ -45,7 +45,7 @@ from timu.role import Role, RoleError
 from timu.sandbox import NoSandbox, Sandbox, detect, why_none
 from timu.tool import Tool, state_dir
 from timu.trace import BY, TraceError, load, render, totals
-from timu.types import Artifact, Budget, Result
+from timu.types import Artifact, Budget, Result, Usage
 from timu.workflow import (
     WORKFLOW_BUDGET,
     WORKFLOWS,
@@ -642,6 +642,7 @@ def _execute(
 ) -> tuple[T, Path] | int:
     """Run body in a Session that writes a trace and streams to the console, with
     Ctrl-C handling. Returns body's result and the trace, or an exit code."""
+    session: Session | None = None
     sandbox: Sandbox | None = None
     if args.unsafe_no_sandbox:
         sandbox = NoSandbox()
@@ -684,8 +685,11 @@ def _execute(
             session.emit("config", source=config.source)
             result = body(session)
     except (RoleError, ReportError, GraphError) as e:
-        err.write(f"timu: {e}\n")
-        return USAGE_ERROR
+        err.write(printable(f"timu: {e}") + "\n")
+        if session is None or not (session.used.turns or session.used.tool_calls):
+            return USAGE_ERROR
+        _spent(session.used, trace, err)  # failed after spending: not a usage error
+        return EXIT["failed"]
     except KeyboardInterrupt:
         err.write("timu: aborted\n")
         return EXIT["cancelled"]
@@ -793,9 +797,12 @@ def clean_state(days: int, delete: bool, out: TextIO) -> int:
 
 
 def _report(result: Result, trace: Path, err: TextIO) -> None:
-    u = result.usage
-    cost = f", ${u.cost_usd:.4f}" if u.cost_usd else ""
     err.write(printable(f"\ntimu: {result.status}: {result.summary}") + "\n")
+    _spent(result.usage, trace, err)
+
+
+def _spent(u: Usage, trace: Path, err: TextIO) -> None:
+    cost = f", ${u.cost_usd:.4f}" if u.cost_usd else ""
     err.write(
         f"timu: {u.turns} turns, {u.tool_calls} tool calls, {u.tokens} tokens{cost}\n"
     )

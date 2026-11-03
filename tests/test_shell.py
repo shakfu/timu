@@ -99,6 +99,17 @@ def test_new_git_and_timu_entries_are_removed(dirs: tuple[Path, Path, Path]) -> 
     assert (tmp / "clone" / ".git").is_dir()
 
 
+def test_a_new_git_in_any_case_is_removed(dirs: tuple[Path, Path, Path]) -> None:
+    """On a case-insensitive volume git treats .GiT as .git."""
+    ws = dirs[0]
+    out = sh(
+        ctx_for(dirs, NoSandbox()), "mkdir -p sub/.GiT && echo x > sub/.GiT/config"
+    )
+    assert out.is_error
+    assert "created sub/.GiT" in out.text
+    assert not (ws / "sub" / ".GiT").exists()
+
+
 def test_a_hidden_directory_is_still_scanned(dirs: tuple[Path, Path, Path]) -> None:
     ws = dirs[0]
     (ws / "own").mkdir(mode=0o300)  # the user's, unreadable before the command
@@ -284,8 +295,10 @@ def test_sandbox_writes(dirs: tuple[Path, Path, Path]) -> None:
     assert not sh(ctx, 'echo x > "$TMPDIR/t"').is_error
     assert sh(ctx, f"echo x > {outside}/o.txt").is_error
     assert sh(ctx, "echo x > .git/hooks-pre-commit").is_error
+    assert sh(ctx, "echo x > .GIT/hooks-x").is_error  # APFS: the same directory
     assert not (outside / "o.txt").exists()
     assert not (ws / ".git" / "hooks-pre-commit").exists()
+    assert not (ws / ".git" / "hooks-x").exists()
     for cmd in ("echo x > timu.toml", "echo x > TIMU.toml", "mkdir -p .timu/skills"):
         assert sh(ctx, cmd).is_error, cmd
     assert not (ws / "timu.toml").exists()
@@ -371,7 +384,7 @@ def test_profile_allows_git_only_in_scratch() -> None:
         (), (Path("/w"), Path("/t")), (Path("/w/.git"),), scratch=(Path("/t"),)
     )
     lines = mac_profile(policy, None).splitlines()
-    deny_git = lines.index('(deny file-write* (regex #"/\\.git(/|$)"))')
+    deny_git = lines.index('(deny file-write* (regex #"/\\.[Gg][Ii][Tt](/|$)"))')
     assert lines[deny_git + 1] == '(allow file-write* (subpath "/t"))'
     assert lines[deny_git + 2] == '(deny file-write* (subpath "/w/.git"))'
 
