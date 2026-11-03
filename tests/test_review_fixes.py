@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import email.message
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import shlex
 import subprocess
 import threading
 import time
+import urllib.error
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +30,7 @@ from timu.graph import (
     seal,
     spec,
 )
+from timu.provider import openai
 from timu.provider.base import Message
 from timu.provider.fake import FakeProvider, call, calls, text
 from timu.provider.openai import OpenAIProvider
@@ -385,6 +388,25 @@ def test_provider_does_not_follow_redirects(
     assert reply.stop == "error"
     assert "http 302" in reply.error
     assert "hit" not in seen
+
+
+def test_provider_survives_a_reset_while_reading_an_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Reset(io.RawIOBase):
+        def readinto(self, b: Any) -> int:
+            raise ConnectionResetError(54, "Connection reset by peer")
+
+    def open_(req: Any, timeout: float) -> Any:
+        raise urllib.error.HTTPError(
+            req.full_url, 503, "busy", email.message.Message(), Reset()
+        )
+
+    monkeypatch.setattr(openai._OPENER, "open", open_)
+    p = OpenAIProvider("http://127.0.0.1:1/v1", "m", "SECRET", retries=0)
+    reply = p.complete([Message("user", "hi")], [])
+    assert reply.stop == "error"
+    assert reply.error.startswith("http 503")
 
 
 def test_web_drops_credentials_on_a_cross_origin_redirect(

@@ -141,7 +141,10 @@ class OpenAIProvider:
                     stream.feed(line)
         except urllib.error.HTTPError as e:
             with e:
-                text = _clean(e.read(64 * 1024))
+                try:
+                    text = _clean(e.read(64 * 1024))
+                except (OSError, http.client.HTTPException):
+                    text = ""  # the status is enough; the body is best-effort
             if e.code != 429 and _is_context_error(text):
                 return _Failure(
                     f"context length exceeded: {text[:500]}", retryable=False
