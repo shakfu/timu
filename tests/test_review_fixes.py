@@ -235,13 +235,18 @@ def test_detached_writes_after_review_fail_the_seal(tmp_path: Path) -> None:
     ws = tmp_path / "ws"
     base, _ = provision(src, ws, "HEAD", "b")
     run = session(tmp_path).at(ws)
+    go = tmp_path / "go"  # outside the reviewed tree, so creating it is not a change
     perl = (
-        "use POSIX; exit if fork; POSIX::setsid(); sleep 1; "
+        "use POSIX; exit if fork; POSIX::setsid(); "
+        f"for (1..300) {{ last if -e '{go}'; select(undef,undef,undef,0.1) }} "
         'open(F,">late.txt"); print F "late"; close F;'
     )
     sh(run.workdir, f"perl -e {shlex.quote(perl)} </dev/null >/dev/null 2>&1")
     run.mark_reviewed()
-    time.sleep(2)
+    go.touch()
+    deadline = time.monotonic() + 30
+    while not (ws / "late.txt").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
     assert (ws / "late.txt").exists()
     with pytest.raises(ValueError, match="changed after the review"):
         seal(run, run.workdir, base, "b", "m", (), "done")
