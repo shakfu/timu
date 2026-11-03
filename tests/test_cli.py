@@ -17,6 +17,7 @@ from timu.cli import ConsoleSink, main
 from timu.events import Event
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider, call, calls, text
+from timu.report import MAX_REPORT
 from timu.sandbox import MacSandbox, detect
 
 mac_only = pytest.mark.skipif(
@@ -202,6 +203,20 @@ def test_report_symlink_is_a_usage_error(tmp_path: Path, repo: Path) -> None:
     code, _, err = cli(tmp_path, ["-C", str(repo), "--unsafe-no-sandbox", "x"], [])
     assert code == 2
     assert "symlink" in err
+
+
+def test_report_error_after_spending_is_a_failure(
+    tmp_path: Path, repo: Path, state: Path
+) -> None:
+    """Exit 2 means nothing ran; a report that fails after the reviewer ran is exit 1,
+    with the spending and the trace."""
+    big = "VERDICT: APPROVE\n" + "x" * MAX_REPORT
+    replies = [text("done"), text(big)]
+    code, _, err = cli(tmp_path, ["-C", str(repo), "--unsafe-no-sandbox", "x"], replies)
+    assert code == 1, err
+    assert "the limit is" in err
+    assert "timu: 2 turns" in err
+    assert f"timu: trace {state / 'timu' / 'runs'}" in err
 
 
 def test_config_error(tmp_path: Path) -> None:

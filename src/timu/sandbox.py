@@ -172,7 +172,9 @@ def mac_profile(
         *([] if policy.network else ["(deny network*)"]),
         "(deny file-write*)",
         f"(allow file-write* {writes} {dev})",
-        '(deny file-write* (regex #"/\\.git(/|$)"))',
+        # each letter as a class: whether regex matches the on-disk or the given case
+        # is undocumented, and APFS is case-insensitive by default
+        '(deny file-write* (regex #"/\\.[Gg][Ii][Tt](/|$)"))',
     ]
     if policy.scratch:  # private and temporary: the user never runs git there
         scratch = " ".join(f"(subpath {_q(p)})" for p in policy.scratch)

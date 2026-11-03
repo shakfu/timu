@@ -831,6 +831,32 @@ def test_network_downstream_of_a_model_is_refused() -> None:
 
 
 @pytest.mark.parametrize(
+    ("param", "value"),
+    [("network", "true"), ("check_paths", '["t/*"]')],
+)
+def test_an_output_cannot_set_a_param_that_takes_no_string(
+    param: str, value: str
+) -> None:
+    """A Ref yields a string. network from one also passed the trust_upstream check,
+    which tests `is True`, and failed only at bind time."""
+    g = NETWORK.replace(
+        'params = { steps = ["true"] }\n',
+        'params = { steps = ["true"] }\noutputs = { x = "file:x" }\n',
+        1,
+    ).replace(
+        'workflow = "commands"\nobjective = "o"\nparams = { steps = ["true"], '
+        "network = true }",
+        'workflow = "check-fix-review"\nobjective = "o"\n'
+        f'params = {{ check = ["true"], {param} = "${{w.x}}" }}',
+    )
+    assert "${w.x}" in g
+    with pytest.raises(GraphError, match=f"params.{param} cannot take an output"):
+        graph(g)
+    fixed = g.replace('"${w.x}"', value)
+    graph(fixed + "trust_upstream = true\n" if param == "network" else fixed)
+
+
+@pytest.mark.parametrize(
     ("extra", "message"),
     [
         ("trust_upstream = 1\n", "trust_upstream must be true or false"),

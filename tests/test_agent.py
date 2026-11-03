@@ -7,8 +7,8 @@ import json
 
 from conftest import MakeAgent
 from timu import Artifact, Budget, Origin, Task, Usage
-from timu.agent import REPEAT_LIMIT, render_task
-from timu.provider.base import Reply, ToolCall
+from timu.agent import REPEAT_LIMIT, STUB, TRIM_AT, TRIM_MIN, render_task, trim
+from timu.provider.base import Message, Reply, ToolCall
 from timu.provider.fake import call, calls, text
 
 TASK = Task("do the thing")
@@ -386,3 +386,73 @@ def test_a_second_unusable_answer_fails(make_agent: MakeAgent) -> None:
     )
     agent, _, _ = make_agent([text("no"), text("OK now")])
     assert agent.run(Task("x", check=check)).summary == "OK now"
+
+
+# ---- context trimming (design 14) ----
+
+OVERFLOW_REPLY = Reply("", stop="error", error="context length exceeded: 40000 > 32768")
+
+
+def _tool_texts(messages: tuple[Message, ...]) -> list[str]:
+    return [m.content for m in messages if m.role == "tool"]
+
+
+def test_old_tool_output_is_trimmed_past_trim_at(make_agent: MakeAgent) -> None:
+    replies = [calls(call("big", n=2000 + i)) for i in range(4)]
+    replies += [calls(call("big", n=2004), tokens=(TRIM_AT + 1, 5)), text("ok")]
+    agent, provider, events = make_agent(replies)
+    assert agent.run(TASK).status == "done"
+    assert all(t.startswith("x") for t in _tool_texts(provider.requests[4].messages))
+    last = _tool_texts(provider.requests[5].messages)
+    assert [t.startswith(STUB) for t in last] == [True, True, False, False, False]
+    assert last[0] == (
+        f"{STUB} 2000 characters; first line: {'x' * 200}. "
+        "Run the tool again if you need it.]"
+    )
+    trims = [e.data for e in events if e.kind == "trim"]
+    assert trims == [
+        {"characters": 4001 - 2 * len(last[0]), "reason": f"{TRIM_AT + 1} input tokens"}
+    ]
+
+
+def test_context_overflow_trims_and_retries(make_agent: MakeAgent) -> None:
+    replies = [calls(call("big", n=2000)), calls(call("big", n=2001))]
+    agent, provider, events = make_agent([*replies, OVERFLOW_REPLY, text("ok")])
+    result = agent.run(TASK)
+    assert (result.status, result.summary) == ("done", "ok")
+    retry = _tool_texts(provider.requests[3].messages)
+    assert [t.startswith(STUB) for t in retry] == [True, False]  # the last turn stays
+    assert [e.data["reason"] for e in events if e.kind == "trim"] == [
+        "context length exceeded"
+    ]
+
+
+def test_context_overflow_with_nothing_to_trim_fails(make_agent: MakeAgent) -> None:
+    replies = [calls(call("big", n=2000)), calls(call("big", n=2001))]
+    agent, _, _ = make_agent([*replies, OVERFLOW_REPLY, OVERFLOW_REPLY])
+    result = agent.run(TASK)  # one retry: the second overflow has nothing left
+    assert result.status == "failed"
+    assert "context length exceeded" in result.summary
+
+
+def test_trim_keeps_short_and_exempt_results() -> None:
+    long = "y" * TRIM_MIN
+    messages = [Message("system", "s"), Message("user", "u")]
+    for name in ("read", "load_skill", "delegate", "echo", "read"):
+        c = call(name, id=f"c{len(messages)}")
+        content = "short" if name == "echo" else long
+        messages += [
+            Message("assistant", "", (c,)),
+            Message("tool", content, tool_call_id=c.id),
+        ]
+    removed = trim(messages, 1)
+    assert [m.content.startswith(STUB) for m in messages if m.role == "tool"] == [
+        True,  # read
+        False,  # load_skill
+        False,  # delegate
+        False,  # echo: shorter than TRIM_MIN
+        False,  # read, in the kept turn
+    ]
+    assert removed == TRIM_MIN - len(messages[3].content)
+    assert trim(messages, 1) == 0  # a stub is not trimmed again
+    assert trim(messages[:2], 0) == 0  # no turns yet

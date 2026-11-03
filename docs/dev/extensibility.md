@@ -9,9 +9,9 @@ Status: partly built; each section says whether it is done. It answers design 15
 | Roles | Python values in `src/timu/roles.py` | the model and skills of a built-in role, in `[roles.<name>]` |
 | Workflows | functions in `src/timu/workflow.py` | nothing |
 | Tools | module constants in `src/timu/tools/` | nothing |
-| Skills | `SKILL.md` directories | anything: `./.timu/skills`, then `~/.config/timu/skills` |
+| Skills | `SKILL.md` directories | anything: `~/.config/timu/skills`, then `./.timu/skills`; a user skill wins over a workspace skill of the same name |
 
-`src/timu/cli.py` hardcodes each workflow in three places: the `--workflow` choices, the roles whose providers it checks before the run, and a dispatch with per-workflow arguments. It also sets the approval-gate default by name (`lead` on).
+Each workflow is a `Workflow` entry in `WORKFLOWS` (`src/timu/workflow.py`). The entry gives its roles, whose providers are checked before the run, its params and its approval-gate default. The CLI takes its `--workflow` choices from there.
 
 ## 2. Constraints
 

@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A graph file's top-level `[budget]` sets the total for all nodes. Before, the total was fixed at 200 turns and 2M tokens, and a node budget could only lower it. `--dry-run` prints it.
 - `timu clean --older-than DAYS` lists old copies, traces and quarantined entries, and `--yes` deletes them.
 - `check-fix-review` takes `check_paths`, globs of files a fix may not change. Opt-in over protecting tests by default, because a fix often adds a regression test.
+- Agents trim old tool output, as design 14 claimed they did. Before, every message stayed, so a long run ended with a context-length error or used up the token budget. Once a reply reports over 64k input tokens, results older than the last 3 turns become a stub with their size and first line. On a context-length error, all but the last turn's results are trimmed and the turn is retried. `delegate` and `load_skill` results are kept. Trimming at a size rather than every turn leaves short runs' prompt prefix unchanged, so provider prompt caching still applies.
 
 ### Fixed
 
@@ -24,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
 - `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
 - A lone surrogate in model text crashed the console. A 429 whose text mentions too many tokens counted as a context overflow and was not retried.
+- A graph that sets a `boolean` or `paths` param, such as `network`, from an upstream output now fails to load. An output is a string, which these params reject, so the node failed only when it ran. A Ref for `network` also passed the `trust_upstream` check.
+- On macOS, the sandbox's `.git` write rule now matches any case, such as `.GIT`. APFS is case-insensitive by default, and Seatbelt does not document whether a `regex` sees the on-disk case. Before, only the post-run scan caught a new `.GiT`, after the command had written it.
+- A role, report or graph error after a model ran now exits 1 and prints the spending and the trace. Before, it exited 2, as a usage error.
 
 ### Security
 

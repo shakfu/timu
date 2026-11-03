@@ -25,6 +25,13 @@ from timu.types import Capability, Result, Status, Task, Usage
 
 REPEAT_LIMIT = 3  # identical consecutive tool calls before the run stops
 CANCEL_POLL = 0.05  # seconds between checks while waiting for the model
+TRIM_AT = 64_000  # input tokens of a reply, past which old tool output is trimmed
+KEEP_TURNS = 3  # the latest turns, whose tool output is never trimmed for size
+TRIM_MIN = 1024  # characters; shorter tool output is kept
+# a child's result costs a whole run to redo, and a skill applies to the whole run
+TRIM_EXEMPT = frozenset({"delegate", "load_skill"})
+STUB = "[trimmed by timu:"
+OVERFLOW = "context length exceeded"  # how the provider reports it
 
 
 class Agent:
@@ -152,6 +159,13 @@ class Agent:
                 error=reply.error,
             )
             last_text = reply.text or last_text
+            if (
+                reply.stop == "error"
+                and reply.error.startswith(OVERFLOW)
+                and (n := trim(messages, 1))
+            ):
+                self._emit("trim", characters=n, reason=OVERFLOW)
+                continue
             if reply.stop == "error":
                 return finish(
                     "failed", with_last(f"provider error: {reply.error}", last_text)
@@ -224,6 +238,9 @@ class Agent:
                 )
             if stop is not None:
                 return finish(stop[0], with_last(stop[1], last_text))
+            tokens = reply.usage.input_tokens
+            if tokens > TRIM_AT and (n := trim(messages, KEEP_TURNS)):
+                self._emit("trim", characters=n, reason=f"{tokens} input tokens")
 
     def _complete(self, messages: list[Message], seconds: float) -> Reply | None:
         """The model's reply, or None on cancel or after seconds. Blocking socket reads
@@ -282,6 +299,33 @@ class Agent:
                 kind, self.agent_id, self.parent_id, self.role.name, time.time(), data
             )
         )
+
+
+def trim(messages: list[Message], keep: int) -> int:
+    """Replace, in place, each tool result older than the last keep turns with a stub
+    that names its size and first line. Returns the characters removed."""
+    turns = [i for i, m in enumerate(messages) if m.role == "assistant"]
+    if len(turns) <= keep:
+        return 0
+    end = turns[-keep] if keep else len(messages)
+    names = {c.id: c.name for m in messages[:end] for c in m.tool_calls}
+    removed = 0
+    for i, m in enumerate(messages[:end]):
+        if (
+            m.role != "tool"
+            or len(m.content) < TRIM_MIN
+            or m.content.startswith(STUB)
+            or names.get(m.tool_call_id) in TRIM_EXEMPT
+        ):
+            continue
+        first = m.content.split("\n", 1)[0][:200]
+        stub = (
+            f"{STUB} {len(m.content)} characters; first line: {first}. "
+            "Run the tool again if you need it.]"
+        )
+        removed += len(m.content) - len(stub)
+        messages[i] = replace(m, content=stub)
+    return removed
 
 
 def unusable(text: str, task: Task) -> str | None:

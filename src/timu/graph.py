@@ -29,7 +29,16 @@ from timu.events import Event
 from timu.report import ReportError
 from timu.role import RoleError
 from timu.types import Artifact, Budget, Origin
-from timu.workflow import WORKFLOW_BUDGET, WORKFLOWS, Commands, Options, Run, Session
+from timu.workflow import (
+    WORKFLOW_BUDGET,
+    WORKFLOWS,
+    Commands,
+    Options,
+    Run,
+    Session,
+    boolean,
+    paths,
+)
 
 ID = re.compile(r"[a-z0-9][a-z0-9_-]*")
 REPO = re.compile(r"(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9_][A-Za-z0-9_.-]*)")
@@ -53,6 +62,7 @@ COMMITTER = (  # the user's identity, signing and hooks play no part in a copy
 DRIVERS = r"^(filter|diff)\..*\.(clean|smudge|process|textconv|command)$"
 GIT_TIMEOUT = 120  # seconds
 STOP_GRACE = 5.0  # seconds running nodes get to stop when the scheduler aborts
+NO_REF = (boolean, paths)  # params whose converter rejects any string, as a Ref yields
 
 
 class GraphError(ValueError):
@@ -256,6 +266,10 @@ def _node(
             if not ref_m:
                 raise GraphError(
                     f"{where}: params.{k}: ${{...}} must be the whole value"
+                )
+            if wf.params[k] in NO_REF:
+                raise GraphError(
+                    f"{where}: params.{k} cannot take an output; set it in the graph"
                 )
             d, out = ref_m.groups()
             if d not in needs or out not in declared(d):
