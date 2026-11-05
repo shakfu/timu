@@ -13,3 +13,5 @@
 - [ ] Local `make test` skips the bwrap tests on a default Ubuntu 24.04 host (AppArmor blocks user namespaces). Only CI catches a bwrap regression. Decide whether Linux is first-class and, if so, how to run them locally.
 
 - [ ] Decide whether graph Refs may set `report_path`. The path now gets the `.git` and PROTECTED checks, but an upstream coder still picks it.
+
+
