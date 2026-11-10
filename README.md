@@ -68,7 +68,7 @@ To expose it, add a `Workflow` to `WORKFLOWS` in `src/timu/workflow.py`. It name
 
   Ubuntu 24.04 and later stop `bwrap` from creating user namespaces (https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces). timu then reports `bwrap cannot create a sandbox here`. An AppArmor profile for `/usr/bin/bwrap` with the `userns` rule allows it; see `docs/dev/bwrap.md`.
 
-- An OpenAI-compatible model API: OpenRouter by default, or a local server such as llama-server.
+- An OpenAI-compatible model API: OpenRouter by default, or a local server such as llama-server. An installed package can add other APIs; see [Providers from packages](#providers-from-packages).
 
 - Optional: a Brave Search API key in `BRAVE_API_KEY`, so the researcher can search as well as fetch.
 
@@ -98,6 +98,53 @@ timu does not read a `timu.toml` in the workspace or the current directory. Mode
 The API key comes from `OPENROUTER_API_KEY`, or the variable `api_key_env` names. Prefer `api_key_file = "~/.config/timu/openrouter.key"` with mode 600: on macOS a sandboxed command can read the environment of your processes, but not files under `$HOME`. `TIMU_MODEL` and `TIMU_BASE_URL` override the file. `src/timu/config.py` documents every key, including per-role models, skills and the search key.
 
 The sandbox hides `$HOME` from commands. List any toolchain that lives there, such as uv's Python, in `extra_read`, or commands that use it fail.
+
+### Providers from packages
+
+`[provider] type` selects the model client. The default, `chat-completions`, is timu's own OpenAI-compatible client. Any other name is looked up in the `timu.providers` entry-point group, so a separately installed package can add, for example, an SDK-based Anthropic client:
+
+```toml
+# the package's pyproject.toml
+[project.entry-points."timu.providers"]
+anthropic = "timu_sdk.anthropic:from_settings"
+
+# ~/.config/timu/timu.toml
+[provider]
+type = "anthropic"
+model = "claude-opus-5-5"
+api_key_file = "~/.config/timu/anthropic.key"
+options = { thinking = { budget_tokens = 4096 } }   # passed to the package as is
+```
+
+The entry point is a `ProviderFactory`: it takes a `ProviderSettings` and returns a `Provider`. Both are public API in `timu.provider`, and the contract beyond the signatures is in `src/timu/provider/base.py`. For a package's type, `base_url` and `api_key_env` default to empty, so the package's own defaults apply. A package cannot replace `chat-completions`. Only the user's config picks a type, as with every other provider setting.
+
+Roles can use different providers. `[providers.NAME]` takes the keys of `[provider]`, and `[roles.X] provider = "NAME"` selects it:
+
+```toml
+[provider]                      # the default: every role without its own provider
+model = "openai/gpt-6-luna"
+
+[providers.anthropic]
+type = "anthropic"
+model = "claude-opus-5-5"
+
+[roles.reviewer]
+provider = "anthropic"
+```
+
+A role's model is its own `model`, else its provider's. A role on a named provider does not fall back to `[provider].model`, which names another API's model. `TIMU_MODEL` and `TIMU_BASE_URL` change only `[provider]`.
+
+`--max-cost` needs a cost per reply. OpenRouter reports one; OpenAI, Anthropic and local servers do not. For those, set a price in USD per million tokens in the provider table, and timu computes the cost:
+
+```toml
+[providers.anthropic]
+type = "anthropic"
+price = { input = 4.0, output = 20.0, cached_input = 0.2, cache_write = 8.0 }
+```
+
+A cost the server reports wins over the price. `cached_input` and `cache_write`, both optional, are the rates for prompt tokens read from and written to a cache; without them those tokens cost the input rate. `cache_write` is one rate for every cache lifetime. Where a longer lifetime costs more, as Anthropic's 1-hour cache does (2x input, against 1.25x for 5 minutes), set the rate of the longest you use; the cost is then an upper bound.
+
+The run summary, `timu trace` and `timu report` show cache reads and writes. A package's provider adapter can check its replies against the contract with `timu.provider.testing.reply_problems`; timu also warns once in a run when a reply counts more cached tokens than input tokens.
 
 ## Run
 
@@ -193,6 +240,26 @@ timu graph run --resume <run id> graph.toml  # reuse the nodes that run finished
 - `--max-parallel` runs ready nodes in threads. Console lines then start with the node id. Approval prompts come one at a time, and other nodes' output waits while you answer.
 - `--resume` reuses a node that ended `done` in the earlier run, if its definition is unchanged, its `ref` is at the same commit, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again, and timu prints why.
 
+## Python API
+
+`timu.api` runs workflows and graphs without a terminal, for a UI or another tool. The CLI is built on it.
+
+```python
+from pathlib import Path
+from timu import api
+
+out = api.run(
+    "make test fails; fix calc.py",
+    Path("~/projects/calc").expanduser(),
+    sink=on_event,                  # each Event as it happens
+    approve=ask_user,               # (artifact, role) -> bool; without it, untrusted content is refused
+    cancel=stop,                    # a threading.Event; set it to stop after the current step
+)
+out.status, out.summary, out.branch, out.copy, out.report, out.trace
+```
+
+`api.run_graph(path_or_graph, ...)` does the same for a graph. A run blocks until it ends, so a UI calls it from a worker thread and reads events from `sink`. The event kinds and their fields are public API, listed in `src/timu/events.py`; every test checks the events it sees against that list. `api.Approvals` answers `approve` from the UI's thread: the run waits until `answer(id, yes)`, the run's cancel, or a timeout, and the last two mean no. Other threads' events keep flowing while it waits. `api.UsageError` means nothing was spent; a failure after spending returns an `Outcome` with status `failed`. The module docstring in `src/timu/api.py` lists every argument.
+
 ## Traces
 
 Every run writes a JSONL trace to `~/.local/state/timu/runs/`, outside the workspace.
@@ -216,3 +283,10 @@ TIMU_LIVE=1 make test   # also the live tests; billed against the configured mod
 ```
 
 The live tests are skipped by default. With `TIMU_KEEP_TRACES=tests/fixtures/traces`, the CLI live tests save their traces as replay fixtures, with local paths and your username replaced by placeholders. `make test` replays every fixture there.
+
+`scripts/sim.py` measures timu against real models. It runs `timu run` on seeded tasks in `scripts/sim/tasks/`, some of them timu itself with one past fix reverted, then scores each committed branch with hidden oracle tests in the sandbox. It reports solve rate with a 95% interval, false accepts, edits to protected files, cost and time, per model and task. Billed. Run it through `uv run`: the timu tasks' tests need the dev environment's pytest.
+
+```sh
+uv run python scripts/sim.py run --model <model id> --trials 3   # --dry-run prints the trials and cost ceiling
+uv run python scripts/sim.py summary --out DIR --min-solved 0.8  # exit 1 below the rate
+```

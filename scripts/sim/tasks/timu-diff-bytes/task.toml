@@ -1,0 +1,12 @@
+# timu at 3d78d04 with one fix reverted (break.patch). The oracle is that fix's
+# regression test plus the tests that run in the sandbox.
+workflow = "fix-review"
+base = "3d78d04"
+objective = """A graph node with the output `git:diff` aborts the whole graph run with \
+UnicodeDecodeError when its diff holds a byte that is not UTF-8, such as from a Latin-1 \
+file. The diff should still become the node's output for the nodes downstream. Fix it. \
+Add a regression test."""
+oracle = "make test PYTHON={python} EXTRA=tests/oracle_diff_bytes.py"
+args = ["--review-to-fix", "1"]
+protected = ["Makefile"]
+max_cost = 1.0

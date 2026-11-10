@@ -1,0 +1,7 @@
+# Two bugs; the visible test catches one. The review should find the other.
+workflow = "fix-review"
+objective = "make test fails. Fix lru.py so that LRU is a correct least-recently-used cache."
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--review-to-fix", "1"]
+protected = ["test_*.py", "Makefile"]
+max_cost = 0.75

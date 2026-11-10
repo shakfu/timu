@@ -28,23 +28,23 @@ test:
 
 # Lint with ruff (applies fixes)
 lint:
-	@uv run ruff check --fix src/ tests/
+	@uv run ruff check --fix src/ tests/ scripts/
 
 # Lint with ruff (check only, no fixes)
 lint-check:
-	@uv run ruff check src/ tests/
+	@uv run ruff check src/ tests/ scripts/
 
 # Format with ruff
 format:
-	@uv run ruff format src/ tests/
+	@uv run ruff format src/ tests/ scripts/
 
 # Check formatting without modifying files
 format-check:
-	@uv run ruff format --check src/ tests/
+	@uv run ruff format --check src/ tests/ scripts/
 
 # Type check with mypy (package and tests)
 typecheck:
-	@uv run mypy src/timu tests
+	@uv run mypy src/timu tests scripts/sim.py
 
 # Run a full quality assurance check (non-mutating; mirrors CI)
 qa: lint-check format-check typecheck test

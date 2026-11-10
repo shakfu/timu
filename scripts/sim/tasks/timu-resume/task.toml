@@ -1,0 +1,11 @@
+# timu at 3d78d04 with one fix reverted (break.patch). The oracle is that fix's
+# regression test plus the tests that run in the sandbox.
+workflow = "fix-review"
+base = "3d78d04"
+objective = """`timu graph run --resume RUN` reuses a node's result from the earlier run \
+even after the node's repo has gained commits, so the resumed run passes on output built \
+from old code. Make --resume run such a node again. Add a regression test."""
+oracle = "make test PYTHON={python} EXTRA=tests/oracle_resume.py"
+args = ["--review-to-fix", "1"]
+protected = ["Makefile"]
+max_cost = 1.0

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from timu.events import Event
-from timu.report import ReportError
+from timu.report import ReportError, is_gitignored
 from timu.role import RoleError
 from timu.types import Artifact, Budget, Origin
 from timu.workflow import (
@@ -450,7 +450,9 @@ def provision(src: Path, dest: Path, ref: str, branch: str) -> tuple[str, bool]:
 def commit(ws: Path, message: str, exclude: Sequence[str] = ()) -> str:
     """Commit every change in ws that is not ignored or excluded, as timu. Returns
     HEAD, unchanged if there was nothing to commit. Only the engine calls this."""
-    skip = [f":(exclude,literal){p}" for p in exclude]
+    # git add fails on a pathspec naming an ignored path, even an exclude; add --all
+    # skips ignored paths anyway
+    skip = [f":(exclude,literal){p}" for p in exclude if not is_gitignored(ws, p)]
     _git(ws, "add", "--all", "--", ".", *skip)
     if _git(ws, "diff", "--cached", "--name-only"):
         _git(ws, *COMMITTER, "commit", "--quiet", "--no-verify", "-m", message)

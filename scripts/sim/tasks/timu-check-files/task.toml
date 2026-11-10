@@ -1,0 +1,12 @@
+# timu at 3d78d04 with one fix reverted (break.patch). The oracle is that fix's
+# regression tests plus the tests that run in the sandbox.
+workflow = "fix-review"
+base = "3d78d04"
+objective = """check-fix-review is meant to stop the coder from editing the files that \
+implement the check. It misses some: with `check = ["python check.py"]` the coder can \
+edit check.py, and `cargo test` and `go test ./...` protect no manifest. Fix it. Add \
+regression tests."""
+oracle = "make test PYTHON={python} EXTRA=tests/oracle_check_files.py"
+args = ["--review-to-fix", "1"]
+protected = ["Makefile"]
+max_cost = 1.0

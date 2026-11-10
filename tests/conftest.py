@@ -49,6 +49,23 @@ MakeAgent = Callable[..., tuple[Agent, FakeProvider, list[Event]]]
 
 
 @pytest.fixture(autouse=True)
+def events_match_the_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every event timu builds in any test must match events.SCHEMA, the public
+    event API, so the schema cannot drift from the code."""
+    import timu.agent
+    import timu.workflow
+    from timu.events import schema_problem
+
+    def checked(*args: Any, **kwargs: Any) -> Event:
+        event = Event(*args, **kwargs)
+        assert (problem := schema_problem(event)) is None, problem
+        return event
+
+    for module in (timu.agent, timu.workflow):
+        monkeypatch.setattr(module, "Event", checked)
+
+
+@pytest.fixture(autouse=True)
 def private_state(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:

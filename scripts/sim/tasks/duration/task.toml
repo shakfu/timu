@@ -1,0 +1,9 @@
+# A feature from a spec, with error cases the model must infer from "anything else".
+workflow = "fix-review"
+objective = """Implement parse_duration(s) in duration.py. It parses strings such as "1h30m", \
+"45s", "2h" and "1h0m5s" into a total number of seconds, as an int. Units are h, m and s. \
+Each number is one to four ASCII digits. Each unit appears at most once, in the order h, m, s, \
+with no spaces. Raise ValueError for anything else, including the empty string. Add tests."""
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+protected = ["Makefile"]
+max_cost = 0.5

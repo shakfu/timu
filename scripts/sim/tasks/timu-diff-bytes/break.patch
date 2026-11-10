@@ -1,0 +1,44 @@
+diff -ruN a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -20,7 +20,7 @@
+ ### Fixed
+ 
+ - On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays. A new `.git`, `timu.toml` or `.timu` is moved to `~/.local/state/timu/quarantine` instead of deleted, since it may hold commits the command made. If the quarantine lies under a write root, the entry stays in place and the call says so.
+-- A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
++- An unexpected exception in a workflow now fails only that node.
+ - `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
+ - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
+ - `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
+diff -ruN a/src/timu/graph.py b/src/timu/graph.py
+--- a/src/timu/graph.py	2026-11-05 16:21:36
++++ b/src/timu/graph.py	2026-11-10 09:00:51
+@@ -542,8 +542,7 @@
+             cwd=cwd,
+             stdin=subprocess.DEVNULL,
+             capture_output=True,
+-            encoding="utf-8",
+-            errors="replace",  # a diff may hold any bytes
++            text=True,
+             timeout=GIT_TIMEOUT,
+             check=False,
+         )
+diff -ruN a/tests/test_review_fixes.py b/tests/test_review_fixes.py
+--- a/tests/test_review_fixes.py	2026-11-05 16:21:36
++++ b/tests/test_review_fixes.py	2026-11-10 09:00:51
+@@ -280,15 +280,6 @@
+ # ---- graph (F6, F7, F8) ----
+ 
+ 
+-def test_a_non_utf8_diff_does_not_raise(tmp_path: Path) -> None:
+-    r = repo(tmp_path / "r")
+-    base = head(r)
+-    (r / "a.txt").write_bytes(b"caf\xe9\n")
+-    git(r, "add", ".")
+-    git(r, "commit", "-qm", "latin-1")
+-    assert "caf" in extract("git:diff", r, base)
+-
+-
+ NODE = '[nodes.a]\nrepo = "a"\nworkflow = "commands"\nobjective = "o"\n'
+ NODE += 'params = { steps = ["true"] }\n'
+ 

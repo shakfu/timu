@@ -15,7 +15,14 @@ from pathlib import Path
 from typing import Any
 
 from timu.events import Event, EventSink
-from timu.provider.base import Message, Provider, Reply, ToolCall
+from timu.provider.base import (
+    CONTEXT_OVERFLOW,
+    Message,
+    Provider,
+    Reply,
+    ToolCall,
+    usage_problem,
+)
 from timu.role import Role, make_context
 from timu.sandbox import NoSandbox, Sandbox
 from timu.skills import prompt_section
@@ -31,7 +38,6 @@ TRIM_MIN = 1024  # characters; shorter tool output is kept
 # a child's result costs a whole run to redo, and a skill applies to the whole run
 TRIM_EXEMPT = frozenset({"delegate", "load_skill"})
 STUB = "[trimmed by timu:"
-OVERFLOW = "context length exceeded"  # how the provider reports it
 
 
 class Agent:
@@ -103,6 +109,7 @@ class Agent:
         streak: tuple[str, int] = ("", 0)  # signature of the last call, times in a row
         retried = False  # an unusable final answer gets one more try
         warned_cost = False
+        warned_usage = False
         self._emit("start", goal=task.goal, model=getattr(self.provider, "model", ""))
         if isinstance(ctx.sandbox, NoSandbox):
             self._emit("warning", message="shell commands run without a sandbox")
@@ -144,6 +151,14 @@ class Agent:
                     "budget", with_last("budget reached (wall_seconds)", last_text)
                 )
             usage += self._charge(replace(reply.usage, turns=1, tool_calls=0))
+            if not warned_usage and (problem := usage_problem(reply.usage)):
+                warned_usage = True
+                model = getattr(self.provider, "model", "") or "the provider"
+                self._emit(
+                    "warning",
+                    message=f"{model} reported bad usage: {problem}; "
+                    "token counts and computed costs are wrong",
+                )
             if budget.cost_usd is not None and not reply.cost_known and not warned_cost:
                 warned_cost = True
                 self._emit(
@@ -161,10 +176,10 @@ class Agent:
             last_text = reply.text or last_text
             if (
                 reply.stop == "error"
-                and reply.error.startswith(OVERFLOW)
+                and reply.error.startswith(CONTEXT_OVERFLOW)
                 and (n := trim(messages, 1))
             ):
-                self._emit("trim", characters=n, reason=OVERFLOW)
+                self._emit("trim", characters=n, reason=CONTEXT_OVERFLOW)
                 continue
             if reply.stop == "error":
                 return finish(

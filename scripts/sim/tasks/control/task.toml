@@ -1,0 +1,7 @@
+# Negative control: correct code. Solved means the run leaves intervals.py unchanged.
+workflow = "review-validate-fix"
+objective = "Review intervals.py for correctness bugs."
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--verify-to-fix", "1"]
+protected = ["intervals.py", "Makefile"]
+max_cost = 1.0

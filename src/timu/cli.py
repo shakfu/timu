@@ -10,7 +10,6 @@ import argparse
 import io
 import json
 import math
-import os
 import re
 import shutil
 import signal
@@ -18,41 +17,31 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
 from pathlib import Path
 from types import FrameType
 from typing import Any, TextIO, TypeVar
 
+from timu import api
+from timu.api import trace_dir
 from timu.config import Config, ConfigError, load_config
-from timu.events import Event, JsonlSink
+from timu.events import Event, EventSink
 from timu.graph import (
     Graph,
     GraphError,
     GraphResult,
     NodeResult,
-    _git,
     find_projects,
     load_graph,
-    provision,
     resumable,
-    run_graph,
-    seal,
     serial_order,
 )
 from timu.provider.base import Provider
-from timu.report import ReportError
-from timu.role import Role, RoleError
-from timu.sandbox import NoSandbox, Sandbox, detect, why_none
-from timu.tool import Tool, state_dir
-from timu.trace import BY, TraceError, load, render, totals
-from timu.types import Artifact, Budget, Result, Usage
+from timu.role import Role
+from timu.trace import BY, TraceError, cache_note, load, render, totals
+from timu.types import Artifact, Usage
 from timu.workflow import (
     WORKFLOW_BUDGET,
     WORKFLOWS,
-    Options,
-    Session,
-    Workflow,
-    new_run_id,
 )
 
 EXIT = {
@@ -137,6 +126,11 @@ class ConsoleSink:
             self._line(f"warning: {d['message']}")
         elif e.kind == "config":
             self._line(f"config: {d['source']}")
+        elif e.kind == "resume":
+            self.err.writelines(
+                printable(line)
+                for line in resume_lines(d["run"], d["nodes"], d.get("again", {}))
+            )
         elif e.kind == "command":
             self._line(f"{who} $ {d['command']}")
         elif e.kind == "command_result":
@@ -175,10 +169,6 @@ def _brief(args: Any, width: int = 100) -> str:
         text = str(args)
     text = " ".join(text.split())
     return text if len(text) <= width else text[: width - 3] + "..."
-
-
-def trace_dir(env: dict[str, str] | os._Environ[str] = os.environ) -> Path:
-    return state_dir(env) / "runs"
 
 
 def positive(v: str) -> int:
@@ -342,10 +332,7 @@ def main(
     loaded = _load(args, workflow.roles, provider_for, err)
     if isinstance(loaded, int):
         return loaded
-    config, provider_for, model_provider = loaded
-    if not args.workdir.is_dir():
-        err.write(f"timu: {args.workdir} is not a directory\n")
-        return USAGE_ERROR
+    config, providers = loaded
     defaults = parser().parse_args(["run", "x"])
     given = {}
     for param, attr in RUN_PARAMS.items():
@@ -360,89 +347,82 @@ def main(
         except ValueError as e:
             err.write(f"timu: {flag} {e}\n")
             return USAGE_ERROR
-
-    source = Path(os.path.realpath(args.workdir))
-    top = source
-    if not args.in_place:
-        try:
-            top = Path(
-                os.path.realpath(_git(source, "rev-parse", "--show-toplevel").strip())
-            )
-        except GraphError:
-            err.write(f"timu: {source} is not in a git repo; use --in-place\n")
-            return USAGE_ERROR
-
-    def body(session: Session) -> Result:
-        search = _search(session, config, workflow.roles)
-        options = Options(config.role_skills, search, given)
-        if args.in_place:
-            run = session.at(source)
-            session.emit("run", workflow=workflow.name, workdir=str(run.workdir))
-            return workflow.run(run, args.objective, options)
-        return _run_on_copy(session, args, workflow, options, source, top, err)
-
-    done = _execute(
+    outcome = _interactive(
         args,
-        config,
-        (provider_for, model_provider),
-        workflow.approve_untrusted,
         out,
         err,
-        body,
+        lambda cancel, sink, approve: api.run(
+            args.objective,
+            args.workdir,
+            workflow=workflow.name,
+            params=given,
+            config=config,
+            sink=sink,
+            approve=approve,
+            gate=args.approve_untrusted,
+            in_place=args.in_place,
+            max_cost=args.max_cost,
+            cancel=cancel,
+            providers=providers,
+            unsafe_no_sandbox=args.unsafe_no_sandbox,
+        ),
     )
-    if isinstance(done, int):
-        return done
-    result, trace = done
-    _report(result, trace, err)
-    return EXIT[result.status]
+    if isinstance(outcome, int):
+        return outcome
+    if outcome.report:
+        err.write(f"timu: report {outcome.report}\n")
+    if outcome.branch:
+        ref = f"{outcome.branch}:{outcome.branch}"
+        err.write(f"timu: git -C {outcome.repo} fetch {outcome.copy} {ref}\n")
+    err.write(printable(f"\ntimu: {outcome.status}: {outcome.summary}") + "\n")
+    _spent(outcome.usage, outcome.trace, err)
+    return EXIT[outcome.status]
 
 
-def _run_on_copy(
-    session: Session,
+def _interactive(
     args: argparse.Namespace,
-    workflow: Workflow,
-    options: Options,
-    source: Path,
-    top: Path,
+    out: TextIO,
     err: TextIO,
-) -> Result:
-    """Run workflow on a clone of top, and commit its changes on a branch there. The
-    checkout stays unchanged, so nothing an agent plants in the copy runs under the
-    user's git unless the user goes there. Raises GraphError."""
-    rel = source.relative_to(top)
-    copy = trace_dir().parent / "work" / session.run_id / "run"
-    branch = f"timu/{session.run_id}/run"
+    call: Callable[[threading.Event, EventSink, api.Approve], api.Outcome],
+) -> api.Outcome | int:
+    """call with a cancel event that the first Ctrl-C sets, a console sink, and a
+    terminal prompt for approvals. While the prompt waits, console output pauses, so
+    other nodes' lines do not break into it. Returns the outcome, or an exit code
+    after reporting a usage error, an error that stopped the run, or an abort."""
+    cancel = threading.Event()
+    console = ConsoleSink(out, err, args.verbose, getattr(args, "max_parallel", 1) > 1)
+    quiet = threading.Lock()
+
+    def sink(e: Event) -> None:
+        with quiet:
+            console(e)
+
+    def approve(artifact: Artifact, role: Role) -> bool:
+        with quiet:
+            return tty_approve(artifact, role)
+
+    def on_sigint(sig: int, frame: FrameType | None) -> None:
+        if cancel.is_set():
+            raise KeyboardInterrupt
+        cancel.set()
+        err.write("\ntimu: stopping after the current step; Ctrl-C again to abort\n")
+
+    previous = signal.signal(signal.SIGINT, on_sigint)
     try:
-        base, dirty = provision(top, copy, "HEAD", branch)
-    except GraphError as e:
-        raise GraphError(f"{e}; commit first, or use --in-place") from None
-    if not (copy / rel).is_dir():
-        raise GraphError(f"{rel} is not in HEAD; commit it, or use --in-place")
-    run = session.at(copy / rel)
-    session.emit("run", workflow=workflow.name, workdir=str(source))
-    if dirty:
-        session.emit(
-            "warning",
-            message=f"{top} has uncommitted changes; the copy starts from HEAD",
-        )
-    result = workflow.run(run, args.objective, options)
-    report = options.params.get("report_path")
-    exclude = (os.path.normpath(rel / report),) if report else ()
-    message = f"timu: {args.objective.splitlines()[0][:60]}\n\n"
-    message += (
-        f"{workflow.name} {result.status}: {result.summary}\n\nrun {session.run_id}"
-    )
-    try:
-        new_head = seal(run, copy, base, branch, message, exclude, result.status)
-    except GraphError as e:
-        session.emit("workflow_result", status="failed", summary=str(e))
-        result = replace(result, status="failed", summary=str(e))
-        new_head = base
-    if report and (copy / rel / report).is_file():
-        err.write(f"timu: report {copy / rel / report}\n")
-    if new_head != base:
-        err.write(f"timu: git -C {top} fetch {copy} {branch}:{branch}\n")
-    return result
+        outcome = call(cancel, sink, approve)
+    except api.UsageError as e:
+        err.write(printable(f"timu: {e}") + "\n")
+        return USAGE_ERROR
+    except KeyboardInterrupt:
+        err.write("timu: aborted\n")
+        return EXIT["cancelled"]
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if outcome.result is None:  # an error stopped the run after it spent
+        err.write(printable(f"timu: {outcome.summary}") + "\n")
+        _spent(outcome.usage, outcome.trace, err)
+        return EXIT["failed"]
+    return outcome
 
 
 def run_graph_file(
@@ -460,76 +440,77 @@ def run_graph_file(
         return USAGE_ERROR
     workflows = [WORKFLOWS[n.workflow] for n in graph.nodes.values()]
     roles = tuple(dict.fromkeys(r for w in workflows for r in w.roles))
+    resume = _trace_path(args.resume) if args.resume else None
     if args.dry_run:
-        try:
-            config = load_config(args.config)
-        except ConfigError as e:
-            err.write(f"timu: {e}\n")
-            return USAGE_ERROR
-        model_provider = None
-    else:
-        loaded = _load(args, roles, provider_for, err)
-        if isinstance(loaded, int):
-            return loaded
-        config, provider_for, model_provider = loaded
-    try:
-        projects = find_projects(graph, config.project_roots)
-    except GraphError as e:
-        err.write(f"timu: {e}\n")
-        return USAGE_ERROR
-    prior: dict[str, NodeResult] = {}
-    if args.resume:
-        try:
-            why_not: dict[str, str] = {}
-            prior = resumable(load(_trace_path(args.resume)), graph, projects, why_not)
-        except TraceError as e:
-            err.write(f"timu: {e}\n")
-            return USAGE_ERROR
-        err.write(
-            f"timu: from {args.resume}, reusing {', '.join(prior) or 'no nodes'}\n"
-        )
-        err.writelines(
-            f"timu: running {nid} again: {why}\n" for nid, why in why_not.items()
-        )
-    if args.dry_run:
-        out.write(
-            plan(graph, projects, config, prior, args.max_cost, args.max_parallel)
-        )
-        return 0
-    assert provider_for is not None
-
-    def body(session: Session) -> GraphResult:
-        options = Options(config.role_skills, _search(session, config, roles))
-        work = trace_dir().parent / "work" / session.run_id
-        if args.resume:
-            session.emit("resume", run=args.resume, nodes=list(prior))
-        return run_graph(
-            session,
+        return _dry_run(args, graph, resume, out, err)
+    loaded = _load(args, roles, provider_for, err)
+    if isinstance(loaded, int):
+        return loaded
+    config, providers = loaded
+    outcome = _interactive(
+        args,
+        out,
+        err,
+        lambda cancel, sink, approve: api.run_graph(
             graph,
-            projects,
-            work,
-            options,
+            config=config,
+            sink=sink,
+            approve=approve,
+            gate=args.approve_untrusted,
+            max_cost=args.max_cost,
             max_parallel=args.max_parallel,
-            prior=prior,
-        )
-
-    gate = any(w.approve_untrusted for w in workflows)
-    done = _execute(
-        args, config, (provider_for, model_provider), gate, out, err, body, graph.budget
+            resume=resume,
+            cancel=cancel,
+            providers=providers,
+            unsafe_no_sandbox=args.unsafe_no_sandbox,
+        ),
     )
-    if isinstance(done, int):
-        return done
-    result, trace = done
-    for nid, r in result.nodes.items():
+    if isinstance(outcome, int):
+        return outcome
+    assert isinstance(outcome.result, GraphResult) and outcome.projects is not None
+    for nid, r in outcome.result.nodes.items():
         reused = " (reused)" if r.reused else ""
         err.write(
             printable(f"timu: node {nid}: {r.status}{reused}: {r.summary}") + "\n"
         )
         if r.head != r.base:
             ref = f"{r.branch}:{r.branch}"
-            err.write(f"timu:   git -C {projects[nid]} fetch {r.workdir} {ref}\n")
-    err.write(f"timu: {result.status}; trace {trace}\n")
-    return EXIT[result.status]
+            err.write(
+                f"timu:   git -C {outcome.projects[nid]} fetch {r.workdir} {ref}\n"
+            )
+    err.write(f"timu: {outcome.status}; trace {outcome.trace}\n")
+    return EXIT[outcome.status]
+
+
+def _dry_run(
+    args: argparse.Namespace,
+    graph: Graph,
+    resume: Path | None,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """`timu graph run --dry-run`: print the plan without building providers."""
+    try:
+        config = load_config(args.config)
+        projects = find_projects(graph, config.project_roots)
+        prior: dict[str, NodeResult] = {}
+        why_not: dict[str, str] = {}
+        if resume is not None:
+            prior = resumable(load(resume), graph, projects, why_not)
+    except (ConfigError, GraphError, TraceError) as e:
+        err.write(f"timu: {e}\n")
+        return USAGE_ERROR
+    if resume is not None:
+        err.writelines(resume_lines(resume.stem, list(prior), why_not))
+    out.write(plan(graph, projects, config, prior, args.max_cost, args.max_parallel))
+    return 0
+
+
+def resume_lines(run: str, nodes: Sequence[str], again: Mapping[str, str]) -> list[str]:
+    """What a resume reuses, and why each other node runs again."""
+    lines = [f"timu: from {run}, reusing {', '.join(nodes) or 'no nodes'}\n"]
+    lines += [f"timu: running {nid} again: {why}\n" for nid, why in again.items()]
+    return lines
 
 
 def plan(
@@ -584,124 +565,20 @@ def plan(
 
 def _load(
     args: argparse.Namespace,
-    roles: Sequence[str],
+    roles: tuple[str, ...],
     provider_for: Callable[[Role], Provider] | None,
     err: TextIO,
-) -> (
-    tuple[
-        Config,
-        Callable[[Role], Provider],
-        Callable[[Role, str], Provider] | None,
-    ]
-    | int
-):
-    """The config, a provider for each role, and one for a role at a model a graph
-    node names, checked before the run so it does not fail halfway. A usage error
-    code instead, after reporting it. A given provider_for serves every model."""
-    model_provider = None
+) -> tuple[Config, api.Providers] | int:
+    """The config and checked providers, or a usage error code after reporting it.
+    A given provider_for serves every role and model."""
     try:
         config = load_config(args.config)
-        if provider_for is None:
-            for name in roles:
-                config.provider(name)
-            if "researcher" in roles:
-                config.search_tool()  # a bad key file fails here, not mid-run
-            provider_for = lambda role: config.provider(role.name)
-            model_provider = lambda role, model: config.provider(role.name, model=model)
-    except ConfigError as e:
+        if provider_for is not None:
+            return config, api.Providers(provider_for)
+        return config, api.check_providers(config, roles)
+    except (ConfigError, api.UsageError) as e:
         err.write(f"timu: {e}\n")
         return USAGE_ERROR
-    return config, provider_for, model_provider
-
-
-def _search(session: Session, config: Config, roles: Sequence[str]) -> Tool | None:
-    """The search tool if a researcher may run; warns when its key is missing."""
-    if "researcher" not in roles:
-        return None
-    search = config.search_tool()
-    if search is None:
-        session.emit(
-            "warning",
-            message=f"{config.search_key_env} is not set; "
-            "the researcher can fetch URLs but not search",
-        )
-    return search
-
-
-def _execute(
-    args: argparse.Namespace,
-    config: Config,
-    providers: tuple[
-        Callable[[Role], Provider], Callable[[Role, str], Provider] | None
-    ],
-    gate_default: bool,
-    out: TextIO,
-    err: TextIO,
-    body: Callable[[Session], T],
-    budget: Budget | None = None,
-) -> tuple[T, Path] | int:
-    """Run body in a Session that writes a trace and streams to the console, with
-    Ctrl-C handling. Returns body's result and the trace, or an exit code."""
-    session: Session | None = None
-    sandbox: Sandbox | None = None
-    if args.unsafe_no_sandbox:
-        sandbox = NoSandbox()
-    elif (sandbox := detect(config.extra_read)) is None:
-        err.write(f"timu: {why_none()}; roles that run commands will not start\n")
-    gate = args.approve_untrusted
-    if gate is None:
-        gate = gate_default
-    run_id = new_run_id()
-    trace = trace_dir() / f"{run_id}.jsonl"
-    trace.parent.mkdir(parents=True, exist_ok=True)
-    trace.parent.parent.chmod(0o700)  # traces and copies hold workspace contents
-    cancel = threading.Event()
-    console = ConsoleSink(out, err, args.verbose, getattr(args, "max_parallel", 1) > 1)
-
-    def on_sigint(sig: int, frame: FrameType | None) -> None:
-        if cancel.is_set():
-            raise KeyboardInterrupt
-        cancel.set()
-        err.write("\ntimu: stopping after the current step; Ctrl-C again to abort\n")
-
-    previous = signal.signal(signal.SIGINT, on_sigint)
-    try:
-        with JsonlSink(trace) as jsonl:
-
-            def sink(e: Event) -> None:
-                jsonl(e)
-                console(e)
-
-            session = Session(
-                providers[0],
-                sink,
-                _session_budget(budget, args.max_cost),
-                run_id=run_id,
-                cancel=cancel,
-                approve=tty_approve if gate else None,
-                sandbox=sandbox,
-                model_provider=providers[1],
-            )
-            session.emit("config", source=config.source)
-            result = body(session)
-    except (RoleError, ReportError, GraphError) as e:
-        err.write(printable(f"timu: {e}") + "\n")
-        if session is None or not (session.used.turns or session.used.tool_calls):
-            return USAGE_ERROR
-        _spent(session.used, trace, err)  # failed after spending: not a usage error
-        return EXIT["failed"]
-    except KeyboardInterrupt:
-        err.write("timu: aborted\n")
-        return EXIT["cancelled"]
-    finally:
-        signal.signal(signal.SIGINT, previous)
-    return result, trace
-
-
-def _session_budget(budget: Budget | None, max_cost: float | None) -> Budget:
-    """budget or the default; --max-cost, if given, wins over its cost."""
-    total = budget or WORKFLOW_BUDGET
-    return total if max_cost is None else replace(total, cost_usd=max_cost)
 
 
 def tty_approve(artifact: Artifact, role: Role, tty: str = "/dev/tty") -> bool:
@@ -796,15 +673,11 @@ def clean_state(days: int, delete: bool, out: TextIO) -> int:
     return 0
 
 
-def _report(result: Result, trace: Path, err: TextIO) -> None:
-    err.write(printable(f"\ntimu: {result.status}: {result.summary}") + "\n")
-    _spent(result.usage, trace, err)
-
-
 def _spent(u: Usage, trace: Path, err: TextIO) -> None:
     cost = f", ${u.cost_usd:.4f}" if u.cost_usd else ""
     err.write(
-        f"timu: {u.turns} turns, {u.tool_calls} tool calls, {u.tokens} tokens{cost}\n"
+        f"timu: {u.turns} turns, {u.tool_calls} tool calls, "
+        f"{u.tokens} tokens{cache_note(u)}{cost}\n"
     )
     err.write(f"timu: trace {trace}\n")
 

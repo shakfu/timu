@@ -60,17 +60,18 @@ class _Output:
 
 def scrubbed_env(tmp: Path, workspace_writable: bool = True) -> dict[str, str]:
     """A scrubbed environment: parent secrets such as API keys are not passed on.
-    HOME is the private temp dir tmp, so tools find no user config."""
+    HOME is the private temp dir tmp, so tools find no user config. Bytecode goes to
+    tmp: in a repo that does not ignore __pycache__, timu would commit it."""
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tmp),
         "TMPDIR": f"{tmp}/",
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "TERM": "dumb",
+        "PYTHONPYCACHEPREFIX": str(tmp / "pycache"),
     }
     if not workspace_writable:
-        # Read-only workspace (reviewer): keep Python caches out of it (design 4.3).
-        env["PYTHONPYCACHEPREFIX"] = str(tmp / "pycache")
+        # Read-only workspace (reviewer): keep pytest's cache out of it (design 4.3).
         env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
     return env
 

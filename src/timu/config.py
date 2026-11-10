@@ -1,16 +1,34 @@
 """timu.toml: which model API to call, and which model each role uses.
 
     [provider]
+    type = "chat-completions"            # optional; or a type an installed package
+                                         # registers (timu.provider)
     base_url = "https://openrouter.ai/api/v1"
     api_key_env = "OPENROUTER_API_KEY"   # "" for a local server without a key
     api_key_file = "~/.config/timu/openrouter.key"   # optional; wins over api_key_env
     model = "<model id>"
     timeout = 600                        # seconds, optional
     extra_body = { cache_control = { type = "ephemeral" } }   # optional
+    options = { }                        # optional; for a package's provider type
+    price = { input = 3.0, output = 15.0, cached_input = 0.3, cache_write = 3.75 }
+                                         # optional; USD per million tokens, for a
+                                         # server that reports no cost; the cache
+                                         # rates are optional
+
+For a type from a package, base_url and api_key_env default to "": the package's
+own defaults apply.
+
+    [providers.anthropic]                # optional; named, with [provider]'s keys
+    type = "anthropic"
+    model = "<model id>"                 # the model of the roles that use it
 
     [roles.reviewer]                     # also coder, researcher, lead,
     model = "<cheaper model id>"         # validator and verifier
+    provider = "anthropic"               # optional; default [provider]
     skills = ["code-review"]             # optional
+
+A role's model is its own, else its provider's. A role on a named provider never
+falls back to [provider].model: that is another API's model id.
 
     [search]
     api_key_env = "BRAVE_API_KEY"        # Brave Search; the default (plan D3)
@@ -42,7 +60,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from timu.provider.openai import OpenAIProvider
+from timu.provider import BUILTIN, Price, Priced, Provider, ProviderSettings, factory
 from timu.roles import ROLE_NAMES
 from timu.tool import Tool
 from timu.tools.web import web_search_tool
@@ -56,14 +74,71 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class Config:
+class ProviderConfig:
+    """One provider table: [provider] or a [providers.NAME]."""
+
+    type: str = BUILTIN
     base_url: str = DEFAULT_BASE_URL
     api_key_env: str = DEFAULT_KEY_ENV
     api_key_file: Path | None = None
     model: str = ""
     timeout: float = 600
     extra_body: Mapping[str, Any] = field(default_factory=dict)
+    options: Mapping[str, Any] = field(default_factory=dict)
+    price: Price | None = None
+
+    def build(
+        self, model: str, env: Mapping[str, str], source: str, name: str
+    ) -> Provider:
+        """A provider at model. Errors name source and the table name. Raises
+        ConfigError."""
+        key = ""
+        if self.api_key_file:
+            key = read_key(self.api_key_file)
+        elif self.api_key_env:
+            key = env.get(self.api_key_env, "")
+            if not key:
+                raise ConfigError(
+                    f"{self.api_key_env} is not set; set it, or set {name}.api_key_env "
+                    f'to "" for a server without a key'
+                )
+        settings = ProviderSettings(
+            model, self.base_url, key, self.timeout, self.extra_body, self.options
+        )
+        where = f"{source}: {name} type {self.type}"
+        try:
+            make = factory(self.type)
+        except LookupError as e:
+            raise ConfigError(f"{where}: {e}") from None
+        except Exception as e:  # noqa: BLE001 - a package's import may raise anything
+            raise ConfigError(
+                f"{where}: cannot load: {type(e).__name__}: {e}"
+            ) from None
+        try:
+            provider = make(settings)
+        except ValueError as e:
+            raise ConfigError(f"{where}: {e}") from None
+        except Exception as e:  # noqa: BLE001 - a package's factory may raise anything
+            raise ConfigError(f"{where}: {type(e).__name__}: {e}") from None
+        return Priced(provider, self.price) if self.price else provider
+
+
+@dataclass(frozen=True)
+class Config:
+    """The flat provider fields are the [provider] table, the default."""
+
+    provider_type: str = BUILTIN
+    base_url: str = DEFAULT_BASE_URL
+    api_key_env: str = DEFAULT_KEY_ENV
+    api_key_file: Path | None = None
+    model: str = ""
+    timeout: float = 600
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
+    provider_options: Mapping[str, Any] = field(default_factory=dict)
+    price: Price | None = None
+    providers: Mapping[str, ProviderConfig] = field(default_factory=dict)  # named
     role_models: Mapping[str, str] = field(default_factory=dict)
+    role_providers: Mapping[str, str] = field(default_factory=dict)  # role -> name
     role_skills: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     extra_read: tuple[Path, ...] = ()
     project_roots: tuple[Path, ...] = ()
@@ -72,31 +147,38 @@ class Config:
     source: str = "defaults"  # the file and env overrides read
 
     def model_for(self, role: str) -> str:
+        if name := self.role_providers.get(role):
+            return self.role_models.get(role) or self.providers[name].model
         return self.role_models.get(role) or self.model
+
+    def provider_table(self, role: str) -> tuple[str, ProviderConfig]:
+        """The name and table of role's provider; "provider" for the default."""
+        if name := self.role_providers.get(role):
+            return f"providers.{name}", self.providers[name]
+        default = ProviderConfig(
+            self.provider_type,
+            self.base_url,
+            self.api_key_env,
+            self.api_key_file,
+            self.model,
+            self.timeout,
+            self.extra_body,
+            self.provider_options,
+            self.price,
+        )
+        return "provider", default
 
     def provider(
         self, role: str, env: Mapping[str, str] = os.environ, model: str = ""
-    ) -> OpenAIProvider:
+    ) -> Provider:
         """A provider for role, at model if given. Raises ConfigError if the model or
-        key is missing."""
+        key is missing, or the provider type cannot be loaded or rejects the settings."""
+        name, table = self.provider_table(role)
         model = model or self.model_for(role)
         if not model:
-            raise ConfigError(
-                f"{self.source}: no model; set provider.model or TIMU_MODEL"
-            )
-        key = ""
-        if self.api_key_file:
-            key = read_key(self.api_key_file)
-        elif self.api_key_env:
-            key = env.get(self.api_key_env, "")
-            if not key:
-                raise ConfigError(
-                    f"{self.api_key_env} is not set; set it, or set provider.api_key_env "
-                    f'to "" for a server without a key'
-                )
-        return OpenAIProvider(
-            self.base_url, model, key, extra_body=self.extra_body, timeout=self.timeout
-        )
+            hint = "TIMU_MODEL" if name == "provider" else f"roles.{role}.model"
+            raise ConfigError(f"{self.source}: no model; set {name}.model or {hint}")
+        return table.build(model, env, self.source, name)
 
     def search_tool(self, env: Mapping[str, str] = os.environ) -> Tool | None:
         """web_search if its key is set, else None. Raises ConfigError for a bad key
@@ -138,31 +220,47 @@ def load_config(
     path = path or user_config_path(env)
     raw, src = (_read(path), str(path)) if path else ({}, "defaults")
     _only(raw, KEYS, src)
-    prov = _table(raw, "provider", src)
     roles = _table(raw, "roles", src)
+    named = _table(raw, "providers", src)
     for table, keys in KEYS.items():
-        if table != "roles":
+        if table not in ("roles", "providers"):
             _only(_table(raw, table, src), keys, f"{src}: {table}")
+    providers = {
+        name: provider_config(_table(named, name, src), f"{src}: providers.{name}")
+        for name in named
+    }
     for name in roles:
         if name not in ROLE_NAMES:
             raise ConfigError(
                 f"{src}: unknown role {name}; roles: {', '.join(ROLE_NAMES)}"
             )
         _only(_table(roles, name, src), KEYS["roles"], f"{src}: roles.{name}")
-    timeout = float(_get(prov, "timeout", (int, float), 600, src))
-    if not 0 < timeout < math.inf:  # also rejects nan
-        raise ConfigError(f"{src}: timeout must be positive and finite")
+    role_providers = {
+        name: _get(_table(roles, name, src), "provider", str, "", src) for name in roles
+    }
+    for role, name in role_providers.items():
+        if name and name not in providers:
+            known = ", ".join(sorted(providers)) or "none"
+            raise ConfigError(
+                f"{src}: roles.{role}.provider: no [providers.{name}]; defined: {known}"
+            )
+    default = provider_config(_table(raw, "provider", src), src)
     config = Config(
-        base_url=_get(prov, "base_url", str, DEFAULT_BASE_URL, src),
-        api_key_env=_get(prov, "api_key_env", str, DEFAULT_KEY_ENV, src),
-        api_key_file=_path(prov, "api_key_file", src),
-        model=_get(prov, "model", str, "", src),
-        timeout=timeout,
-        extra_body=_table(prov, "extra_body", src),
+        provider_type=default.type,
+        base_url=default.base_url,
+        api_key_env=default.api_key_env,
+        api_key_file=default.api_key_file,
+        model=default.model,
+        timeout=default.timeout,
+        extra_body=default.extra_body,
+        provider_options=default.options,
+        price=default.price,
+        providers=providers,
         role_models={
             name: _get(_table(roles, name, src), "model", str, "", src)
             for name in roles
         },
+        role_providers={r: n for r, n in role_providers.items() if n},
         role_skills={
             name: _strings(_table(roles, name, src), "skills", src) for name in roles
         },
@@ -189,9 +287,53 @@ def load_config(
     return config
 
 
-# The keys of each table; for roles, the keys of each [roles.<name>].
+def provider_config(prov: Mapping[str, Any], src: str) -> ProviderConfig:
+    """A provider table, checked. Raises ConfigError naming src."""
+    _only(prov, KEYS["provider"], src)
+    kind = _get(prov, "type", str, BUILTIN, src)
+    builtin = kind == BUILTIN
+    timeout = float(_get(prov, "timeout", (int, float), 600, src))
+    if not 0 < timeout < math.inf:  # also rejects nan
+        raise ConfigError(f"{src}: timeout must be positive and finite")
+    return ProviderConfig(
+        type=kind,
+        base_url=_get(prov, "base_url", str, DEFAULT_BASE_URL if builtin else "", src),
+        api_key_env=_get(
+            prov, "api_key_env", str, DEFAULT_KEY_ENV if builtin else "", src
+        ),
+        api_key_file=_path(prov, "api_key_file", src),
+        model=_get(prov, "model", str, "", src),
+        timeout=timeout,
+        extra_body=_table(prov, "extra_body", src),
+        options=_table(prov, "options", src),
+        price=_price(prov, src),
+    )
+
+
+def _price(prov: Mapping[str, Any], src: str) -> Price | None:
+    t = _table(prov, "price", src)
+    if not t:
+        return None
+    allowed = {"input", "output", "cached_input", "cache_write"}
+    if not {"input", "output"} <= set(t) <= allowed:
+        raise ConfigError(
+            f"{src}: price needs input and output, and may set cached_input and "
+            "cache_write; USD per million tokens"
+        )
+    try:
+        return Price(
+            t["input"], t["output"], t.get("cached_input"), t.get("cache_write")
+        )
+    except ValueError as e:
+        raise ConfigError(f"{src}: {e}") from None
+
+
+# The keys of each table; for roles and providers, the keys of each [<table>.<name>].
 KEYS = {
     "provider": {
+        "type",
+        "options",
+        "price",
         "base_url",
         "api_key_env",
         "api_key_file",
@@ -199,7 +341,8 @@ KEYS = {
         "timeout",
         "extra_body",
     },
-    "roles": {"model", "skills"},
+    "providers": set(),  # each [providers.NAME] has the keys of provider
+    "roles": {"model", "provider", "skills"},
     "search": {"api_key_env", "api_key_file"},
     "sandbox": {"extra_read"},
     "projects": {"roots"},

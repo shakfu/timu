@@ -1,0 +1,7 @@
+# A bug no test covers, so only the review finds it. median and clamp are correct decoys.
+workflow = "review-validate-fix"
+objective = "Review stats.py for correctness bugs."
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--verify-to-fix", "1"]
+protected = ["Makefile"]
+max_cost = 1.0

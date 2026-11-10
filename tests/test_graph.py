@@ -343,6 +343,18 @@ def test_commit_takes_new_files_and_leaves_out_the_report(tmp_path: Path) -> Non
     assert commit(ws, "again", exclude=("REVIEW.md",)) == new  # nothing left
 
 
+def test_commit_with_a_gitignored_report(tmp_path: Path) -> None:
+    """git add refuses an exclude pathspec that names an ignored file."""
+    src = project(tmp_path / "p", "a", **{".gitignore": "REVIEW.md\n", "f.txt": "v1\n"})
+    ws = tmp_path / "work" / "a"
+    base, _ = provision(src, ws, "HEAD", "timu/r1/a")
+    (ws / "f.txt").write_text("v2\n")
+    (ws / "REVIEW.md").write_text("VERDICT: APPROVE\n")
+    assert commit(ws, "timu a: change", exclude=("REVIEW.md",)) != base
+    patch = diff(ws, base)
+    assert "f.txt" in patch and "REVIEW.md" not in patch
+
+
 def test_commit_ignores_the_users_hooks_and_signing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1195,7 +1207,7 @@ def test_cli_resume_and_report(tmp_path: Path) -> None:
     out = io.StringIO()
     assert main(["report"], out=out, err=io.StringIO()) == 0
     rows = [line.split() for line in out.getvalue().splitlines()]
-    assert rows[0] == ["workflow", "runs", "done", "cost", "tokens", "time"]
+    assert rows[0] == ["workflow", "runs", "done", "cost", "tokens", "cached", "time"]
     assert rows[1][:4] == ["fix-review", "3", "2", "(66%)"]  # a, b, b; a reused ran not
     out = io.StringIO()
     assert main(["report", "--by", "project"], out=out, err=io.StringIO()) == 0

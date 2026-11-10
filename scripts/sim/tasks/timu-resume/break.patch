@@ -1,0 +1,93 @@
+diff -ruN a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -21,7 +21,6 @@
+ 
+ - On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays. A new `.git`, `timu.toml` or `.timu` is moved to `~/.local/state/timu/quarantine` instead of deleted, since it may hold commits the command made. If the quarantine lies under a write root, the entry stays in place and the call says so.
+ - A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
+-- `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
+ - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
+ - `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
+ - A lone surrogate in model text crashed the console. A 429 whose text mentions too many tokens counted as a context overflow and was not retried.
+diff -ruN a/src/timu/graph.py b/src/timu/graph.py
+--- a/src/timu/graph.py	2026-11-05 16:21:36
++++ b/src/timu/graph.py	2026-11-10 09:00:51
+@@ -776,7 +776,7 @@
+     why_not: dict[str, str] | None = None,
+ ) -> dict[str, NodeResult]:
+     """The done results in an earlier run's events that a run of graph may reuse: same
+-    spec, same base commit, every need reused too, and a copy still at the recorded
++    spec, every need reused too, and a copy still at the recorded
+     head. why_not, if given, receives the reason for each other node."""
+     why_not = {} if why_not is None else why_not
+     found = {
+@@ -786,7 +786,6 @@
+     }
+     reuse: dict[str, NodeResult] = {}
+     deps = {n.id: n.needs for n in graph.nodes.values()}
+-    parents = chains(graph, projects)
+     for nid in TopologicalSorter(deps).static_order():
+         node, d = graph.nodes[nid], found.get(nid)
+         if not d:
+@@ -795,9 +794,6 @@
+         if d.get("spec") != spec(node, projects[nid]):
+             why_not[nid] = "its definition or project path changed"
+             continue
+-        if not parents[nid] and not _same_base(projects[nid], node.ref, d.get("base")):
+-            why_not[nid] = f"{node.ref} is at a different commit now"
+-            continue
+         if not all(n in reuse for n in node.needs):
+             why_not[nid] = "a node it needs is not reused"
+             continue
+@@ -832,16 +828,6 @@
+             why_not[nid] = "its copy or record is unusable"
+             continue  # a trace from before resume, or a copy that is gone
+     return reuse
+-
+-
+-def _same_base(project: Path, ref: str, base: Any) -> bool:
+-    """Whether ref in project is still the commit an earlier run started from."""
+-    try:
+-        return bool(
+-            _git(project, "rev-parse", "--verify", f"{ref}^{{commit}}").strip() == base
+-        )
+-    except GraphError:
+-        return False
+ 
+ 
+ def serial_order(graph: Graph) -> list[str]:
+diff -ruN a/tests/test_review_fixes.py b/tests/test_review_fixes.py
+--- a/tests/test_review_fixes.py	2026-11-05 16:21:36
++++ b/tests/test_review_fixes.py	2026-11-10 09:00:51
+@@ -302,31 +302,6 @@
+     assert g.budget.tool_calls == WORKFLOW_BUDGET.tool_calls
+ 
+ 
+-def test_resume_reruns_a_node_whose_project_moved_on(tmp_path: Path) -> None:
+-    import tomllib
+-
+-    r = repo(tmp_path / "a")
+-    g = parse_graph(tomllib.loads(NODE))
+-    copy = tmp_path / "copy"
+-    base, _ = provision(r, copy, "HEAD", "b")
+-    data = {
+-        "node": "a",
+-        "status": "done",
+-        "summary": "s",
+-        "branch": "b",
+-        "base": base,
+-        "head": base,
+-        "workdir": str(copy),
+-        "files": "",
+-        "spec": spec(g.nodes["a"], r),
+-        "outputs": [],
+-    }
+-    events = [Event("node_result", "r", "", "workflow", 0.0, data)]
+-    assert list(resumable(events, g, {"a": r})) == ["a"]
+-    git(r, "commit", "--allow-empty", "-qm", "newer")
+-    assert list(resumable(events, g, {"a": r})) == []
+-
+-
+ # ---- check files (F9) ----
+ 
+ 

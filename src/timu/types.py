@@ -39,13 +39,17 @@ class Budget:
 
 @dataclass(frozen=True)
 class Usage:
-    """Resources an agent run has used."""
+    """Resources an agent run has used. input_tokens counts every prompt token;
+    cached_input_tokens is the part of it read from a prompt cache, and
+    cache_write_input_tokens the part written to one."""
 
     turns: int = 0
     tool_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    cached_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
 
     @property
     def tokens(self) -> int:
@@ -58,6 +62,8 @@ class Usage:
             self.input_tokens + other.input_tokens,
             self.output_tokens + other.output_tokens,
             self.cost_usd + other.cost_usd,
+            self.cached_input_tokens + other.cached_input_tokens,
+            self.cache_write_input_tokens + other.cache_write_input_tokens,
         )
 
     def exceeds(

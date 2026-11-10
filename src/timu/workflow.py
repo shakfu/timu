@@ -101,6 +101,9 @@ class Session:
         self.max_depth = max_depth
         self.used = Usage()
         self.approved: set[Artifact] = set()
+        # one question at a time, so an artifact is asked about once; events from
+        # other threads keep flowing while approve waits for an answer
+        self.approval_lock = threading.Lock()
         self.agents = 0  # agent ids are unique across the session
         self.start = clock()
 
@@ -358,7 +361,7 @@ class Run:
         risky = role.grants & {Capability.EXEC, Capability.FS_WRITE}
         if approve is None or not (outbound or risky):
             return None
-        with self.session.lock:  # one prompt at a time; other nodes' output waits
+        with self.session.approval_lock:
             pending = [
                 a
                 for a in task.inputs

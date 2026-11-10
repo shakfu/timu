@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -208,6 +209,20 @@ def test_read_only_workspace_redirects_caches(dirs: tuple[Path, Path, Path]) -> 
     assert f"PYTHONPYCACHEPREFIX={dirs[1]}/pycache" in out
     assert "PYTEST_ADDOPTS=-p no:cacheprovider" in out
     assert "PYTEST_ADDOPTS" not in sh(ctx_for(dirs), "env").text
+
+
+def test_bytecode_stays_out_of_a_writable_workspace(
+    dirs: tuple[Path, Path, Path],
+) -> None:
+    """Else a coder's test run leaves __pycache__ for timu to commit."""
+    ws, tmp, _ = dirs
+    (ws / "m.py").write_text("X = 1\n")
+    prefixes = tuple({Path(os.path.realpath(p)) for p in (sys.prefix, sys.base_prefix)})
+    ctx = ctx_for(dirs, detect(prefixes))
+    out = sh(ctx, f"{shlex.quote(sys.executable)} -c 'import m'")
+    assert not out.is_error, out.text
+    assert not (ws / "__pycache__").exists()
+    assert list((tmp / "pycache").rglob("m.*.pyc"))
 
 
 def test_timeout_kills_grandchildren(dirs: tuple[Path, Path, Path]) -> None:

@@ -1,0 +1,11 @@
+# A spec in the objective; the visible test already passes, so only the spec guides the fix.
+workflow = "fix-review"
+objective = """slugify() in text.py must follow these rules: lowercase the text; turn each \
+accented Latin letter, meaning a character whose NFD decomposition starts with an ASCII \
+letter, into that letter (e.g. "\u00e9" -> "e"); drop other non-ASCII characters; \
+replace every run of characters that are not a-z or 0-9 with a single hyphen; strip leading \
+and trailing hyphens. Implement the rules and add tests for them."""
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--review-to-fix", "1"]
+protected = ["Makefile"]
+max_cost = 0.5

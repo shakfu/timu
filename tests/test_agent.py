@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
+from pathlib import Path
 
 from conftest import MakeAgent
 from timu import Artifact, Budget, Origin, Task, Usage
@@ -456,3 +457,37 @@ def test_trim_keeps_short_and_exempt_results() -> None:
     assert removed == TRIM_MIN - len(messages[3].content)
     assert trim(messages, 1) == 0  # a stub is not trimmed again
     assert trim(messages[:2], 0) == 0  # no turns yet
+
+
+def test_a_priced_provider_enforces_the_cost_limit(tmp_path: Path) -> None:
+    """A server that reports no cost, with a price set: the limit applies, and no
+    warning says it is not enforced."""
+    from dataclasses import replace
+
+    import pytest
+
+    from conftest import TEST_ROLE
+    from timu import Agent, Event, Role
+    from timu.provider import Price, Priced
+    from timu.provider.fake import FakeProvider
+
+    costly = replace(
+        calls(call("echo", text="x")),
+        usage=Usage(input_tokens=1_000_000),
+        cost_known=False,
+    )
+    inner = FakeProvider([costly, costly, text("done")])
+    events: list[Event] = []
+    role = Role(
+        TEST_ROLE.name,
+        TEST_ROLE.prompt,
+        TEST_ROLE.tools,
+        budget=Budget(cost_usd=5, tokens=10_000_000),
+    )
+    agent = Agent(role, Priced(inner, Price(3.0, 0)), events.append, tmp_path)
+    result = agent.run(Task("go"))
+    assert result.status == "budget" and "cost_usd" in result.summary
+    assert result.usage.cost_usd == pytest.approx(6.0)
+    assert not [
+        e for e in events if e.kind == "warning" and "cost" in e.data["message"]
+    ]

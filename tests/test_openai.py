@@ -349,16 +349,32 @@ def test_truncated_stream_is_retried(server: Server) -> None:
     assert len(server.requests) == 2
 
 
-def test_no_retry_after_text_was_delivered(server: Server) -> None:
+def test_retry_after_text_was_delivered_marks_the_restart(server: Server) -> None:
+    """A 502 mid-reply, as OpenRouter sends it: the reply is retried, and the console
+    sees where it restarts. The reply holds only the retry's text."""
+    error = b'data: {"error": {"code": 502, "message": "provider_unavailable"}}\n\n'
+    server.responses += [
+        Resp(chunks=[event({"content": "partial"}), error]),
+        Resp(chunks=[event({"content": "again"}, finish="stop"), DONE]),
+    ]
+    pieces: list[str] = []
+    reply = make(server)[0].complete([], [], pieces.append)
+    assert (reply.stop, reply.text) == ("end", "again")
+    assert pieces[0] == "partial" and pieces[2] == "again"
+    assert pieces[1].startswith("\n[stream error: ") and "retrying" in pieces[1]
+    assert len(server.requests) == 2
+
+
+def test_truncated_stream_after_text_is_retried(server: Server) -> None:
     server.responses += [
         Resp(chunks=[event({"content": "partial"})]),
         Resp(chunks=[event({"content": "again"}, finish="stop"), DONE]),
     ]
     pieces: list[str] = []
     reply = make(server)[0].complete([], [], pieces.append)
-    assert reply.error == "the stream ended early"
-    assert pieces == ["partial"]
-    assert len(server.requests) == 1
+    assert reply.text == "again"
+    assert pieces[1] == "\n[the stream ended early; retrying the reply]\n"
+    assert len(server.requests) == 2
 
 
 def test_error_mid_stream(server: Server) -> None:
@@ -497,3 +513,59 @@ def test_to_wire() -> None:
         "tool_call_id": "c1",
         "content": "error: boom",
     }
+
+
+@pytest.mark.parametrize(
+    ("details", "cached"),
+    [
+        ({"cached_tokens": 8}, 8),
+        ({"cached_tokens": 99}, 12),  # never more than the prompt
+        ({"cached_tokens": "8"}, 0),
+        ("x", 0),
+        (None, 0),
+    ],
+)
+def test_cached_prompt_tokens(server: Server, details: Any, cached: int) -> None:
+    usage: dict[str, Any] = {"prompt_tokens": 12, "completion_tokens": 3}
+    if details is not None:
+        usage["prompt_tokens_details"] = details
+    chunk = json.dumps({"choices": [], "usage": usage}).encode()
+    server.responses.append(
+        Resp(
+            chunks=[
+                event({"content": "ok"}, finish="stop"),
+                b"data: " + chunk + b"\n\n",
+                DONE,
+            ]
+        )
+    )
+    reply = make(server)[0].complete([], [])
+    assert reply.usage == Usage(
+        input_tokens=12, output_tokens=3, cached_input_tokens=cached
+    )
+
+
+def test_the_builtin_replies_pass_the_adapter_kit(server: Server) -> None:
+    """The built-in provider keeps the contract that timu.provider.testing checks."""
+    from timu.provider.testing import reply_problems
+
+    usage = {
+        "prompt_tokens": 12,
+        "completion_tokens": 3,
+        "cost": 0.002,
+        "prompt_tokens_details": {"cached_tokens": 8},
+    }
+    chunk = json.dumps({"choices": [], "usage": usage}).encode()
+    server.responses.append(
+        Resp(
+            chunks=[
+                event({"content": "ok"}, finish="stop"),
+                b"data: " + chunk + b"\n\n",
+                DONE,
+            ]
+        )
+    )
+    server.responses.append(Resp(status=400, chunks=[b'{"error": "bad"}']))
+    provider = make(server)[0]
+    for reply in (provider.complete([], []), provider.complete([], [])):
+        assert reply_problems(reply) == [], reply

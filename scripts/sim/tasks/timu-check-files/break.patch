@@ -1,0 +1,54 @@
+diff -ruN a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,7 +23,6 @@
+ - A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
+ - `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
+ - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
+-- `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
+ - A lone surrogate in model text crashed the console. A 429 whose text mentions too many tokens counted as a context overflow and was not retried.
+ - A graph that sets a `boolean` or `paths` param, such as `network`, from an upstream output now fails to load. An output is a string, which these params reject, so the node failed only when it ran. A Ref for `network` also passed the `trust_upstream` check.
+ - On macOS, the sandbox's `.git` write rule now matches any case, such as `.GIT`. APFS is case-insensitive by default, and Seatbelt does not document whether a `regex` sees the on-disk case. Before, only the post-run scan caught a new `.GiT`, after the command had written it.
+diff -ruN a/src/timu/workflow.py b/src/timu/workflow.py
+--- a/src/timu/workflow.py	2026-11-05 16:21:36
++++ b/src/timu/workflow.py	2026-11-10 09:00:51
+@@ -690,8 +690,6 @@
+ CHECK_FILES: Mapping[str, tuple[str, ...]] = {
+     **dict.fromkeys(("make", "gmake"), ("Makefile", "GNUmakefile", "makefile", "*.mk")),
+     "just": ("justfile", "Justfile", ".justfile"),
+-    "cargo": ("Cargo.toml", "build.rs"),
+-    "go": ("go.mod",),
+     **dict.fromkeys(("npm", "yarn", "pnpm"), ("package.json",)),
+     "nox": ("noxfile.py",),
+     "tox": ("tox.ini",),
+@@ -708,7 +706,7 @@
+     for word in (w for c in commands for w in CHECK_WORD.findall(c)):
+         found.update(dict.fromkeys(CHECK_FILES.get(word.rsplit("/", 1)[-1], ())))
+         path = Path(os.path.realpath(workdir / word))
+-        if path.is_relative_to(workdir) and path.is_file():
++        if "/" in word and path.is_relative_to(workdir) and path.is_file():
+             found[str(path.relative_to(workdir))] = None
+     return tuple(found)
+ 
+diff -ruN a/tests/test_review_fixes.py b/tests/test_review_fixes.py
+--- a/tests/test_review_fixes.py	2026-11-05 16:21:36
++++ b/tests/test_review_fixes.py	2026-11-10 09:00:51
+@@ -330,18 +330,6 @@
+ # ---- check files (F9) ----
+ 
+ 
+-@pytest.mark.parametrize("command", ["python check.py", "sh check.py"])
+-def test_a_script_named_without_a_slash_counts(tmp_path: Path, command: str) -> None:
+-    (tmp_path / "check.py").write_text("")
+-    workdir = Path(os.path.realpath(tmp_path))
+-    assert check_files([command], workdir) == ("check.py",)
+-
+-
+-def test_cargo_and_go_have_check_files(tmp_path: Path) -> None:
+-    assert "Cargo.toml" in check_files(["cargo test"], tmp_path)
+-    assert "go.mod" in check_files(["go test ./..."], tmp_path)
+-
+-
+ # ---- credentials over redirects (F10) ----
+ 
+ 

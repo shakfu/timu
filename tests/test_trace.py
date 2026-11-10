@@ -290,7 +290,13 @@ def _ev(kind: str, ts: float, at: str = "", agent: str = "", **data: Any) -> Eve
 
 
 def test_totals_by_workflow_project_and_model() -> None:
-    usage = {"turns": 1, "input_tokens": 100, "output_tokens": 20, "cost_usd": 0.5}
+    usage = {
+        "turns": 1,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cost_usd": 0.5,
+        "cached_input_tokens": 25,
+    }
     single = [
         _ev("run", 0, workflow="fix-review", workdir="/p/calc"),
         _ev("start", 1, agent="a1", model="m1"),
@@ -308,10 +314,10 @@ def test_totals_by_workflow_project_and_model() -> None:
     ]
     old = [_ev("start", 0, agent="a1"), _ev("workflow_result", 1, status="done")]
     assert totals([single, graph_run, old], "workflow").splitlines() == [
-        "workflow    runs  done      cost   tokens  time",
-        "?           1     1 (100%)  $0.00  0       0m01s",
-        "commands    1     1 (100%)  $0.00  0       0m05s",
-        "fix-review  2     1 (50%)   $1.00  240     1m07s",
+        "workflow    runs  done      cost   tokens  cached  time",
+        "?           1     1 (100%)  $0.00  0       -       0m01s",
+        "commands    1     1 (100%)  $0.00  0       -       0m05s",
+        "fix-review  2     1 (50%)   $1.00  240     25%     1m07s",
     ]
     assert [
         r.split()[:2] for r in totals([single, graph_run], "project").splitlines()
@@ -328,3 +334,45 @@ def test_totals_by_workflow_project_and_model() -> None:
         ["m1", "1", "1"],
         ["m2", "1", "0"],
     ]
+
+
+def test_usage_from_a_trace_before_cached_tokens() -> None:
+    """Traces written before Usage had cached_input_tokens still load."""
+    from timu.trace import _usage
+    from timu.types import Usage
+
+    old = {
+        "turns": 1,
+        "tool_calls": 0,
+        "input_tokens": 5,
+        "output_tokens": 2,
+        "cost_usd": 0,
+    }
+    assert _usage(old) == Usage(1, 0, 5, 2, 0.0)
+    assert _usage({**old, "cached_input_tokens": 3}).cached_input_tokens == 3
+
+
+def test_usage_adds_cached_tokens() -> None:
+    from timu.types import Usage
+
+    total = Usage(input_tokens=5, cached_input_tokens=2) + Usage(cached_input_tokens=1)
+    assert total.cached_input_tokens == 3
+
+
+def test_the_tree_and_summary_show_cached_tokens() -> None:
+    from timu.trace import cache_note
+    from timu.types import Usage
+
+    assert cache_note(Usage(input_tokens=10)) == ""
+    assert cache_note(Usage(input_tokens=10, cached_input_tokens=7)) == " (7 cached)"
+
+
+def test_cache_writes_in_notes_and_traces() -> None:
+    from timu.trace import _usage, cache_note
+    from timu.types import Usage
+
+    u = Usage(input_tokens=10, cached_input_tokens=3, cache_write_input_tokens=4)
+    assert cache_note(u) == " (3 cached, 4 cache writes)"
+    assert cache_note(Usage(cache_write_input_tokens=2)) == " (2 cache writes)"
+    assert _usage({"cache_write_input_tokens": 4}).cache_write_input_tokens == 4
+    assert (u + u).cache_write_input_tokens == 8

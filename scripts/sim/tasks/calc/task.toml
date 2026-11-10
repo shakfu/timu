@@ -1,0 +1,6 @@
+# Baseline: one seeded bug that the visible test catches.
+workflow = "fix-review"
+objective = "make test fails; fix calc.py"
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+protected = ["test_*.py", "Makefile"]
+max_cost = 0.5

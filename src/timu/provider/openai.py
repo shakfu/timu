@@ -16,7 +16,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from timu.provider.base import Message, OnText, Reply, Stop, ToolCall
+from timu.provider.base import (
+    CONTEXT_OVERFLOW,
+    Message,
+    OnText,
+    ProviderSettings,
+    Reply,
+    Stop,
+    ToolCall,
+)
 from timu.tool import Tool
 from timu.types import Usage
 
@@ -44,6 +52,7 @@ class _Failure:
     error: str
     retryable: bool
     delay: float | None = None  # from Retry-After
+    delivered: bool = False  # text reached on_text before the failure
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -54,6 +63,21 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def from_settings(settings: ProviderSettings) -> OpenAIProvider:
+    """The built-in provider type. It needs a base_url; options is unused."""
+    if not settings.base_url:
+        raise ValueError("provider.base_url is required")
+    if settings.options:
+        raise ValueError("provider.options is only for provider types from packages")
+    return OpenAIProvider(
+        settings.base_url,
+        settings.model,
+        settings.api_key,
+        extra_body=settings.extra_body,
+        timeout=settings.timeout,
+    )
 
 
 class OpenAIProvider:
@@ -113,6 +137,9 @@ class OpenAIProvider:
                 return outcome
             if not outcome.retryable or attempt == self.retries:
                 return Reply("", stop="error", error=outcome.error)
+            if outcome.delivered and on_text:
+                # The retry streams the reply again; mark where it restarts.
+                on_text(f"\n[{outcome.error}; retrying the reply]\n")
             self._sleep(
                 outcome.delay
                 if outcome.delay is not None
@@ -146,9 +173,7 @@ class OpenAIProvider:
                 except (OSError, http.client.HTTPException):
                     text = ""  # the status is enough; the body is best-effort
             if e.code != 429 and _is_context_error(text):
-                return _Failure(
-                    f"context length exceeded: {text[:500]}", retryable=False
-                )
+                return _Failure(f"{CONTEXT_OVERFLOW}: {text[:500]}", retryable=False)
             retryable = e.code == 429 or e.code >= 500
             return _Failure(
                 f"http {e.code}: {text[:500]}", retryable, _retry_after(e.headers)
@@ -162,7 +187,9 @@ class OpenAIProvider:
             )
         except (OSError, http.client.HTTPException) as e:
             return _Failure(
-                f"network error: {e or type(e).__name__}", not stream.delivered
+                f"network error: {e or type(e).__name__}",
+                True,
+                delivered=stream.delivered,
             )
         return stream.result()
 
@@ -208,7 +235,7 @@ class _Stream:
         self.error: str | None = None
         self.events = 0
         self.done = False  # the server sent [DONE]
-        self.delivered = False  # text reached on_text, so a retry would repeat it
+        self.delivered = False  # text reached on_text, so a retry repeats it
 
     def feed(self, line: bytes) -> None:
         line = line.rstrip(b"\r\n")
@@ -313,13 +340,15 @@ class _Stream:
         if self.error is not None:
             if _is_context_error(self.error):
                 return _Failure(
-                    f"context length exceeded: {self.error[:500]}", retryable=False
+                    f"{CONTEXT_OVERFLOW}: {self.error[:500]}", retryable=False
                 )
-            return _Failure(f"stream error: {self.error[:500]}", not self.delivered)
+            return _Failure(
+                f"stream error: {self.error[:500]}", True, delivered=self.delivered
+            )
         if not self.events:
             return _Failure("empty response", retryable=True)
         if not self.finish and not self.done:
-            return _Failure("the stream ended early", not self.delivered)
+            return _Failure("the stream ended early", True, delivered=self.delivered)
         calls = tuple(
             ToolCall(
                 c["id"], c["name"], _parse_args("".join(c["args"])), "".join(c["args"])
@@ -330,14 +359,18 @@ class _Stream:
         stop = STOPS.get(self.finish, "tool_use" if calls else "end")
         if stop == "end" and calls:  # some servers say "stop" with tool calls
             stop = "tool_use"
+        prompt = _int(self.usage.get("prompt_tokens"))
+        details = self.usage.get("prompt_tokens_details")
+        cached = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
         return Reply(
             "".join(self.text),
             calls,
             stop,
             Usage(
-                input_tokens=_int(self.usage.get("prompt_tokens")),
+                input_tokens=prompt,
                 output_tokens=_int(self.usage.get("completion_tokens")),
                 cost_usd=_num(self.usage.get("cost")),  # OpenRouter reports it
+                cached_input_tokens=min(cached, prompt),
             ),
             extra={"reasoning_details": self.details} if self.details else {},
             cost_known="cost" in self.usage,

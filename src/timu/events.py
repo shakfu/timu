@@ -1,4 +1,34 @@
-"""Events agents emit instead of printing, and sinks that receive them."""
+"""Events agents emit instead of printing, and sinks that receive them.
+
+The event kinds and their data keys are public API: a UI reads them, and the trace
+stores them. SCHEMA lists every kind; a key in brackets below is optional. An agent's
+events carry its agent_id, parent_id (the delegating agent, or "") and role. A
+workflow or graph event carries the run id as agent_id and role "workflow". node is
+the graph node, or "" outside a graph. Usage values are dicts of types.Usage.
+
+    config          source                     the config file and env overrides read
+    run             workflow, workdir          a workflow starts
+    resume          run, nodes, again          nodes reused from run; again: node -> why
+    warning         message
+    start           goal, model                an agent starts
+    model_delta     text                       streamed model text; display only
+    model_reply     text, stop, tool_calls, usage, error
+    tool_call       id, name, arguments, raw   arguments is None if raw is not JSON
+    tool_result     id, text, is_error
+    trim            characters, reason         old tool output removed from context
+    result          status, summary, usage, untrusted      an agent ends
+    approval        artifact, role, approved   the untrusted-content gate answered
+    round           n, stage, [verdict]        a workflow step: code, review, verdict...
+    command         command, network           a commands step starts
+    command_result  command, result
+    workflow_result status, summary            a workflow ends
+    node            repo, project, workflow    a graph node starts
+    node_result     node, status, summary, branch, base, head, workdir, files, spec,
+                    reused, outputs            a graph node ends; enough to resume it
+
+New kinds and new optional keys may be added in a minor release. A UI should ignore
+kinds it does not know.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +41,48 @@ from types import TracebackType
 from typing import IO, Any, Self
 
 EventSink = Callable[["Event"], None]
+
+# kind -> (required data keys, optional data keys); see the module docstring
+SCHEMA: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
+    kind: (frozenset(req.split()), frozenset(opt.split()))
+    for kind, req, opt in (
+        ("config", "source", ""),
+        ("run", "workflow workdir", ""),
+        ("resume", "run nodes again", ""),
+        ("warning", "message", ""),
+        ("start", "goal model", ""),
+        ("model_delta", "text", ""),
+        ("model_reply", "text stop tool_calls usage error", ""),
+        ("tool_call", "id name arguments raw", ""),
+        ("tool_result", "id text is_error", ""),
+        ("trim", "characters reason", ""),
+        ("result", "status summary usage untrusted", ""),
+        ("approval", "artifact role approved", ""),
+        ("round", "n stage", "verdict"),
+        ("command", "command network", ""),
+        ("command_result", "command result", ""),
+        ("workflow_result", "status summary", ""),
+        ("node", "repo project workflow", ""),
+        (
+            "node_result",
+            "node status summary branch base head workdir files spec reused outputs",
+            "",
+        ),
+    )
+}
+
+
+def schema_problem(event: Event) -> str | None:
+    """Why event does not match SCHEMA, or None."""
+    if event.kind not in SCHEMA:
+        return f"unknown event kind {event.kind!r}"
+    required, optional = SCHEMA[event.kind]
+    keys = set(event.data)
+    if missing := required - keys:
+        return f"{event.kind}: missing {', '.join(sorted(missing))}"
+    if extra := keys - required - optional:
+        return f"{event.kind}: undocumented {', '.join(sorted(extra))}"
+    return None
 
 
 @dataclass(frozen=True)

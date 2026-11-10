@@ -183,13 +183,44 @@ def _cost(u: Usage) -> str:
     turns = "turn" if u.turns == 1 else "turns"
     tool_calls = "tool call" if u.tool_calls == 1 else "tool calls"
     tokens = "token" if u.tokens == 1 else "tokens"
-    return f"{u.turns} {turns}, {u.tool_calls} {tool_calls}, {u.tokens} {tokens}{cost}"
+    return (
+        f"{u.turns} {turns}, {u.tool_calls} {tool_calls}, "
+        f"{u.tokens} {tokens}{cache_note(u)}{cost}"
+    )
+
+
+def cache_note(u: Usage) -> str:
+    """The prompt's cache reads and writes, as " (N cached, M cache writes)", or ""
+    for none."""
+    parts = [
+        f"{n} {what}"
+        for n, what in (
+            (u.cached_input_tokens, "cached"),
+            (u.cache_write_input_tokens, "cache writes"),
+        )
+        if n
+    ]
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _cached_share(u: Usage) -> str:
+    if not u.input_tokens:
+        return "-"
+    return f"{100 * min(u.cached_input_tokens, u.input_tokens) // u.input_tokens}%"
 
 
 def _usage(d: Any) -> Usage:
     if not isinstance(d, dict):
         return Usage()
-    names = ("turns", "tool_calls", "input_tokens", "output_tokens", "cost_usd")
+    names = (
+        "turns",
+        "tool_calls",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "cached_input_tokens",  # these two are absent from traces before 0.3.0
+        "cache_write_input_tokens",
+    )
     return Usage(**{k: d[k] for k in names if isinstance(d.get(k), int | float)})
 
 
@@ -258,7 +289,15 @@ def totals(traces: Sequence[Sequence[Event]], by: str) -> str:
     for events in traces:
         for u in units(events, by):
             rows.setdefault(u.key, []).append(u)
-    head = (by, "runs" if by != "model" else "agents", "done", "cost", "tokens", "time")
+    head = (
+        by,
+        "runs" if by != "model" else "agents",
+        "done",
+        "cost",
+        "tokens",
+        "cached",
+        "time",
+    )
     table = [head]
     for key in sorted(rows):
         us = rows[key]
@@ -272,6 +311,7 @@ def totals(traces: Sequence[Sequence[Event]], by: str) -> str:
                 f"{done} ({100 * done // len(us)}%)",
                 f"${usage.cost_usd:.2f}",
                 str(usage.tokens),
+                _cached_share(usage),
                 _duration(seconds),
             )
         )
@@ -317,7 +357,11 @@ def replies(events: Sequence[Event]) -> list[Reply]:
 def _reply_usage(u: Usage) -> Usage:
     """A Reply's usage leaves turns and tool calls to the agent."""
     return Usage(
-        input_tokens=u.input_tokens, output_tokens=u.output_tokens, cost_usd=u.cost_usd
+        input_tokens=u.input_tokens,
+        output_tokens=u.output_tokens,
+        cost_usd=u.cost_usd,
+        cached_input_tokens=u.cached_input_tokens,
+        cache_write_input_tokens=u.cache_write_input_tokens,
     )
 
 
