@@ -25,7 +25,10 @@ jobs:
     env:
       UV_PYTHON: ${{ matrix.python }}
     steps:
+      # Base-commit sim tasks run `git archive <base>`; a shallow clone lacks it.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v7
       # Ubuntu 24.04 stops bwrap from creating user namespaces (README, docs/dev/bwrap.md).
       # Lifting that on a throwaway runner lets the bwrap tests run instead of skipping.
