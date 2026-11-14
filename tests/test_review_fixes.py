@@ -237,7 +237,9 @@ def test_detached_writes_after_review_fail_the_seal(tmp_path: Path) -> None:
     run = session(tmp_path).at(ws)
     go = tmp_path / "go"  # outside the reviewed tree, so creating it is not a change
     perl = (
-        "use POSIX; exit if fork; POSIX::setsid(); "
+        # The parent exits only after setsid, so killing sh's group cannot reach it.
+        "use POSIX; pipe(R, W); if (fork) { close W; <R>; exit } "
+        "close R; POSIX::setsid(); close W; "
         f"for (1..300) {{ last if -e '{go}'; select(undef,undef,undef,0.1) }} "
         'open(F,">late.txt"); print F "late"; close F;'
     )
