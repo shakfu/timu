@@ -218,6 +218,9 @@ def test_bytecode_stays_out_of_a_writable_workspace(
     ws, tmp, _ = dirs
     (ws / "m.py").write_text("X = 1\n")
     prefixes = tuple({Path(os.path.realpath(p)) for p in (sys.prefix, sys.base_prefix)})
+    # uv's venv python links via an unversioned toolchain dir that realpath skips
+    base = Path(getattr(sys, "_base_executable", sys.executable)).parent.parent
+    prefixes += (base,)
     ctx = ctx_for(dirs, detect(prefixes))
     out = sh(ctx, f"{shlex.quote(sys.executable)} -c 'import m'")
     assert not out.is_error, out.text
