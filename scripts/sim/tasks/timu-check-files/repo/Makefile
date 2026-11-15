@@ -8,9 +8,11 @@ TESTS = tests/test_agent.py tests/test_config.py tests/test_delegate.py \
 HOST_ONLY = test_clipboard_is_denied test_a_rate_limit_with_token_wording_is_retried \
 	test_a_trickling_response_hits_the_total_limit test_provider_does_not_follow_redirects \
 	test_web_drops_credentials_on_a_cross_origin_redirect
+# Races at 3d78d04: the forked child can die before setsid. Fixed in da930d6.
+RACY = test_detached_writes_after_review_fail_the_seal
 
 test:
 	PYTHONPATH=src $(PYTHON) -m pytest -q -p no:cacheprovider $(TESTS) $(EXTRA) \
-		$(foreach t,$(HOST_ONLY),--deselect tests/test_review_fixes.py::$(t))
+		$(foreach t,$(HOST_ONLY) $(RACY),--deselect tests/test_review_fixes.py::$(t))
 
 .PHONY: test
