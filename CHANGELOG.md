@@ -13,45 +13,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `[provider] type` selects a model client registered by an installed package under the `timu.providers` entry-point group. The provider interface in `timu.provider` (`Provider`, `ProviderSettings`, `ProviderFactory`, `Message`, `Reply`, `ToolCall`, `CONTEXT_OVERFLOW`) is now public API, with its contract in `provider/base.py`. Core stays dependency-free; a separate package can bring the OpenAI and Anthropic SDKs. Entry points over a module path in config, so that installing a package is the trust step and config only names it.
+
 - `timu.api.run` and `timu.api.run_graph` start a run from Python and return an `Outcome`: status, usage, trace, and the copy, branch and report. Events go to a caller's sink, and `approve` and `cancel` replace the terminal prompt and Ctrl-C. Without `approve`, gated content is refused, as without a terminal. The CLI now calls this API, so both share one path.
+
 - The event kinds and their data keys are public API, listed in `timu.events.SCHEMA` and the module docstring. Every test checks each event timu emits against it, so the list cannot drift from the code.
+
 - `timu.api.Approvals` lets a UI answer approval questions from its own thread. A question waits for `answer()`, the run's cancel or a timeout; the last two mean no. The gate now holds its own lock instead of the session's, so other nodes' events keep flowing while a question waits. The CLI still pauses console output during its terminal prompt, so lines do not break into it.
+
 - `price = { input, output }` in a provider table, in USD per million tokens, gives a cost to replies whose server reports none, so `--max-cost` applies to OpenAI, Anthropic and local servers. A reported cost wins. `cached_input` sets the rate for prompt tokens read from a cache; cache writes cost the input rate, so on Anthropic, which bills them higher, the cost runs short. Prices are the user's: a table of per-model prices in core would go stale.
+
 - `Usage.cache_write_input_tokens` and `price.cache_write` count and price prompt tokens written to a cache. One rate covers every cache lifetime; with Anthropic's 1-hour cache at 2x input against 1.25x for 5 minutes, setting the longest lifetime's rate gives an upper bound. One rate per lifetime would be exact, but would put one vendor's billing model into core's `Usage`. The run summary, `timu trace` and a new `cached` column in `timu report` show cache use.
+
 - `timu.provider.testing.reply_problems` checks an adapter's replies against the rules of the provider contract that the types do not enforce. timu also warns once per agent when a reply counts more cached and cache-write tokens than input tokens: the sign of an adapter that passes Anthropic's `input_tokens`, which excludes them, straight through.
+
 - `Usage.cached_input_tokens` is the part of `input_tokens` read from a prompt cache. The built-in provider reads it from `prompt_tokens_details.cached_tokens`; traces carry it, and older traces load with 0. An adapter whose API counts cached tokens apart from input, as Anthropic's does, adds them to `input_tokens` too.
+
 - `[providers.NAME]` tables and `[roles.X] provider = "NAME"` put roles on different providers, such as an Anthropic reviewer and an OpenAI coder. A role on a named provider takes its model from the role or that table, never from `[provider]`: another API's model id would fail only at the first call.
+
 - `scripts/sim.py` runs `timu run` with real models on 9 seeded tasks and scores each committed branch with hidden oracle tests, run in the sandbox. The workflow's own verdict is not trusted. A trial is solved when the oracle passes and no protected file, such as the visible test, changed. A green run that is not solved counts as a false accept. Before, only 3 live tests showed real-model behavior, each a single pass/fail.
 
   Three tasks revert one real timu fix at a pinned commit, and the fix's regression tests become the oracle. Hand-written specs left gaps that reviewers objected to in 2 of 3 runs. A real fix's tests encode decisions the author already made.
+
 - A graph file's top-level `[budget]` sets the total for all nodes. Before, the total was fixed at 200 turns and 2M tokens, and a node budget could only lower it. `--dry-run` prints it.
+
 - `timu clean --older-than DAYS` lists old copies, traces and quarantined entries, and `--yes` deletes them.
+
 - `check-fix-review` takes `check_paths`, globs of files a fix may not change. Opt-in over protecting tests by default, because a fix often adds a regression test.
+
 - Agents trim old tool output, as design 14 claimed they did. Before, every message stayed, so a long run ended with a context-length error or used up the token budget. Once a reply reports over 64k input tokens, results older than the last 3 turns become a stub with their size and first line. On a context-length error, all but the last turn's results are trimmed and the turn is retried. `delegate` and `load_skill` results are kept. Trimming at a size rather than every turn leaves short runs' prompt prefix unchanged, so provider prompt caching still applies.
 
 ### Fixed
 
 - A provider error after a reply had begun streaming, such as an OpenRouter 502, failed the run. It was not retried because the retry repeats the text already printed. It is now retried, and the console marks where the reply restarts. Only the retry's text enters the conversation.
+
 - Commands that the coder and graph steps ran left `__pycache__` in the workspace, and timu committed it in repos that do not ignore it. Bytecode now goes to the command's private temp dir, as it already did for the reviewer.
+
 - A run on a copy, or a graph node, failed to commit when the repo gitignored its report, as timu's own warning advises. git refuses an exclude pathspec that names an ignored file. Found by `scripts/sim.py`.
+
 - On macOS, renaming a directory deleted any `.git` inside it, with the repo's history. The post-run scan compares paths, so the moved `.git` looked new. An entry that existed before the command now stays. A new `.git`, `timu.toml` or `.timu` is moved to `~/.local/state/timu/quarantine` instead of deleted, since it may hold commits the command made. If the quarantine lies under a write root, the entry stays in place and the call says so.
+
 - A non-UTF-8 byte in a `git:diff` output aborted the whole graph. An unexpected exception in a workflow now fails only that node.
+
 - `--resume` reused a node after its project gained commits, since the spec hashes the project's path. It now compares the commit, and prints why each other node runs again.
+
 - A trickling model stream or web response could outlast `wall_seconds`, and one Ctrl-C did not interrupt a model call. Socket timeouts apply per read. The agent now abandons a model call on cancel or at the wall limit, and a web response stops after 120 s. An abandoned call's spending is not charged, since the server has not reported it.
+
 - `check-fix-review` missed scripts named without a slash, such as `python check.py`, and `cargo` and `go` manifests.
+
 - A lone surrogate in model text crashed the console. A 429 whose text mentions too many tokens counted as a context overflow and was not retried.
+
 - A graph that sets a `boolean` or `paths` param, such as `network`, from an upstream output now fails to load. An output is a string, which these params reject, so the node failed only when it ran. A Ref for `network` also passed the `trust_upstream` check.
+
 - On macOS, the sandbox's `.git` write rule now matches any case, such as `.GIT`. APFS is case-insensitive by default, and Seatbelt does not document whether a `regex` sees the on-disk case. Before, only the post-run scan caught a new `.GiT`, after the command had written it.
+
 - A role, report or graph error after a model ran now exits 1 and prints the spending and the trace. Before, it exited 2, as a usage error.
 
 ### Security
 
 - A commit now fails if the files changed after the last review. On macOS a process that calls `setsid` outlives `_kill_group`, so it could change an approved tree. The hash covers what a commit would see, not ignored files, and is dropped when a graph command runs after the review.
+
 - A commit now fails if the tree holds a bare git repo layout.
+
 - macOS commands can no longer read the pasteboard. The profile starts from `(allow default)`; other per-user services are not audited.
+
 - The provider no longer follows redirects, and `web_search` drops its key on a cross-origin redirect. urllib copied credentials to the target.
+
 - `timu trace` escapes control characters, as the console already did.
+
 - `search` runs its regex in a killable subprocess with a 30 s limit, and `read` refuses files over 16 MB. Both ran unbounded in timu's own process.
+
 - `~/.local/state/timu` is now mode 0700. Trace files were private, but graph copies followed the umask.
 
 - On Linux, commands can no longer write an existing `.git` below the workspace root, such as a vendored repo's, or create a `.git`, `timu.toml` or `.timu` in the workspace. bwrap protects only the paths it is given, and it was given only the `.git` at each write root. A command could set `core.fsmonitor` in a nested repo's config, or in a repo it created, and git would run it unsandboxed the next time anything ran `git status` there. timu now mounts every existing `.git` under the write roots read-only, removes the entries a command created, and fails the call.
@@ -188,7 +218,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `timu.toml` config for the base URL, key variable, model, and per-role models. `TIMU_BASE_URL` and `TIMU_MODEL` override it.
 
-- Agent Skills (`SKILL.md`, https://agentskills.io/specification). A role names its skills; the system prompt lists each one's name and description; `load_skill` and `read_skill_file` load the rest on demand. The frontmatter parser handles the YAML subset skills use and reports anything else with file and line, which keeps the package free of dependencies.
+- Agent Skills (`SKILL.md`, <https://agentskills.io/specification>). A role names its skills; the system prompt lists each one's name and description; `load_skill` and `read_skill_file` load the rest on demand. The frontmatter parser handles the YAML subset skills use and reports anything else with file and line, which keeps the package free of dependencies.
 
 - `timu run "<objective>"`: the fix-review workflow. A coder changes the code, then a reviewer runs the tests and returns a report whose first line is `VERDICT: APPROVE` or `VERDICT: CHANGES`. Findings go back to the coder, for up to `--max-rounds` rounds. The report goes to `--report` (default `REVIEW.md`). With `--report-mode write`, the reviewer writes it itself and can write nothing else. All agents share one budget, and `--max-cost` caps it. The exit code is 0 when approved, 1 on failure, 2 on a usage error, 3 when the budget runs out, and 130 when interrupted. Traces go to `$XDG_STATE_HOME/timu/runs/`.
 

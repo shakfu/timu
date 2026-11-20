@@ -26,6 +26,7 @@ No role holds network access together with the ability to write files or run com
 A workflow turns one objective into tasks for agents and combines their results. It decides which roles run, in what order, and what passes between them. timu has two kinds (design section 7):
 
 - **Pipeline**: Python code starts agents in a fixed order.
+
 - **Delegation**: a `lead` agent starts other agents with its `delegate` tool, in an order it picks at run time.
 
 The built-in workflows for `timu run`, in `src/timu/workflow.py`:
@@ -66,7 +67,7 @@ To expose it, add a `Workflow` to `WORKFLOWS` in `src/timu/workflow.py`. It name
 
 - A sandbox for the `shell` tool: `sandbox-exec` on macOS, or `bwrap` (bubblewrap) on Linux. Without one, roles that run commands refuse to start unless you pass `--unsafe-no-sandbox`, and timu says why.
 
-  Ubuntu 24.04 and later stop `bwrap` from creating user namespaces (https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces). timu then reports `bwrap cannot create a sandbox here`. An AppArmor profile for `/usr/bin/bwrap` with the `userns` rule allows it; see `docs/dev/bwrap.md`.
+  Ubuntu 24.04 and later stop `bwrap` from creating user namespaces (<https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces>). timu then reports `bwrap cannot create a sandbox here`. An AppArmor profile for `/usr/bin/bwrap` with the `userns` rule allows it; see `docs/dev/bwrap.md`.
 
 - An OpenAI-compatible model API: OpenRouter by default, or a local server such as llama-server. An installed package can add other APIs; see [Providers from packages](#providers-from-packages).
 
@@ -203,11 +204,17 @@ timu graph run graph.toml
 ```
 
 - Each node works on a `git clone --local` copy under `~/.local/state/timu/work/`. Your checkouts are not changed. Uncommitted changes in them are not copied, and timu warns about them.
+
 - timu commits each node's changes on a branch in its copy, as `timu <timu@localhost>`, with your hooks and signing off. Agents cannot commit, and a node whose `HEAD` moved fails. The run prints `git -C <project> fetch <copy> <branch>:<branch>` for each node that changed something.
+
 - If a node does not finish `done`, the nodes that need it are skipped. Other nodes still run.
+
 - Outputs: `toml:FILE#KEY`, `file:GLOB`, `changelog:latest` (the first released section of `CHANGELOG.md`) and `git:diff`. A node also exposes its workflow's results, such as `a.review` or `a.log`.
+
 - `file:GLOB` must match one file. timu copies it out of the copy, and the output is the copy's path. Nodes that need it may read it.
+
 - `${node.output}` may appear only in `params`, and each param is checked against the workflow's schema. Free text reaches a node only through `inputs`.
+
 - Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review with the failure log as an input and checks again. `check_to_fix` and `review_to_fix` allow loops on each edge; both default to 0. Both take `network = true` and `timeout` in seconds per command. `check-fix-review` uses network for its first `check` run only; re-checks run coder-written code, so they run offline. A node with `network = true` below a node that runs a model fails to load unless it sets `trust_upstream = true`. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
 
   ```toml
@@ -227,8 +234,11 @@ timu graph run graph.toml
   ```
 
 - `check-fix-review` fails a fix that changes a file the check runs, such as `Makefile` for `make test`, `conftest.py` or `pyproject.toml` for pytest, or a script the check names. Such an edit can make any tree pass. Set `allow_check_edits = true` in `params` to accept it. Test files are not covered unless you list them: `check_paths = ["tests/*"]` in `params` fails a fix that adds, edits or removes a match.
+
 - `budget = { cost_usd = 1.0 }` on a node, or under `[defaults]`, caps that node's agents. A top-level `[budget]` table sets the total for every node together, by default 200 turns, 400 tool calls, 2,000,000 tokens and 3600 seconds. A node budget cannot exceed it. `--max-cost` caps the whole graph's cost.
+
 - `models = { reviewer = "<model id>" }` on a node sets a role's model for that node, over the user config.
+
 - Several nodes may use one project. A node starts from the branch of its nearest ancestor on that project.
 
 ```sh
@@ -238,6 +248,7 @@ timu graph run --resume <run id> graph.toml  # reuse the nodes that run finished
 ```
 
 - `--max-parallel` runs ready nodes in threads. Console lines then start with the node id. Approval prompts come one at a time, and other nodes' output waits while you answer.
+
 - `--resume` reuses a node that ended `done` in the earlier run, if its definition is unchanged, its `ref` is at the same commit, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again, and timu prints why.
 
 ## Python API
