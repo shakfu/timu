@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- A run warns when 20 or more copies sit under `~/.local/state/timu/work/`, naming `timu clean`. Each `timu run` leaves a copy, and copies may hold unfetched branches, so timu warns rather than deleting them.
+
 - `[provider] type` selects a model client registered by an installed package under the `timu.providers` entry-point group. The provider interface in `timu.provider` (`Provider`, `ProviderSettings`, `ProviderFactory`, `Message`, `Reply`, `ToolCall`, `CONTEXT_OVERFLOW`) is now public API, with its contract in `provider/base.py`. Core stays dependency-free; a separate package can bring the OpenAI and Anthropic SDKs. Entry points over a module path in config, so that installing a package is the trust step and config only names it.
 
 - `timu.api.run` and `timu.api.run_graph` start a run from Python and return an `Outcome`: status, usage, trace, and the copy, branch and report. Events go to a caller's sink, and `approve` and `cancel` replace the terminal prompt and Ctrl-C. Without `approve`, gated content is refused, as without a terminal. The CLI now calls this API, so both share one path.
@@ -69,6 +71,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A role, report or graph error after a model ran now exits 1 and prints the spending and the trace. Before, it exited 2, as a usage error.
 
 ### Security
+
+- A graph `report_path` can no longer be bound to an upstream output. The report is left out of the commit, so an upstream coder that named `src/x.py` dropped the downstream coder's change to it from an approved branch. An absolute report path inside the copy is now skipped by the after-review check as well as the commit; before, only the commit skipped it, so a `done` run failed to seal.
 
 - A commit now fails if the files changed after the last review. On macOS a process that calls `setsid` outlives `_kill_group`, so it could change an approved tree. The hash covers what a commit would see, not ignored files, and is dropped when a graph command runs after the review.
 

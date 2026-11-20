@@ -159,6 +159,8 @@ timu run --workflow lead "add a --json flag to the report command"
 
 A run works on a `git clone --local` copy under `~/.local/state/timu/work/`, so your checkout does not change. timu commits the changes on a branch in the copy and prints the `git fetch` command that brings it back. The copy starts from `HEAD`: uncommitted changes and gitignored files, such as `.env`, are not in it, and timu warns if the checkout is dirty. The reviewer's report goes to `REVIEW.md` in the copy, or `--report PATH`, and timu prints its path. It stays out of the commit. A run fails without committing if the tree holds a bare git repo, or if files change after the last review.
 
+The coder has no network, so it can edit `pyproject.toml` but cannot install or lock. When you know a fix needs a new dependency, use a graph (see Graphs). A `commands` node runs `uv add NAME` with `network = true`. A `check-fix-review` node that `needs` it runs `uv sync` in its first, networked check, so the coder starts with the package installed. A dependency the coder picks itself still needs you to add it.
+
 `--in-place` works in the checkout itself, and is the only choice outside a git repo. Use it only for work you trust. An agent can then plant a repo config, by moving a nested repo or creating a bare one, and git runs that config's commands outside the sandbox when you next run git there.
 
 Useful flags:
@@ -213,7 +215,7 @@ timu graph run graph.toml
 
 - `file:GLOB` must match one file. timu copies it out of the copy, and the output is the copy's path. Nodes that need it may read it.
 
-- `${node.output}` may appear only in `params`, and each param is checked against the workflow's schema. Free text reaches a node only through `inputs`.
+- `${node.output}` may appear only in `params`, and each param is checked against the workflow's schema. `report_path` takes no output. Free text reaches a node only through `inputs`.
 
 - Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review with the failure log as an input and checks again. `check_to_fix` and `review_to_fix` allow loops on each edge; both default to 0. Both take `network = true` and `timeout` in seconds per command. `check-fix-review` uses network for its first `check` run only; re-checks run coder-written code, so they run offline. A node with `network = true` below a node that runs a model fails to load unless it sets `trust_upstream = true`. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
 

@@ -51,6 +51,9 @@ VERDICT = re.compile(
 ReportMode = Literal["return", "write"]
 
 
+RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")  # what new_run_id returns
+
+
 def new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
 
@@ -416,7 +419,11 @@ def tree_hash(workdir: Path, exclude: str = "") -> str | None:
     files = _git_files(workdir)
     if files is None:
         return None
-    skip = os.path.normpath(exclude) if exclude else ""
+    skip = ""
+    if exclude:  # resolved as file_root does, so an absolute path matches too
+        lexical = os.path.join(workdir, exclude)
+        parent = os.path.realpath(os.path.dirname(lexical))
+        skip = os.path.relpath(os.path.join(parent, os.path.basename(lexical)), workdir)
     h = hashlib.sha256()
     for path in files:
         rel = os.path.relpath(path, workdir)
@@ -1090,7 +1097,9 @@ def positive_int(v: Any) -> int:
     return n
 
 
-def string(v: Any) -> str:
+def report_file(v: Any) -> str:
+    """The report path. A graph may not bind it to an output (graph.NO_REF): the file
+    is left out of the commit, so an upstream coder could drop any file from it."""
     if not isinstance(v, str):
         raise ValueError("must be a string")  # noqa: TRY004 - the Param contract
     return v
@@ -1132,7 +1141,7 @@ COMMANDS = Commands()
 
 FIX_PARAMS: Mapping[str, Param] = {
     "review_to_fix": non_negative_int,
-    "report_path": string,
+    "report_path": report_file,
     "report_mode": report_mode,
 }
 
@@ -1169,7 +1178,7 @@ WORKFLOWS = {
             lambda run, obj, o: review_validate_fix(
                 run, obj, skills=o.skills, inputs=o.inputs, **o.params
             ),
-            {"verify_to_fix": non_negative_int, "report_path": string},
+            {"verify_to_fix": non_negative_int, "report_path": report_file},
             ("review",),
         ),
         Workflow(

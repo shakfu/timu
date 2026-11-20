@@ -40,6 +40,7 @@ from timu.role import Role
 from timu.trace import BY, TraceError, cache_note, load, render, totals
 from timu.types import Artifact, Usage
 from timu.workflow import (
+    RUN_ID,
     WORKFLOW_BUDGET,
     WORKFLOWS,
 )
@@ -59,7 +60,6 @@ USAGE_ERROR = 2
 CONTROL = re.compile(
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff]"
 )
-RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{4}")
 # workflow param -> `timu run` argument; a workflow gets the ones it declares
 RUN_PARAMS = {
     "review_to_fix": "review_to_fix",

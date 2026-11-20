@@ -50,6 +50,7 @@ from timu.tool import Tool, state_dir
 from timu.trace import TraceError, load
 from timu.types import Artifact, Budget, Result, Usage
 from timu.workflow import (
+    RUN_ID,
     WORKFLOW_BUDGET,
     WORKFLOWS,
     Options,
@@ -59,6 +60,7 @@ from timu.workflow import (
 )
 
 T = TypeVar("T")
+COPIES_WARN = 20  # copies under the state dir's work/ at which a run warns
 Approve = Callable[[Artifact, Role], bool]
 """approve(artifact, role): may this untrusted artifact reach role?"""
 
@@ -477,12 +479,24 @@ def _execute(
                 "warning",
                 message=f"{why_none()}; roles that run commands will not start",
             )
+        if (n := len(copies())) >= COPIES_WARN:
+            session.emit(
+                "warning",
+                message=f"{n} copies in {state_dir() / 'work'}; "
+                "`timu clean --older-than DAYS` lists old ones",
+            )
         try:
             return body(session), "", session, trace
         except (RoleError, ReportError, GraphError) as e:
             if not (session.used.turns or session.used.tool_calls):
                 raise UsageError(str(e)) from None
             return None, str(e), session, trace
+
+
+def copies() -> list[Path]:
+    """The run copies under the state dir, which only `timu clean` removes."""
+    work = state_dir() / "work"
+    return [p for p in work.glob("*") if RUN_ID.fullmatch(p.name)]
 
 
 def _deny(artifact: Artifact, role: Role) -> bool:

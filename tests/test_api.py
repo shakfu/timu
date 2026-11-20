@@ -70,6 +70,23 @@ def start(workdir: Path, replies: list[Reply], **kw: Any) -> api.Outcome:
     )
 
 
+def test_a_run_warns_when_copies_pile_up(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(api, "COPIES_WARN", 2)
+    work = tmp_path / "state" / "timu" / "work"
+    (work / "20260101-000000-abcd").mkdir(parents=True)
+    (work / "not-a-run").mkdir()
+
+    def warnings() -> list[str]:
+        events: list[Event] = []
+        start(repo, FIX, sink=events.append)
+        return [e.data["message"] for e in events if e.kind == "warning"]
+
+    assert not any("copies in" in w for w in warnings())  # 1 copy, then this run's
+    assert any(w.startswith("2 copies in") and "timu clean" in w for w in warnings())
+
+
 def test_a_run_on_a_copy(repo: Path) -> None:
     events: list[Event] = []
     out = start(repo, FIX, sink=events.append)

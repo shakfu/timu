@@ -57,6 +57,10 @@ timu then reports `bwrap cannot create a sandbox here`, and roles that run comma
 
    A skip line naming `needs bwrap` means the probe still fails. Its reason follows.
 
+## Testing
+
+CI is the gate for the Linux sandbox. Its Ubuntu 24.04 job lifts the restriction on a throwaway runner, so `tests/test_bwrap.py` runs there (`.github/workflows/ci.yml`). Locally, on macOS or a default Ubuntu host, those tests skip. A change to `BwrapSandbox` or `bwrap_args` is verified only once CI passes. A local Linux container was rejected: bwrap there needs relaxed seccomp and AppArmor settings, so it tests a setup unlike a real host.
+
 ## Undo
 
 ```sh

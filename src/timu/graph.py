@@ -38,6 +38,7 @@ from timu.workflow import (
     Session,
     boolean,
     paths,
+    report_file,
 )
 
 ID = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -62,7 +63,7 @@ COMMITTER = (  # the user's identity, signing and hooks play no part in a copy
 DRIVERS = r"^(filter|diff)\..*\.(clean|smudge|process|textconv|command)$"
 GIT_TIMEOUT = 120  # seconds
 STOP_GRACE = 5.0  # seconds running nodes get to stop when the scheduler aborts
-NO_REF = (boolean, paths)  # params whose converter rejects any string, as a Ref yields
+NO_REF = (boolean, paths, report_file)  # params an output may not set
 
 
 class GraphError(ValueError):

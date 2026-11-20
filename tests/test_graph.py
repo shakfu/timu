@@ -171,7 +171,7 @@ BASE = '[nodes.a]\nrepo = "a"\nworkflow = "fix-review"\nobjective = "o"\n'
         (
             (
                 '[nodes.b]\nrepo="b"\nworkflow="fix-review"\nobjective="o"\nneeds=["a"]\n'
-                'params={ report_path = "${a.review}" }\n'
+                'params={ review_to_fix = "${a.review}" }\n'
             ),
             "declared output",
         ),
@@ -844,13 +844,12 @@ def test_network_downstream_of_a_model_is_refused() -> None:
 
 @pytest.mark.parametrize(
     ("param", "value"),
-    [("network", "true"), ("check_paths", '["t/*"]')],
+    [("network", "true"), ("check_paths", '["t/*"]'), ("report_path", '"R.md"')],
 )
-def test_an_output_cannot_set_a_param_that_takes_no_string(
-    param: str, value: str
-) -> None:
+def test_an_output_cannot_set_a_guarded_param(param: str, value: str) -> None:
     """A Ref yields a string. network from one also passed the trust_upstream check,
-    which tests `is True`, and failed only at bind time."""
+    which tests `is True`, and failed only at bind time. report_path is left out of
+    the commit, so an upstream coder could drop a file from it."""
     g = NETWORK.replace(
         'params = { steps = ["true"] }\n',
         'params = { steps = ["true"] }\noutputs = { x = "file:x" }\n',

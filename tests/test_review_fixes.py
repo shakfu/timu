@@ -658,3 +658,20 @@ def test_a_trickling_response_hits_the_total_limit(
         _get(f"http://127.0.0.1:{server.server_port}/", {}, True)
     assert time.monotonic() - start < 5
     server.shutdown()
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_the_review_check_and_the_commit_skip_the_same_report(
+    tmp_path: Path, absolute: bool
+) -> None:
+    """An absolute report path was left out of the commit but not of the reviewed
+    tree, so the two checks disagreed about one file."""
+    src = repo(tmp_path / "src")
+    ws = tmp_path / "ws"
+    base, _ = provision(src, ws, "HEAD", "b")
+    run = session(tmp_path).at(ws)
+    report = str(run.workdir / "a.txt") if absolute else "a.txt"
+    run.mark_reviewed(report)
+    (ws / "a.txt").write_text("VERDICT: APPROVE\n")
+    assert not run.changed_after_review()
+    assert seal(run, run.workdir, base, "b", "m", (report,), "done") == base
