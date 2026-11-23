@@ -33,7 +33,7 @@ The built-in workflows for `timu run`, in `src/timu/workflow.py`:
 
 | Workflow | Kind | Steps |
 |-|-|-|
-| `fix-review` (default) | pipeline | Coder, then reviewer. One of the report's first three non-empty lines is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. |
+| `fix-review` (default) | pipeline | Coder, then reviewer. One of the report's first three non-empty lines is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. `--no-coder-summary` keeps the coder's summary from the reviewer. `--check CMD` runs a command offline after each coder run, before the review; a failure skips the review and fails the run, unless `--check-to-fix N` sends the log back to the coder up to N times. |
 | `research-fix-review` | pipeline | Researcher first. Its findings and source URLs go to the coder as untrusted inputs. Then `fix-review`. |
 | `review-validate-fix` | pipeline | Reviewer, validator, coder, verifier. The reviewer reports findings. The validator confirms or rejects each one. The coder fixes the confirmed ones, most severe first. The verifier checks each fix. `--verify-to-fix N` sends unfixed findings back to the coder up to N times. The report lists every finding with each step's verdict. |
 | `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Every coder result includes a review, which timu runs, not the lead. Delegation depth is at most 2. |
@@ -167,7 +167,7 @@ Useful flags:
 
 - `--max-cost USD` stops the run at a spending limit. All agents share one budget. It needs a server that reports cost, such as OpenRouter; otherwise timu warns and does not enforce it.
 
-- `--approve-untrusted` asks on the terminal before web content reaches the coder, and before a task the lead writes reaches the researcher. It is on by default for `lead`. Without a terminal the answer is no; pass `--no-approve-untrusted` for unattended runs.
+- `--approve-untrusted` asks on the terminal before web content reaches the coder, and before a task the lead writes reaches the researcher. It is on by default for `lead` and `research-fix-review`. Without a terminal the answer is no; pass `--no-approve-untrusted` for unattended runs.
 
 - `-v` shows every tool result.
 
@@ -303,3 +303,5 @@ The live tests are skipped by default. With `TIMU_KEEP_TRACES=tests/fixtures/tra
 uv run python scripts/sim.py run --model <model id> --trials 3   # --dry-run prints the trials and cost ceiling
 uv run python scripts/sim.py summary --out DIR --min-solved 0.8  # exit 1 below the rate
 ```
+
+`--arm check` adds `--check "make test" --review-to-fix 0` to each fix-review task; `--arm check-blind` also adds `--no-coder-summary`. The committed tree is then the coder's, so the summary scores two gates on one tree: `check FA` and `check FR` count the check's false accepts and rejects, `false accept` and `false reject` the check plus the reviewer.

@@ -456,14 +456,23 @@ def fix_review(
     review_to_fix: int = 0,
     report_path: str = "REVIEW.md",
     report_mode: ReportMode = "return",
+    check: Sequence[str] = (),
+    check_to_fix: int = 0,
+    allow_check_edits: bool = False,
+    check_paths: Sequence[str] = (),
+    coder_summary: bool = True,
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
 ) -> Result:
     """Code, then review. On CHANGES, the report goes back to the coder, at most
-    review_to_fix times. The report
-    reaches report_path by the workflow (mode "return") or the reviewer ("write").
-    inputs go to the coder in every round. Raises ReportError if report_path fails
-    the checks in design 4.3."""
+    review_to_fix times. The report reaches report_path by the workflow (mode
+    "return") or the reviewer ("write"). inputs go to the coder in every round.
+
+    check, if given, runs offline after each coder run and before the review. A
+    failing check sends its log back to the coder at most check_to_fix times; the
+    reviewer gets the passing log. A fix that changes a file implementing check fails
+    the run, as in check_fix_review. coder_summary False keeps the coder's summary
+    from the reviewer. Raises ReportError if report_path fails design 4.3."""
     report_file = file_root(run.workdir, report_path)
     if is_gitignored(run.workdir, report_path) is False:
         run.emit("warning", message=f"{report_path} is not gitignored")
@@ -476,6 +485,8 @@ def fix_review(
     review_goal = f"Review the coder's work on this goal:\n\n{objective}"
     if report_mode == "write":
         review_goal += f"\n\nReport path: {report_path}"
+    patterns = (*check_files(check, run.workdir), *check_paths)
+    guarded = snapshot(run.workdir, patterns) if check else {}
 
     def done(status: Status, summary: str, report: Artifact | None = None) -> Result:
         run.emit("workflow_result", status=status, summary=summary)
@@ -483,16 +494,21 @@ def fix_review(
         tainted = any(a.tainted for a in (*artifacts, *inputs))
         return Result(status, summary, artifacts, run.used, run.run_id, tainted)
 
-    findings: Artifact | None = None
-    rounds = review_to_fix + 1
-    for n in range(1, rounds + 1):
+    findings: Artifact | None = None  # the latest review
+    feedback: Artifact | None = None  # what the coder gets next: a review or a log
+    reviews_left, checks_left = review_to_fix, check_to_fix
+    n = 0
+    while True:
+        n += 1
         goal = objective
-        if findings:
+        if feedback and feedback.name == "log":
+            goal += "\n\nThe checks failed after your change. Their output is the log input; make them pass."
+        elif feedback:
             goal += (
                 "\n\nThe reviewer asked for changes. Their report is the review input."
             )
         run.emit("round", n=n, stage="code")
-        given = (*inputs, findings) if findings else inputs
+        given = (*inputs, feedback) if feedback else inputs
         coded = run.run_agent(
             coder, Task(goal, given, "The goal is met and the tests pass.")
         )
@@ -500,6 +516,26 @@ def fix_review(
             return done(
                 coded.status, f"coder stopped in round {n}: {coded.summary}", findings
             )
+
+        evidence: tuple[Artifact, ...] = ()
+        if check:
+            run.emit("round", n=n, stage="check")
+            edited = _edited(run.workdir, guarded, patterns)
+            if edited and not allow_check_edits:
+                return done(
+                    "failed",
+                    f"round {n} changed {', '.join(edited)}, which the check runs; "
+                    "review the change, or set allow_check_edits = true",
+                    findings,
+                )
+            status, summary, log = run_steps(run, check, False, CHECK_TIMEOUT)
+            if status == "failed" and checks_left:
+                checks_left -= 1
+                feedback = log
+                continue
+            if status != "done":
+                return done(status, f"check in round {n}: {summary}", findings)
+            evidence = (log,)
 
         run.emit("round", n=n, stage="review")
         before = _read(report_file)
@@ -511,8 +547,9 @@ def fix_review(
             coded.trace_id,
             coded.untrusted,
         )
+        shown = (work, *evidence) if coder_summary else evidence
         run.mark_reviewed(report_path)
-        reviewed = run.run_agent(reviewer, Task(review_goal, (work,)))
+        reviewed = run.run_agent(reviewer, Task(review_goal, shown))
         if reviewed.status != "done":
             return done(
                 reviewed.status,
@@ -550,7 +587,12 @@ def fix_review(
             return done(
                 "failed", f"the review in round {n} has no VERDICT line", findings
             )
-    return done("failed", f"not approved after {rounds} rounds", findings)
+        if not reviews_left:
+            return done(
+                "failed", f"not approved after {review_to_fix + 1} rounds", findings
+            )
+        reviews_left -= 1
+        feedback = findings
 
 
 def research_fix_review(
@@ -617,6 +659,7 @@ def lead(
 
 
 MAX_LOG = 64 * 1024  # bytes of output kept per command
+CHECK_TIMEOUT = 600  # seconds per command of a fix-review check
 
 
 def run_steps(
@@ -743,6 +786,16 @@ def snapshot(workdir: Path, patterns: Sequence[str]) -> dict[str, str]:
     return hashes
 
 
+def _edited(
+    workdir: Path, before: Mapping[str, str], patterns: Sequence[str]
+) -> list[str]:
+    """The files matching patterns whose hash differs from before."""
+    after = snapshot(workdir, patterns)
+    return sorted(
+        k for k in before.keys() | after.keys() if before.get(k) != after.get(k)
+    )
+
+
 def check_fix_review(
     run: Run,
     objective: str,
@@ -784,10 +837,7 @@ def check_fix_review(
         if fixed.status != "done":
             status, summary = fixed.status, f"fix round {n}: {fixed.summary}"
             break
-        after = snapshot(run.workdir, patterns)
-        edited = sorted(
-            k for k in before.keys() | after.keys() if before.get(k) != after.get(k)
-        )
+        edited = _edited(run.workdir, before, patterns)
         if edited and not allow_check_edits:
             status = "failed"
             summary = (
@@ -1144,6 +1194,14 @@ FIX_PARAMS: Mapping[str, Param] = {
     "report_path": report_file,
     "report_mode": report_mode,
 }
+# fix_review's own check; check-fix-review has its own check params
+CHECK_PARAMS: Mapping[str, Param] = {
+    "check": COMMANDS,
+    "check_to_fix": non_negative_int,
+    "allow_check_edits": boolean,
+    "check_paths": paths,
+    "coder_summary": boolean,
+}
 
 WORKFLOWS = {
     w.name: w
@@ -1156,18 +1214,18 @@ WORKFLOWS = {
             lambda run, obj, o: fix_review(
                 run, obj, skills=o.skills, inputs=o.inputs, **o.params
             ),
-            FIX_PARAMS,
+            {**FIX_PARAMS, **CHECK_PARAMS},
             ("review",),
         ),
         Workflow(
             "research-fix-review",
             "a researcher looks things up on the web first",
             ("coder", "reviewer", "researcher"),
-            False,
+            True,  # web content reaches the coder in every run
             lambda run, obj, o: research_fix_review(
                 run, obj, search=o.search, skills=o.skills, inputs=o.inputs, **o.params
             ),
-            FIX_PARAMS,
+            {**FIX_PARAMS, **CHECK_PARAMS},
             ("review", "research", "sources"),
         ),
         Workflow(

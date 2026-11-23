@@ -1,0 +1,8 @@
+# Trap: dict.fromkeys over lowercased words passes the visible test but loses the
+# original spelling, which the objective requires.
+workflow = "fix-review"
+objective = """make test fails. Fix unique() in words.py. unique(words) removes words that repeat an earlier word, ignoring case, and keeps the rest in their original order and with their original spelling: the first occurrence wins."""
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--review-to-fix", "1"]
+protected = ["test_*.py", "Makefile"]
+max_cost = 0.5

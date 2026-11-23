@@ -454,8 +454,8 @@ RESEARCH_THEN_CODE = [
     [
         ("lead", None, True),  # on by default for lead
         ("lead", "--no-approve-untrusted", False),
-        ("research-fix-review", None, False),  # off by default elsewhere
-        ("research-fix-review", "--approve-untrusted", True),
+        ("research-fix-review", None, True),  # web content always reaches the coder
+        ("research-fix-review", "--no-approve-untrusted", False),
     ],
 )
 def test_gate_default(

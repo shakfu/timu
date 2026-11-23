@@ -545,6 +545,74 @@ def test_review_to_fix_bounds_the_loop(tmp_path: Path) -> None:
     assert result.artifacts[0].content == CHANGES
 
 
+# ---- fix_review with a check (H2 in REVIEW.md) ----
+
+
+def test_a_passing_check_reaches_the_reviewer(tmp_path: Path) -> None:
+    run, provider, events = make_run(tmp_path, [*coder_turn(), text(APPROVE)])
+    result = fix_review(run, "fix", check=["test -f calc.py"])
+    assert (result.status, result.summary) == ("done", "approved in round 1")
+    review_task = provider.requests[2].messages[1].content
+    assert 'name="log" kind="log"' in review_task
+    assert "$ test -f calc.py" in review_task
+    rounds = [e.data["stage"] for e in events if e.kind == "round"]
+    assert rounds == ["code", "check", "review", "verdict"]
+
+
+def test_a_failing_check_skips_the_review(tmp_path: Path) -> None:
+    run, provider, _ = make_run(tmp_path, coder_turn())
+    result = fix_review(run, "fix", check=["false"])
+    assert (result.status, result.summary) == (
+        "failed",
+        "check in round 1: `false` failed: exit 1",
+    )
+    assert len(provider.requests) == 2  # the coder's two turns, no reviewer
+
+
+def test_check_to_fix_sends_the_log_back(tmp_path: Path) -> None:
+    """The check edge has its own limit; review_to_fix stays 0."""
+    replies = [text("tried"), *coder_turn(), text(APPROVE)]
+    run, provider, _ = make_run(tmp_path, replies)
+    result = fix_review(run, "fix", check=["test -f calc.py"], check_to_fix=1)
+    assert (result.status, result.summary) == ("done", "approved in round 2")
+    second_coder_task = provider.requests[1].messages[1].content
+    assert "The checks failed after your change" in second_coder_task
+    assert "[exit 1]" in second_coder_task
+
+
+def test_check_to_fix_bounds_the_check_edge(tmp_path: Path) -> None:
+    run, provider, _ = make_run(tmp_path, [text("tried")] * 3)
+    result = fix_review(run, "fix", check=["false"], check_to_fix=1)
+    assert result.summary == "check in round 2: `false` failed: exit 1"
+    assert len(provider.requests) == 2
+
+
+def test_a_fix_may_not_edit_what_the_check_runs(tmp_path: Path) -> None:
+    (tmp_path / "Makefile").write_text("check:\n\ttest -f fixed.txt\n")
+    replies = [
+        calls(call("write", path="Makefile", content="check:\n\ttrue\n")),
+        text("fixed"),
+        text(APPROVE),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    result = fix_review(run, "fix", check=["make -s check"])
+    assert result.status == "failed"
+    assert result.summary.startswith("round 1 changed Makefile, which the check runs")
+    (tmp_path / "Makefile").write_text("check:\n\ttest -f fixed.txt\n")
+    run, _, _ = make_run(tmp_path, replies)
+    result = fix_review(run, "fix", check=["make -s check"], allow_check_edits=True)
+    assert result.status == "done", result.summary
+
+
+def test_coder_summary_can_be_withheld_from_the_reviewer(tmp_path: Path) -> None:
+    run, provider, _ = make_run(tmp_path, [*coder_turn(), text(APPROVE)])
+    fix_review(run, "fix", check=["true"], coder_summary=False)
+    review_task = provider.requests[2].messages[1].content
+    assert "coder-summary" not in review_task
+    assert "fixed calc.py" not in review_task
+    assert 'name="log"' in review_task
+
+
 def test_missing_verdict_fails(tmp_path: Path) -> None:
     run, _, _ = make_run(tmp_path, [*coder_turn(), text("Looks fine to me.")])
     result = fix_review(run, "fix")

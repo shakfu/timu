@@ -6,6 +6,8 @@ Each task under scripts/sim/tasks/<name>/ holds:
     repo/       the files the agents see, committed to a fresh git repo
     oracle/     hidden tests, copied in only after the run
     solution/   a reference fix; tests check the oracle fails without it and passes with it
+    trap/       optional: a tempting wrong fix that passes the visible tests and fails the
+                oracle, so a check alone accepts it
 
 A task that sets `base` starts instead from that commit of this repo, without
 scripts/sim, overlaid with repo/ and with break.patch applied. The commit is the
@@ -58,6 +60,17 @@ ROOT = Path(__file__).resolve().parents[1]  # the repo whose commits `base` name
 ORACLE_TIMEOUT = 120.0  # seconds
 MAX_OUTPUT = 64 * 1024  # bytes of oracle output kept
 GIT = ["git", "-c", "user.name=sim", "-c", "user.email=sim@localhost"]
+# `timu run` arguments added after a task's own. A check arm runs the visible tests
+# before one review, so the committed tree is the coder's: the oracle scores the
+# check's decision and the reviewer's on the same tree.
+ARMS: Mapping[str, tuple[str, ...]] = {
+    "default": (),
+    "check": ("--check", "make test", "--review-to-fix", "0"),
+    "check-blind": (
+        *("--check", "make test", "--review-to-fix", "0"),
+        "--no-coder-summary",
+    ),
+}
 
 Runner = Callable[[list[str], dict[str, str], float], tuple[int, str]]
 """runner(timu argv, env, timeout) -> (exit code, stderr)."""
@@ -223,6 +236,7 @@ class Trial:
     task: str
     model: str  # the label: --model, or "config" for the user's own models
     n: int
+    arm: str = "default"  # a key of ARMS
     workflow: str = ""
     exit: int | None = None
     status: str = ""  # the workflow_result status
@@ -239,6 +253,9 @@ class Trial:
     solved: bool = False
     false_accept: bool = False  # timu exited 0 but the task is not solved
     false_reject: bool = False  # timu exited non-zero but the task is solved
+    check_passed: bool | None = None  # a check arm's check; None without one
+    check_false_accept: bool = False  # the check passed but the task is not solved
+    check_false_reject: bool = False  # the check failed but the task is solved
     turns: int = 0
     tool_calls: int = 0
     tool_errors: int = 0
@@ -256,7 +273,13 @@ class Trial:
 
     @property
     def key(self) -> str:
-        return f"{self.task}/{self.model}/{self.n}"
+        arm = "" if self.arm == "default" else f"{self.arm}/"
+        return f"{self.task}/{self.model}/{arm}{self.n}"
+
+    @property
+    def label(self) -> str:
+        """The model, and the arm unless it is the default."""
+        return self.model if self.arm == "default" else f"{self.model} [{self.arm}]"
 
 
 def subprocess_runner(
@@ -353,6 +376,7 @@ def run_trial(
         "--no-approve-untrusted",
         "--max-cost", str(task.max_cost),
         *task.args,
+        *ARMS[trial.arm],
         task.objective,
     ]  # fmt: skip
     trial.exit, stderr = runner(argv, run_env, task.timeout)
@@ -390,6 +414,9 @@ def score_outcome(trial: Trial) -> Trial:
     trial.solved = trial.oracle == "pass" and not trial.protected_changed
     trial.false_accept = trial.exit == 0 and not trial.solved
     trial.false_reject = trial.exit != 0 and trial.solved
+    if trial.check_passed is not None:
+        trial.check_false_accept = trial.check_passed and not trial.solved
+        trial.check_false_reject = not trial.check_passed and trial.solved
     if trial.exit != 0 and "provider error:" in trial.summary:
         trial.error = trial.summary
     return trial
@@ -408,6 +435,9 @@ def score_trace(trial: Trial, events: Sequence[Any]) -> None:
             )
         elif e.kind == "round":
             trial.rounds = max(trial.rounds, int(d.get("n", 0)))
+        elif e.kind == "command_result" and trial.arm != "default":
+            passed = d.get("result") == "exit 0"
+            trial.check_passed = passed and trial.check_passed is not False
         elif e.kind == "start" and d.get("model"):
             trial.models.setdefault(e.role, str(d["model"]))
         elif e.kind == "tool_result" and d.get("is_error") is True:
@@ -527,11 +557,12 @@ def summarize(trials: Iterable[Trial]) -> tuple[str, dict[str, Any]]:
     scored = [t for t in trials if not t.error]
     groups: dict[tuple[str, str], list[Trial]] = {}
     for t in scored:
-        groups.setdefault((t.model, t.task), []).append(t)
-        groups.setdefault((t.model, "ALL"), []).append(t)
+        groups.setdefault((t.label, t.task), []).append(t)
+        groups.setdefault((t.label, "ALL"), []).append(t)
     head = (
         "model", "task", "n", "solved", "95% CI", "exit 0", "false accept",
-        "false reject", "protected", "model errors", "cost/trial", "median s", "turns", "tokens",
+        "false reject", "check FA", "check FR", "protected", "model errors",
+        "cost/trial", "median s", "turns", "tokens",
     )  # fmt: skip
     rows, data = [head], {}
     for (model, task), ts in sorted(
@@ -547,6 +578,9 @@ def summarize(trials: Iterable[Trial]) -> tuple[str, dict[str, Any]]:
             "exit0": sum(t.exit == 0 for t in ts) / n,
             "false_accept": sum(t.false_accept for t in ts),
             "false_reject": sum(t.false_reject for t in ts),
+            "check_false_accept": sum(t.check_false_accept for t in ts),
+            "check_false_reject": sum(t.check_false_reject for t in ts),
+            "checked": sum(t.check_passed is not None for t in ts),
             "protected": sum(bool(t.protected_changed) for t in ts),
             "model_errors": sum(t.model_errors > 0 for t in ts),
             "cost": statistics.fmean(t.cost_usd for t in ts),
@@ -558,6 +592,8 @@ def summarize(trials: Iterable[Trial]) -> tuple[str, dict[str, Any]]:
         rows.append((
             model, task, str(n), f"{k}/{n}", f"{lo:.2f}-{hi:.2f}",
             f"{row['exit0']:.0%}", str(row["false_accept"]), str(row["false_reject"]),
+            *((str(row["check_false_accept"]), str(row["check_false_reject"]))
+              if row["checked"] else ("-", "-")),
             str(row["protected"]), str(row["model_errors"]), f"${row['cost']:.3f}", f"{row['median_s']:.0f}",
             f"{row['turns']:.1f}", f"{row['tokens']:.0f}",
         ))  # fmt: skip
@@ -602,13 +638,20 @@ def cmd_run(args: argparse.Namespace, runner: Runner = subprocess_runner) -> int
         )
     }
     out: Path = args.out
+    arms = args.arm or ["default"]
     plan = [
-        (t, m, n) for m in lineups for t in tasks for n in range(1, args.trials + 1)
+        Trial(t.name, m, n, arm)
+        for m in lineups
+        for arm in arms
+        for t in tasks
+        if arm == "default" or "check" in WORKFLOWS[t.workflow].params
+        for n in range(1, args.trials + 1)
     ]
+    by_name = {t.name: t for t in tasks}
     results_path = out / "results.jsonl"
     done = {t.key for t in read_results(results_path) if not t.error}
-    todo = [(t, m, n) for t, m, n in plan if f"{t.name}/{m}/{n}" not in done]
-    ceiling = sum(t.max_cost for t, _, _ in todo)
+    todo = [t for t in plan if t.key not in done]
+    ceiling = sum(by_name[t.task].max_cost for t in todo)
     print(
         f"sim: {len(plan)} trials, {len(plan) - len(todo)} already in {results_path}; "
         f"running {len(todo)}, at most ${ceiling:.2f} if the server reports cost"
@@ -621,7 +664,7 @@ def cmd_run(args: argparse.Namespace, runner: Runner = subprocess_runner) -> int
             return 2
     if args.dry_run:
         for task in tasks:
-            n = sum(t is task for t, _, _ in todo)
+            n = sum(t.task == task.name for t in todo)
             print(
                 f"  {task.name}: {task.workflow}, {n} trials, max ${task.max_cost:.2f} each"
             )
@@ -637,10 +680,10 @@ def cmd_run(args: argparse.Namespace, runner: Runner = subprocess_runner) -> int
     out.chmod(0o700)  # trials hold copies of the workspace and traces
     lock = threading.Lock()
 
-    def one(item: tuple[Task, str, int]) -> Trial:
-        task, name, n = item
-        trial = Trial(task.name, name, n)
-        root = out / "trials" / f"{task.name}-{name.replace('/', '_')}-{n}"
+    def one(trial: Trial) -> Trial:
+        task, name = by_name[trial.task], trial.model
+        arm = "" if trial.arm == "default" else f"{trial.arm}-"
+        root = out / "trials" / f"{task.name}-{name.replace('/', '_')}-{arm}{trial.n}"
         if root.exists():
             shutil.rmtree(root)  # an earlier, unscored attempt
         try:
@@ -773,6 +816,13 @@ def parser() -> argparse.ArgumentParser:
         "--trials", type=int, default=3, help="trials per task and model (default: 3)"
     )
     run.add_argument("--jobs", type=int, default=1, help="trials at once (default: 1)")
+    run.add_argument(
+        "--arm",
+        action="append",
+        choices=list(ARMS),
+        help="extra `timu run` arguments per trial; repeat to compare. A check arm "
+        "runs only tasks whose workflow takes a check (default: default)",
+    )
     run.add_argument(
         "--config",
         type=Path,

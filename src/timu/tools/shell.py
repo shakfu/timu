@@ -9,6 +9,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -26,6 +27,10 @@ EXIT_GRACE = (
     0.3  # seconds to drain output after sh exits, if background jobs hold the pipe
 )
 TERM_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
+# the largest file a command writes, in ulimit -f blocks: 512 bytes in dash, 1024 in
+# bash, so 1 or 2 GiB
+FILE_BLOCKS = 2 * 1024 * 1024
+PROC_HEADROOM = 512  # processes a command may start beyond the user's current count
 
 
 class _Output:
@@ -259,7 +264,7 @@ def _run(
     cancel: threading.Event,
     max_output: int,
 ) -> Ran:
-    argv = sandbox.wrap(["/bin/sh", "-c", cmd], policy)
+    argv = sandbox.wrap(["/bin/sh", "-c", limits() + cmd], policy)
     try:
         proc = subprocess.Popen(
             argv,
@@ -304,6 +309,37 @@ def _run(
         return Ran(out.text(), None, stopped)
     code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
     return Ran(out.text(), code)
+
+
+def limits() -> str:
+    """A /bin/sh prefix that caps file size and process count, so one command cannot
+    fill the disk with one file or fork until the user's processes fail. ulimit sets
+    the hard limit too, so the command cannot raise it. The process limit counts all
+    of the user's processes, so it is the current count plus PROC_HEADROOM. bash names
+    it -u, dash -p. A shell that has neither runs without it."""
+    prefix = f"ulimit -f {FILE_BLOCKS} 2>/dev/null; "
+    if (n := _processes()) is not None:
+        m = n + PROC_HEADROOM
+        prefix += f"{{ ulimit -u {m} || ulimit -p {m}; }} 2>/dev/null; "
+    return prefix
+
+
+def _processes() -> int | None:
+    """What the user's process limit counts, or None if ps fails: processes, and on
+    Linux their threads (getrlimit(2), RLIMIT_NPROC)."""
+    each = ["-L", "-o", "lwp="] if sys.platform.startswith("linux") else ["-o", "pid="]
+    try:
+        r = subprocess.run(
+            ["ps", "-U", str(os.getuid()), *each],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return len(r.stdout.split()) if r.returncode == 0 else None
 
 
 def refusal(ran: Ran, cwd: Path) -> str:

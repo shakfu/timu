@@ -1,0 +1,8 @@
+# Trap: comparing int tuples passes the visible test, but (1, 2, 0) > (1, 2), which
+# the objective says are equal.
+workflow = "fix-review"
+objective = """make test fails. Fix newer() in versions.py. newer(a, b) is True if version a is newer than version b. Versions are dot-separated non-negative integers compared component by component as numbers; a missing component counts as 0, so 1.2 and 1.2.0 are the same version."""
+oracle = "{python} -m unittest discover -p 'oracle_*.py' -q"
+args = ["--review-to-fix", "1"]
+protected = ["test_*.py", "Makefile"]
+max_cost = 0.5

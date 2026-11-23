@@ -24,7 +24,7 @@ from timu.sandbox import MacSandbox, NoSandbox, Policy, Sandbox, detect, mac_pro
 from timu.skills import find
 from timu.tool import state_dir
 from timu.tools.fs import EDIT, READ, WRITE
-from timu.tools.shell import SHELL, Ran, refusal, run_sh
+from timu.tools.shell import FILE_BLOCKS, SHELL, Ran, limits, refusal, run_sh
 
 mac_only = pytest.mark.skipif(
     not isinstance(detect(), MacSandbox), reason="needs macOS sandbox-exec"
@@ -172,6 +172,33 @@ def test_output_and_exit_status(dirs: tuple[Path, Path, Path]) -> None:
 
 def test_signal_exit_status(dirs: tuple[Path, Path, Path]) -> None:
     assert sh(ctx_for(dirs), "kill -TERM $$").text == "[exit 143]"
+
+
+def test_a_command_cannot_write_a_file_past_the_limit(
+    dirs: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("timu.tools.shell.FILE_BLOCKS", 8)  # 4 or 8 KiB
+    out = sh(ctx_for(dirs), "head -c 100000 /dev/zero > big")
+    assert out.is_error
+    assert (dirs[0] / "big").stat().st_size <= 8192
+
+
+def test_a_command_cannot_raise_its_limits(dirs: tuple[Path, Path, Path]) -> None:
+    out = sh(ctx_for(dirs), "ulimit -f unlimited")
+    assert out.is_error, out.text
+
+
+def test_a_command_cannot_fork_without_bound(
+    dirs: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("timu.tools.shell.PROC_HEADROOM", 20)
+    out = sh(ctx_for(dirs), "for i in $(seq 200); do sleep 2 & done")
+    assert "fork" in out.text.casefold(), out.text  # bash and dash both name it
+
+
+def test_without_ps_only_file_size_is_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("timu.tools.shell._processes", lambda: None)
+    assert limits() == f"ulimit -f {FILE_BLOCKS} 2>/dev/null; "
 
 
 def test_bad_arguments(dirs: tuple[Path, Path, Path]) -> None:

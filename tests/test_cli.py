@@ -168,6 +168,31 @@ def test_not_approved_exits_1(tmp_path: Path, repo: Path) -> None:
     assert "not approved after 1 rounds" in err  # no loop unless asked for
 
 
+def test_a_failing_check_exits_1(tmp_path: Path, repo: Path) -> None:
+    code, _, err = cli(
+        tmp_path,
+        ["-C", str(repo), "--unsafe-no-sandbox", "--check", "false", "x"],
+        FIX,
+    )
+    assert code == 1
+    assert "check in round 1: `false` failed: exit 1" in err
+
+
+def test_no_coder_summary_hides_it_from_the_reviewer(
+    tmp_path: Path, repo: Path
+) -> None:
+    provider = FakeProvider([*FIX, text("VERDICT: APPROVE")])
+    code = main(
+        ["run", "--in-place", "--config", str(config(tmp_path)), "-C", str(repo),
+         "--unsafe-no-sandbox", "--no-coder-summary", "x"],
+        provider_for=lambda role: provider,
+        out=io.StringIO(),
+        err=io.StringIO(),
+    )  # fmt: skip
+    assert code == 0
+    assert "make test passes" not in provider.requests[-1].messages[1].content
+
+
 def test_budget_exits_3(tmp_path: Path, repo: Path) -> None:
     replies = [
         Reply("", (call("read", path="calc.py"),), "tool_use", Usage(cost_usd=2.0))
@@ -191,6 +216,9 @@ def test_budget_exits_3(tmp_path: Path, repo: Path) -> None:
             ["--workflow", "review-validate-fix", "--review-to-fix", "1", "x"],
             "does not apply",
         ),
+        (["--workflow", "lead", "--check", "make test", "x"], "does not apply"),
+        (["--check", " ", "x"], "--check must be a non-empty list of commands"),
+        (["--workflow", "lead", "--no-coder-summary", "x"], "does not apply"),
     ],
 )
 def test_usage_errors(tmp_path: Path, argv: list[str], message: str) -> None:

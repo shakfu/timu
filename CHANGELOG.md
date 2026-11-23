@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `fix-review` and `research-fix-review` take a `check`: commands timu runs offline after each coder run, before the review (`--check CMD`). A failing check skips the review; `check_to_fix` sends its log back to the coder. The reviewer gets the passing log. Before, the run was accepted on the reviewer's verdict alone, and the reviewer only reported whether it ran the tests. A fix that edits what the check runs fails the run, as in `check-fix-review`. `coder_summary = false` keeps the coder's summary from the reviewer, to measure whether that summary sways the verdict.
+
+- `scripts/sim.py run --arm` compares `timu run` variants: `check` and `check-blind` (no coder summary) on each fix-review task. A check arm reviews once, so the committed tree is the coder's, and the oracle scores the check's accept against the check-plus-review accept on that tree. This measures what the reviewer adds without a coder-only workflow, which would break the rule that every fix is checked.
+
+- Three sim tasks, `trap-split`, `trap-unique` and `trap-version`, where the tempting fix passes the visible test and fails the oracle. The objective states the full requirement, so a reviewer can reject that fix and a check cannot. In a pilot on the 7 earlier tasks, 21 of 21 trials were solved, and no check ever accepted what the oracle rejected, so those tasks could not show what the reviewer adds. Each task's `trap/` holds the tempting fix, and a test checks that it does trap. On `openai/gpt-6-luna` the coder avoided every trap (15 of 15), so the traps do not yet separate the arms.
+
 - A run warns when 20 or more copies sit under `~/.local/state/timu/work/`, naming `timu clean`. Each `timu run` leaves a copy, and copies may hold unfetched branches, so timu warns rather than deleting them.
 
 - `[provider] type` selects a model client registered by an installed package under the `timu.providers` entry-point group. The provider interface in `timu.provider` (`Provider`, `ProviderSettings`, `ProviderFactory`, `Message`, `Reply`, `ToolCall`, `CONTEXT_OVERFLOW`) is now public API, with its contract in `provider/base.py`. Core stays dependency-free; a separate package can bring the OpenAI and Anthropic SDKs. Entry points over a module path in config, so that installing a package is the trust step and config only names it.
@@ -71,6 +77,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A role, report or graph error after a model ran now exits 1 and prints the spending and the trace. Before, it exited 2, as a usage error.
 
 ### Security
+
+- `research-fix-review` now asks before web content reaches the coder, as `lead` does. It passes research to the coder in every run, and the capability split stops data leaving but not injected code changes. `--no-approve-untrusted` restores the old default.
+
+- Sandboxed commands are capped at 1 or 2 GiB per file and at the user's current process count plus 512. Before, a fork bomb or one runaway file could exhaust the machine within the 600 s timeout. The process cap counts all of the user's processes, and on Linux their threads, so a fixed number would break commands on a busy desktop.
 
 - A graph `report_path` can no longer be bound to an upstream output. The report is left out of the commit, so an upstream coder that named `src/x.py` dropped the downstream coder's change to it from an approved branch. An absolute report path inside the copy is now skipped by the after-review check as well as the commit; before, only the commit skipped it, so a `done` run failed to seal.
 

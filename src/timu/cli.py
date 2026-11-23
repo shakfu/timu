@@ -66,6 +66,9 @@ RUN_PARAMS = {
     "verify_to_fix": "verify_to_fix",
     "report_path": "report",
     "report_mode": "report_mode",
+    "check": "check",
+    "check_to_fix": "check_to_fix",
+    "coder_summary": "coder_summary",
 }
 
 
@@ -198,8 +201,8 @@ def parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         help="ask on the terminal before web content, or a goal written after reading "
         "it, reaches the coder, and before a task the lead writes reaches the "
-        "researcher. Default: on for lead, off otherwise. With no terminal, the answer "
-        "is no",
+        "researcher. Default: on for lead and research-fix-review, off otherwise. "
+        "With no terminal, the answer is no",
     )
     common.add_argument(
         "--config",
@@ -247,6 +250,24 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="how many times a CHANGES verdict goes back to the coder (default: 0)",
+    )
+    run.add_argument(
+        "--check",
+        action="append",
+        metavar="CMD",
+        help="a command timu runs offline after each coder run, before the review; "
+        "repeat for more. The run fails if a fix changes a file the command runs",
+    )
+    run.add_argument(
+        "--check-to-fix",
+        type=int,
+        default=0,
+        help="how many times a failing --check goes back to the coder (default: 0)",
+    )
+    run.add_argument(
+        "--coder-summary",
+        action=argparse.BooleanOptionalAction,
+        help="give the reviewer the coder's summary of its work (default: on)",
     )
     run.add_argument(
         "--verify-to-fix",
@@ -337,6 +358,8 @@ def main(
     given = {}
     for param, attr in RUN_PARAMS.items():
         value, flag = getattr(args, attr), "--" + attr.replace("_", "-")
+        if value is None:  # an unset flag without a default, such as --check
+            continue
         if param not in workflow.params:
             if value != getattr(defaults, attr):
                 err.write(f"timu: {flag} does not apply to {workflow.name}\n")
