@@ -52,6 +52,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The sim's `timu-*` task oracles run the full timu suite, about 30 s idle. On a loaded machine they hit the shared 120 s oracle limit and scored `timeout`. A task can now set `oracle_timeout` in `task.toml`; the `timu-*` tasks set 600 s. A per-task limit over a higher global one keeps a hung oracle on a small fixture capped at 120 s.
+
 - A provider error after a reply had begun streaming, such as an OpenRouter 502, failed the run. It was not retried because the retry repeats the text already printed. It is now retried, and the console marks where the reply restarts. Only the retry's text enters the conversation.
 
 - Commands that the coder and graph steps ran left `__pycache__` in the workspace, and timu committed it in repos that do not ignore it. Bytecode now goes to the command's private temp dir, as it already did for the reviewer.

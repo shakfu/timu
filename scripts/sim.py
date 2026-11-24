@@ -57,7 +57,6 @@ from timu.workflow import WORKFLOWS, verdict
 
 TASKS = Path(__file__).parent / "sim" / "tasks"
 ROOT = Path(__file__).resolve().parents[1]  # the repo whose commits `base` names
-ORACLE_TIMEOUT = 120.0  # seconds
 MAX_OUTPUT = 64 * 1024  # bytes of oracle output kept
 GIT = ["git", "-c", "user.name=sim", "-c", "user.email=sim@localhost"]
 # `timu run` arguments added after a task's own. A check arm runs the visible tests
@@ -87,6 +86,7 @@ class Task:
     protected: tuple[str, ...] = ()  # globs a correct run leaves unchanged
     max_cost: float = 1.0  # USD per trial, passed as --max-cost
     timeout: float = 1800.0  # wall seconds per trial
+    oracle_timeout: float = 120.0  # wall seconds for the oracle
     base: str = ""  # a commit of ROOT to start from, broken by break.patch
 
     def files(self, part: str) -> list[Path]:
@@ -513,7 +513,7 @@ def oracle(task: Task, tree: Path, sandbox: Sandbox) -> tuple[str, str]:
             sandbox=sandbox,
             policy=policy,
             env=scrubbed_env(home),
-            timeout=ORACLE_TIMEOUT,
+            timeout=task.oracle_timeout,
             cancel=threading.Event(),
             max_output=MAX_OUTPUT,
         )

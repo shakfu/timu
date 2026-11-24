@@ -10,3 +10,4 @@ oracle = "make test PYTHON={python} EXTRA=tests/oracle_check_files.py"
 args = ["--review-to-fix", "1"]
 protected = ["Makefile"]
 max_cost = 1.0
+oracle_timeout = 600.0  # the full suite takes ~30 s idle; 120 s timed out under load
