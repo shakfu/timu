@@ -13,7 +13,7 @@
 
   - In 2 runs a wrong `timu-check-files` fix (`sh check.py`) passed the visible tests and the review. `make test` passed it too in the `check` arm.
 
-- Structured output: a `submit_review` tool with a JSON schema in place of the `verdict` regex and the `json_items` fenced-block parser.
+- [ ] Structured output: a `submit_review` tool with a JSON schema in place of the `verdict` regex and the `json_items` fenced-block parser.
 
 ## Medium
 
