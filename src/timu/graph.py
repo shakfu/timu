@@ -14,7 +14,6 @@ import queue
 import re
 import shlex
 import shutil
-import subprocess
 import threading
 import time
 import tomllib
@@ -25,9 +24,12 @@ from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any
 
+from timu import git
 from timu.events import Event
-from timu.report import ReportError, is_gitignored
+from timu.git import GitError
+from timu.report import ReportError
 from timu.role import RoleError
+from timu.roles import CODER
 from timu.types import Artifact, Budget, Origin
 from timu.workflow import (
     WORKFLOW_BUDGET,
@@ -56,14 +58,23 @@ NODE_KEYS = frozenset(
 )
 SEVERITY = ("done", "skipped", "refused", "failed", "budget", "cancelled")
 MAX_OUTPUT = 256 * 1024  # bytes, for one extracted output
-COMMITTER = (  # the user's identity, signing and hooks play no part in a copy
-    *("-c", "user.name=timu", "-c", "user.email=timu@localhost"),
-    *("-c", "commit.gpgsign=false"),
-)
-DRIVERS = r"^(filter|diff)\..*\.(clean|smudge|process|textconv|command)$"
-GIT_TIMEOUT = 120  # seconds
 STOP_GRACE = 5.0  # seconds running nodes get to stop when the scheduler aborts
 NO_REF = (boolean, paths, report_file)  # params an output may not set
+# A planned graph (workflow-proposals.md 2.3) is model output: only workflows that run
+# a model, no command steps, no network, and nothing that picks a base or a model.
+PLANNED_WORKFLOWS = (
+    "fix-review",
+    "reproduce-fix-review",
+    "review-validate-fix",
+    "check-fix-review",
+)
+PLANNED_NODE_KEYS = frozenset(
+    {"repo", "workflow", "objective", "needs", "params", "inputs", "outputs"}
+)
+PLAN_KEYS = frozenset(
+    {"by", "objective", "repos", "check", "untrusted", "run_id"}
+    | {"max_coder_runs", "max_nodes"}
+)
 
 
 class GraphError(ValueError):
@@ -103,9 +114,24 @@ class Node:
 
 
 @dataclass(frozen=True)
+class Plan:
+    """A graph file's [plan] table: a planner wrote the file, so the rules in
+    workflow-proposals.md 2.3 apply while the table is there."""
+
+    objective: str
+    repos: tuple[str, ...]
+    check: tuple[str, ...]
+    untrusted: bool  # the planner read untrusted input; node objectives need approval
+    run_id: str
+    max_coder_runs: int
+    max_nodes: int
+
+
+@dataclass(frozen=True)
 class Graph:
     nodes: Mapping[str, Node]  # in file order
     budget: Budget | None = None  # the total for every node; default WORKFLOW_BUDGET
+    plan: Plan | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +167,8 @@ def load_graph(path: Path) -> Graph:
 
 def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
     """Check raw against graph.md section 4. Raises GraphError naming the key."""
-    _only(raw, {"nodes", "defaults", "budget"}, src)
+    _only(raw, {"nodes", "defaults", "budget", "plan"}, src)
+    plan = _plan(raw, src) if "plan" in raw else None
     defaults = _table(raw, "defaults", src)
     _only(defaults, {"budget"}, f"{src}: defaults")
     default_budget = _budget(defaults, f"{src}: defaults")
@@ -155,7 +182,7 @@ def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
             )
         if not isinstance(t, dict):
             raise GraphError(f"{src}: nodes.{nid} must be a table")
-        _only(t, NODE_KEYS, f"{src}: nodes.{nid}")
+        _only(t, PLANNED_NODE_KEYS if plan else NODE_KEYS, f"{src}: nodes.{nid}")
     nodes = {
         nid: _node(nid, t, tables, default_budget, f"{src}: nodes.{nid}")
         for nid, t in tables.items()
@@ -164,7 +191,7 @@ def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
         TopologicalSorter({n.id: n.needs for n in nodes.values()}).prepare()
     except CycleError as e:
         raise GraphError(f"{src}: cycle: {' -> '.join(e.args[1])}") from None
-    graph = Graph(nodes, _budget(raw, src))
+    graph = Graph(nodes, _budget(raw, src), plan)
     for nid, models in model_ancestors(graph).items():
         node = nodes[nid]
         if models and node.params.get("network") is True and not node.trust_upstream:
@@ -173,7 +200,95 @@ def parse_graph(raw: Mapping[str, Any], src: str = "graph") -> Graph:
                 "model upstream, so its commands could run code a coder wrote with "
                 "network access; set trust_upstream = true to allow it"
             )
+    if plan:
+        _check_plan(graph, plan, src)
     return graph
+
+
+def _plan(raw: Mapping[str, Any], src: str) -> Plan:
+    t = _table(raw, "plan", src)
+    where = f"{src}: plan"
+    _only(t, PLAN_KEYS, where)
+    if t.get("by") != "planner":
+        raise GraphError(f'{where}: by must be "planner"')
+    untrusted = t.get("untrusted", True)  # a table without the flag is not trusted
+    if not isinstance(untrusted, bool):
+        raise GraphError(f"{where}: untrusted must be true or false")
+    limits = []
+    for k in ("max_coder_runs", "max_nodes"):
+        v = t.get(k)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+            raise GraphError(f"{where}: {k} must be a positive integer")
+        limits.append(v)
+    check = _strs(t, "check", where)
+    if not check:
+        raise GraphError(f"{where}: check must list the final check's commands")
+    return Plan(
+        _str(t, "objective", where),
+        _strs(t, "repos", where),
+        check,
+        untrusted,
+        _str(t, "run_id", where, ""),
+        *limits,
+    )
+
+
+def _check_plan(graph: Graph, plan: Plan, src: str) -> None:
+    """The rules for a planned graph (workflow-proposals.md 2.3). Raises GraphError."""
+    for n in graph.nodes.values():
+        where = f"{src}: nodes.{n.id}"
+        if n.workflow not in PLANNED_WORKFLOWS:
+            allowed = ", ".join(PLANNED_WORKFLOWS)
+            raise GraphError(f"{where}: a planned graph may use only {allowed}")
+        if n.params.get("network") is True:
+            raise GraphError(f"{where}: a planned graph may not turn network on")
+        if n.repo not in plan.repos:
+            raise GraphError(f"{where}: repo {n.repo} is not in plan.repos")
+    ancestors = _ancestors(graph)
+    for repo in dict.fromkeys(n.repo for n in graph.nodes.values()):
+        on = [n.id for n in graph.nodes.values() if n.repo == repo]
+        tips = [a for a in on if not any(a in ancestors[b] for b in on)]
+        if len(tips) != 1 or any(
+            a != b and a not in ancestors[b] and b not in ancestors[a]
+            for a in on
+            for b in on
+        ):
+            raise GraphError(
+                f"{src}: nodes on {repo} must form one chain, each needing the last"
+            )
+        tip = graph.nodes[tips[0]]
+        if (
+            tip.workflow != "check-fix-review"
+            or tuple(getattr(tip.params.get("check"), "commands", ())) != plan.check
+        ):
+            raise GraphError(
+                f"{src}: the last node on {repo} must be check-fix-review with "
+                "plan.check"
+            )
+    repos = len({n.repo for n in graph.nodes.values()})
+    if (count := len(graph.nodes) - repos) > plan.max_nodes:
+        raise GraphError(f"{src}: {count} nodes, over plan.max_nodes {plan.max_nodes}")
+    runs = worst_case(graph)
+    if runs is None or runs > plan.max_coder_runs:
+        raise GraphError(
+            f"{src}: worst case {runs} coder runs, over plan.max_coder_runs "
+            f"{plan.max_coder_runs}"
+        )
+
+
+def worst_case(graph: Graph) -> int | None:
+    """The most coder runs graph can make (workflow-proposals.md 2.4), or None if a
+    node has no bound, such as lead, or a count bound to an upstream output."""
+    total = 0
+    for n in graph.nodes.values():
+        runs = WORKFLOWS[n.workflow].runs
+        if runs is None:
+            return None
+        try:
+            total += runs(n.params)
+        except TypeError:
+            return None
+    return total
 
 
 def _ancestors(graph: Graph) -> dict[str, set[str]]:
@@ -415,49 +530,14 @@ def find_project(repo: str, roots: Sequence[Path]) -> Path:
         )
     path = Path(os.path.realpath(found[0]))
     if owner:
-        url = _git(path, "remote", "get-url", "origin").strip()
+        try:
+            url = git.run(path, "remote", "get-url", "origin").strip()
+        except GitError as e:
+            raise GraphError(str(e)) from None
         gm = GITHUB.fullmatch(url)
         if not gm or gm.group(1).lower() != repo.lower():
             raise GraphError(f"{path}: origin is {url}, not github.com/{repo}")
     return path
-
-
-def provision(src: Path, dest: Path, ref: str, branch: str) -> tuple[str, bool]:
-    """Clone src to dest with `git clone --local`, on a new branch at ref. Returns the
-    base commit, and whether src has uncommitted changes (they are not copied).
-    src may be an upstream node's copy."""
-    try:
-        base = _git(
-            src, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"
-        ).strip()
-    except GraphError:
-        raise GraphError(f"{src}: ref {ref!r} is not a commit") from None
-    dirty = bool(_git(src, "status", "--porcelain").strip())
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    _git(
-        dest.parent,
-        "clone",
-        "--local",
-        "--no-checkout",
-        "--quiet",
-        "--",
-        str(src),
-        str(dest),
-    )
-    _git(dest, "checkout", "--quiet", "-b", branch, base)
-    return base, dirty
-
-
-def commit(ws: Path, message: str, exclude: Sequence[str] = ()) -> str:
-    """Commit every change in ws that is not ignored or excluded, as timu. Returns
-    HEAD, unchanged if there was nothing to commit. Only the engine calls this."""
-    # git add fails on a pathspec naming an ignored path, even an exclude; add --all
-    # skips ignored paths anyway
-    skip = [f":(exclude,literal){p}" for p in exclude if not is_gitignored(ws, p)]
-    _git(ws, "add", "--all", "--", ".", *skip)
-    if _git(ws, "diff", "--cached", "--name-only"):
-        _git(ws, *COMMITTER, "commit", "--quiet", "--no-verify", "-m", message)
-    return head(ws)
 
 
 def bare_repos(ws: Path) -> list[str]:
@@ -483,78 +563,20 @@ def seal(
     """Commit a finished workflow's changes on branch in the copy ws and return HEAD.
     Raises GraphError, committing nothing, if an agent committed, if the tree holds a
     bare repo, or if a done workflow's tree changed after its last review."""
-    if _git(ws, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").split() != [
-        base,
-        f"refs/heads/{branch}",
-    ]:
+    try:
+        at = git.run(ws, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").split()
+    except GitError as e:
+        raise GraphError(f"cannot commit: {e}") from None
+    if at != [base, f"refs/heads/{branch}"]:
         raise GraphError("HEAD moved during the workflow; agents may not commit")
     if found := bare_repos(ws):
         raise GraphError(f"cannot commit: bare git repos at {', '.join(found)}")
     if status == "done" and run.changed_after_review():
         raise GraphError("the files changed after the review; a process may still run")
     try:
-        return commit(ws, message, exclude)
-    except GraphError as e:
+        return git.commit(ws, message, exclude)
+    except GitError as e:
         raise GraphError(f"cannot commit: {e}") from None
-
-
-def head(ws: Path) -> str:
-    return _git(ws, "rev-parse", "HEAD").strip()
-
-
-def diff(ws: Path, base: str) -> str:
-    """The commits on ws's branch since base, as a patch."""
-    return _git(ws, "diff", "--binary", "--no-textconv", "--no-ext-diff", base, "HEAD")
-
-
-def _no_drivers(cwd: Path) -> list[str]:
-    """-c options that blank each configured filter and diff driver. The engine runs
-    unsandboxed, and .gitattributes in an agent-written tree selects the driver, which
-    may run a script from that tree. Standard git-lfs filters stay."""
-    r = subprocess.run(
-        ["git", "config", "--get-regexp", DRIVERS],
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT,
-        check=False,
-    )
-    blank = []
-    for line in r.stdout.splitlines():
-        key, _, value = line.partition(" ")
-        if not (key.startswith("filter.lfs.") and value.startswith("git-lfs ")):
-            blank += ["-c", f"{key}="]
-    return blank
-
-
-def _git(cwd: Path, *args: str, ok: tuple[int, ...] = (0,)) -> str:
-    try:
-        r = subprocess.run(
-            [
-                *(
-                    "git",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                ),
-                *_no_drivers(cwd),
-                *args,
-            ],
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",  # a diff may hold any bytes
-            timeout=GIT_TIMEOUT,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise GraphError(f"git {args[0]} in {cwd}: {e}") from None
-    if r.returncode not in ok:
-        raise GraphError(f"git {args[0]} in {cwd}: {r.stderr.strip() or r.returncode}")
-    return r.stdout
 
 
 # ---- outputs ----
@@ -603,7 +625,7 @@ def extract(spec: str, ws: Path, base: str, files: Path | None = None) -> str:
         return str(value)
     if spec == "changelog:latest":
         return _latest_release(_read(ws, "CHANGELOG.md"))
-    text = diff(ws, base)
+    text = git.diff(ws, base)
     if len(text.encode()) > MAX_OUTPUT:
         raise GraphError(f"the diff is larger than {MAX_OUTPUT} bytes")
     return text
@@ -676,6 +698,7 @@ def run_graph(
     are done; if one is not, the node is skipped. options.params and inputs are
     replaced per node. A node in prior is not run again: its result is reused."""
     prior = prior or {}
+    ask = graph.plan is not None and graph.plan.untrusted
     order = list(graph.nodes)
     parents = chains(graph, projects)
     ts = TopologicalSorter({n.id: n.needs for n in graph.nodes.values()})
@@ -690,7 +713,9 @@ def run_graph(
             return prior[nid]
         parent = results[p] if (p := parents[nid]) else None
         node = graph.nodes[nid]
-        return _run_node(session, node, results, projects[nid], parent, work, options)
+        return _run_node(
+            session, node, results, projects[nid], parent, work, options, ask
+        )
 
     def in_thread(nid: str) -> None:
         try:
@@ -806,7 +831,7 @@ def resumable(
             continue
         try:
             workdir = Path(d["workdir"])
-            if head(workdir) != d["head"]:
+            if git.head(workdir) != d["head"]:
                 why_not[nid] = "its copy has moved"
                 continue
             outputs = {
@@ -841,9 +866,10 @@ def _same_base(project: Path, ref: str, base: Any) -> bool:
     """Whether ref in project is still the commit an earlier run started from."""
     try:
         return bool(
-            _git(project, "rev-parse", "--verify", f"{ref}^{{commit}}").strip() == base
+            git.run(project, "rev-parse", "--verify", f"{ref}^{{commit}}").strip()
+            == base
         )
-    except GraphError:
+    except GitError:
         return False
 
 
@@ -870,8 +896,10 @@ def _run_node(
     parent: NodeResult | None,
     work: Path,
     options: Options,
+    ask: bool = False,
 ) -> NodeResult:
-    """Run node on a copy of project, or of parent's copy if parent is set."""
+    """Run node on a copy of project, or of parent's copy if parent is set. ask: the
+    objective is model text that read untrusted input, so it needs approval."""
     if session.cancel.is_set():
         return NodeResult("cancelled", "not started")
     if blocked := [d for d in node.needs if results[d].status != "done"]:
@@ -885,8 +913,8 @@ def _run_node(
     )
     try:
         params = _bind(node, results)
-        base, dirty = provision(src, ws, ref, branch)
-    except GraphError as e:
+        base, dirty = git.provision(src, ws, ref, branch)
+    except (GraphError, GitError) as e:
         return NodeResult("failed", str(e))
     files = work / "_files" / node.id  # no node id starts with _
     reads = tuple(sorted({f for d in node.needs if (f := results[d].files)}))
@@ -910,6 +938,19 @@ def _run_node(
             head=base,
         )
     inputs = tuple(results[d].outputs[out] for d, out in node.inputs)
+    if ask:
+        goal = Artifact(
+            "objective", node.objective, "goal", Origin.AGENT, node.id, True
+        )
+        if refused := run.ask(goal, CODER):
+            return NodeResult(
+                "refused",
+                refused,
+                workdir=run.workdir,
+                branch=branch,
+                base=base,
+                head=base,
+            )
     exclude = (
         (params.get("report_path", "REVIEW.md"),) if "report_path" in wf.params else ()
     )
@@ -936,7 +977,7 @@ def _run_node(
         for name, extractor in node.outputs.items():
             try:
                 content = extract(extractor, run.workdir, base, files)
-            except (GraphError, OSError) as e:
+            except (GraphError, GitError, OSError) as e:
                 status, summary = "failed", f"output {name}: {e}"
                 break
             outputs[name] = Artifact(

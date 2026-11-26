@@ -15,8 +15,11 @@
                                          # server that reports no cost; the cache
                                          # rates are optional
 
-For a type from a package, base_url and api_key_env default to "": the package's
-own defaults apply.
+type = "anthropic" (Messages API) and type = "openai" (Responses API) are built in
+and use the official SDKs, from `uv tool install 'timu[extras]'`. They check
+ANTHROPIC_API_KEY and OPENAI_API_KEY by default; base_url defaults to the SDK's. For
+a type from a package, base_url and api_key_env default to "": the package's own
+defaults apply. api_key_env = "" also lets an SDK find its own credentials.
 
     [providers.anthropic]                # optional; named, with [provider]'s keys
     type = "anthropic"
@@ -67,6 +70,13 @@ from timu.tools.web import web_search_tool
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_KEY_ENV = "OPENROUTER_API_KEY"
+# The key variable each built-in type checks by default. A package's type gets "",
+# and its own default applies. The SDK types' base_url defaults to the SDK's.
+KEY_ENVS = {
+    BUILTIN: DEFAULT_KEY_ENV,
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
 
 
 class ConfigError(ValueError):
@@ -292,15 +302,14 @@ def provider_config(prov: Mapping[str, Any], src: str) -> ProviderConfig:
     _only(prov, KEYS["provider"], src)
     kind = _get(prov, "type", str, BUILTIN, src)
     builtin = kind == BUILTIN
+    key_env = KEY_ENVS.get(kind, "")
     timeout = float(_get(prov, "timeout", (int, float), 600, src))
     if not 0 < timeout < math.inf:  # also rejects nan
         raise ConfigError(f"{src}: timeout must be positive and finite")
     return ProviderConfig(
         type=kind,
         base_url=_get(prov, "base_url", str, DEFAULT_BASE_URL if builtin else "", src),
-        api_key_env=_get(
-            prov, "api_key_env", str, DEFAULT_KEY_ENV if builtin else "", src
-        ),
+        api_key_env=_get(prov, "api_key_env", str, key_env, src),
         api_key_file=_path(prov, "api_key_file", src),
         model=_get(prov, "model", str, "", src),
         timeout=timeout,

@@ -14,15 +14,17 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
+from timu import git
 from timu.agent import Agent
 from timu.events import Event, EventSink
+from timu.git import GitError
 from timu.provider.base import Provider
-from timu.report import ReportError, file_root, is_gitignored, write_report
+from timu.report import ReportError, file_root, write_report
 from timu.role import Role
 from timu.roles import (
     CODER,
@@ -30,14 +32,15 @@ from timu.roles import (
     LEAD,
     REVIEWER,
     REVIEWER_WRITE,
+    SELECTOR,
+    TESTER,
     VALIDATOR,
     VERIFIER,
     researcher,
     with_skills,
 )
 from timu.sandbox import Policy, Sandbox
-from timu.tool import PROTECTED, DelegateError, Tool
-from timu.tools.fs import _git_files
+from timu.tool import PROTECTED, DelegateError, Tool, state_dir
 from timu.tools.shell import refusal, run_sh, scrubbed_env
 from timu.tools.web import WEB_FETCH
 from timu.types import Artifact, Budget, Capability, Origin, Result, Status, Task, Usage
@@ -196,11 +199,29 @@ class Run:
             set()
         )  # agents that received an untrusted child result
         self._reviewed: tuple[str, str] | None = None  # (tree hash, report path)
+        self.parent: Run | None = None  # a view's Run, which it also charges
+        self.scope = "node"  # names this Run's budget when it runs out
 
     def at(self, workdir: Path, roles: Mapping[str, Role] | None = None) -> Run:
         """A Run on workdir in the same session. Delegate inputs and roles are not
         shared, so agents on one workdir cannot name results from another."""
         return self.session.at(workdir, roles)
+
+    def view(self, workdir: Path, budget: Budget | None = None) -> Run:
+        """A Run on workdir whose agents also charge this Run and stay within its
+        budgets; budget, if given, caps them together."""
+        child = Run.__new__(Run)
+        child._bind(
+            self.session,
+            workdir,
+            self.roles,
+            self.node,
+            budget,
+            self.reads,
+            self.models,
+        )
+        child.parent, child.scope = self, "candidate"
+        return child
 
     @property
     def run_id(self) -> str:
@@ -262,8 +283,28 @@ class Run:
         tree, report_path = self._reviewed
         return tree_hash(self.workdir, report_path) != tree
 
+    def affords(self, want: Usage, seconds: float) -> bool:
+        """Whether every budget over this Run has want and seconds left."""
+        for _scope, b, used, elapsed in self._caps():
+            short = (
+                b.turns - used.turns < want.turns
+                or b.tool_calls - used.tool_calls < want.tool_calls
+                or b.tokens - used.tokens < want.tokens
+                or b.wall_seconds - elapsed < seconds
+                or (
+                    b.cost_usd is not None
+                    and b.cost_usd - used.cost_usd < want.cost_usd
+                )
+            )
+            if short:
+                return False
+        return True
+
     def _charge(self, delta: Usage) -> None:
         self.used += delta
+        if self.parent is not None:
+            self.parent._charge(delta)
+            return
         with self.session.lock:
             self.session.used += delta
 
@@ -271,9 +312,13 @@ class Run:
         """(scope, budget, used, elapsed) for the session and, if capped, this Run."""
         s = self.session
         now = s.clock()
-        caps = [("workflow", s.budget, s.used, now - s.start)]
+        caps = (
+            self.parent._caps()
+            if self.parent is not None
+            else [("workflow", s.budget, s.used, now - s.start)]
+        )
         if self.budget is not None:
-            caps.append(("node", self.budget, self.used, now - self._start))
+            caps.append((self.scope, self.budget, self.used, now - self._start))
         return caps
 
     def _exhausted(self, turns: bool = True) -> str | None:
@@ -382,6 +427,24 @@ class Run:
                 approved.add(a)
         return None
 
+    def ask(self, artifact: Artifact, role: Role) -> str | None:
+        """Why artifact may not reach role, or None. Asks the session's approve once
+        per artifact; with the gate off, nothing is asked."""
+        ses = self.session
+        if ses.approve is None:
+            return None
+        with ses.approval_lock:
+            if artifact in ses.approved:
+                return None
+            ok = ses.approve(artifact, role)
+            self.emit("approval", artifact=artifact.name, role=role.name, approved=ok)
+            if not ok:
+                return (
+                    f"untrusted input {artifact.name} was not approved for {role.name}"
+                )
+            ses.approved.add(artifact)
+        return None
+
     def _child_budget(self, want: Budget) -> Budget | None:
         """The smaller of want and each remainder; None if one is spent."""
         return self._limit(want)[0]
@@ -416,7 +479,7 @@ def _remainder(want: Budget, b: Budget, u: Usage, elapsed: float) -> Budget | No
 def tree_hash(workdir: Path, exclude: str = "") -> str | None:
     """A hash of what a commit under workdir would see: paths, and file contents or link
     targets, without ignored files and exclude. None outside a git repo."""
-    files = _git_files(workdir)
+    files = git.files(workdir)
     if files is None:
         return None
     skip = ""
@@ -449,6 +512,28 @@ def verdict(report: str) -> str | None:
     return None
 
 
+TIMING = re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds)\b")
+
+
+def _same_log(a: Artifact, b: Artifact, workdir: Path) -> bool:
+    """Whether two check logs match once timings and the workdir path are removed."""
+
+    def norm(text: str) -> str:
+        return TIMING.sub("<t>", text.replace(str(workdir), "<w>"))
+
+    return norm(a.content) == norm(b.content)
+
+
+def _less(a: Usage, b: Usage) -> Usage:
+    """a - b, field by field."""
+    return Usage(*(getattr(a, f.name) - getattr(b, f.name) for f in fields(Usage)))
+
+
+def _most(a: Usage, b: Usage) -> Usage:
+    """The larger of a and b in each field."""
+    return Usage(*(max(getattr(a, f.name), getattr(b, f.name)) for f in fields(Usage)))
+
+
 def fix_review(
     run: Run,
     objective: str,
@@ -461,20 +546,29 @@ def fix_review(
     allow_check_edits: bool = False,
     check_paths: Sequence[str] = (),
     coder_summary: bool = True,
+    timeout: float = 600,
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
+    failed_check: Artifact | None = None,
+    review_inputs: tuple[Artifact, ...] = (),
+    first: Result | None = None,
 ) -> Result:
     """Code, then review. On CHANGES, the report goes back to the coder, at most
     review_to_fix times. The report reaches report_path by the workflow (mode
     "return") or the reviewer ("write"). inputs go to the coder in every round.
 
     check, if given, runs offline after each coder run and before the review. A
-    failing check sends its log back to the coder at most check_to_fix times; the
-    reviewer gets the passing log. A fix that changes a file implementing check fails
-    the run, as in check_fix_review. coder_summary False keeps the coder's summary
-    from the reviewer. Raises ReportError if report_path fails design 4.3."""
+    failing check sends its log back to the coder at most check_to_fix times, with
+    the unanswered review, if any; the reviewer gets the passing log. A fix that
+    changes a file implementing check (check_files) or matching check_paths fails
+    the run, unless allow_check_edits. timeout is per check command. coder_summary
+    False keeps the coder's summary from the reviewer. failed_check is a check log
+    the first coder run starts from; review_inputs go to the reviewer in every round.
+    first is a coder result already in the workdir, which round 1 checks and reviews
+    instead of running the coder. The result holds the report and the latest check
+    log. Raises ReportError if report_path fails design 4.3."""
     report_file = file_root(run.workdir, report_path)
-    if is_gitignored(run.workdir, report_path) is False:
+    if git.is_ignored(run.workdir, report_path) is False:
         run.emit("warning", message=f"{report_path} is not gitignored")
     skills = skills or {}
     coder = with_skills(CODER, skills.get("coder", ()))
@@ -485,57 +579,79 @@ def fix_review(
     review_goal = f"Review the coder's work on this goal:\n\n{objective}"
     if report_mode == "write":
         review_goal += f"\n\nReport path: {report_path}"
-    patterns = (*check_files(check, run.workdir), *check_paths)
-    guarded = snapshot(run.workdir, patterns) if check else {}
+    checker = Check(run, check, check_paths, allow_check_edits, timeout)
+
+    seen = (*inputs, failed_check) if failed_check else inputs
+    findings: Artifact | None = None  # the latest review, CHANGES until it returns
+    log = failed_check  # the failing check's log, for the next coder run
+    latest = failed_check  # the latest check log, for the result
 
     def done(status: Status, summary: str, report: Artifact | None = None) -> Result:
         run.emit("workflow_result", status=status, summary=summary)
-        artifacts = (report,) if report else ()
-        tainted = any(a.tainted for a in (*artifacts, *inputs))
+        artifacts = tuple(a for a in (report, latest) if a)
+        tainted = any(a.tainted for a in (*artifacts, *seen))
         return Result(status, summary, artifacts, run.used, run.run_id, tainted)
 
-    findings: Artifact | None = None  # the latest review
-    feedback: Artifact | None = None  # what the coder gets next: a review or a log
     reviews_left, checks_left = review_to_fix, check_to_fix
+    largest, longest = Usage(), 0.0  # the most one round has used
+    used, started = run.used, run.session.clock()
     n = 0
     while True:
         n += 1
+        if n > 1:  # stop early when another round cannot help (proposals 6)
+            largest = _most(largest, _less(run.used, used))
+            longest = max(longest, run.session.clock() - started)
+            if not run.affords(largest, longest):
+                return done(
+                    "budget",
+                    f"round {n} not started: less budget is left than a round used",
+                    findings,
+                )
+            used, started = run.used, run.session.clock()
+        tree = tree_hash(run.workdir, report_path) if n > 1 else None
         goal = objective
-        if feedback and feedback.name == "log":
-            goal += "\n\nThe checks failed after your change. Their output is the log input; make them pass."
-        elif feedback:
+        if log:
+            goal += (
+                "\n\nThe checks failed. Their output is the log input; make them pass."
+            )
+        if findings:
             goal += (
                 "\n\nThe reviewer asked for changes. Their report is the review input."
             )
-        run.emit("round", n=n, stage="code")
-        given = (*inputs, feedback) if feedback else inputs
-        coded = run.run_agent(
-            coder, Task(goal, given, "The goal is met and the tests pass.")
-        )
+        given = (*inputs, *(a for a in (findings, log) if a))
+        if n == 1 and first is not None:
+            coded = first
+        else:
+            run.emit("round", n=n, stage="code")
+            coded = run.run_agent(
+                coder, Task(goal, given, "The goal is met and the tests pass.")
+            )
         if coded.status != "done":
             return done(
                 coded.status, f"coder stopped in round {n}: {coded.summary}", findings
             )
+        if tree is not None and tree == tree_hash(run.workdir, report_path):
+            return done("failed", f"round {n} made no change", findings)
 
         evidence: tuple[Artifact, ...] = ()
         if check:
-            run.emit("round", n=n, stage="check")
-            edited = _edited(run.workdir, guarded, patterns)
-            if edited and not allow_check_edits:
-                return done(
-                    "failed",
-                    f"round {n} changed {', '.join(edited)}, which the check runs; "
-                    "review the change, or set allow_check_edits = true",
-                    findings,
-                )
-            status, summary, log = run_steps(run, check, False, CHECK_TIMEOUT)
+            status, summary, ran = checker(n)
+            if ran is None:
+                return done(status, summary, findings)
             if status == "failed" and checks_left:
+                if latest and _same_log(ran, latest, run.workdir):
+                    return done(
+                        "failed",
+                        f"check in round {n} failed with the same output as before",
+                        findings,
+                    )
                 checks_left -= 1
-                feedback = log
+                log = latest = ran
                 continue
+            latest = ran
             if status != "done":
                 return done(status, f"check in round {n}: {summary}", findings)
-            evidence = (log,)
+            log, evidence = None, (ran,)
 
         run.emit("round", n=n, stage="review")
         before = _read(report_file)
@@ -547,7 +663,7 @@ def fix_review(
             coded.trace_id,
             coded.untrusted,
         )
-        shown = (work, *evidence) if coder_summary else evidence
+        shown = (*review_inputs, *((work,) if coder_summary else ()), *evidence)
         run.mark_reviewed(report_path)
         reviewed = run.run_agent(reviewer, Task(review_goal, shown))
         if reviewed.status != "done":
@@ -592,7 +708,264 @@ def fix_review(
                 "failed", f"not approved after {review_to_fix + 1} rounds", findings
             )
         reviews_left -= 1
-        feedback = findings
+
+
+def reproduce_fix_review(
+    run: Run,
+    objective: str,
+    *,
+    check: Sequence[str],
+    test_paths: Sequence[str] = ("tests",),
+    check_to_reproduce: int = 0,
+    timeout: float = 600,
+    skills: Mapping[str, tuple[str, ...]] | None = None,
+    inputs: tuple[Artifact, ...] = (),
+    **fix: Any,
+) -> Result:
+    """check must pass; a tester adds files under test_paths that make it fail; then
+    fix_review runs with the same check, and the new files join check_paths, so the
+    coder cannot change them (workflow-proposals.md 1). A check that still passes
+    after the tester goes back to it at most check_to_reproduce times. fix takes
+    fix_review's other keyword arguments."""
+    tester = with_skills(
+        replace(TESTER, write_roots=tuple(test_paths)), (skills or {}).get("tester", ())
+    )
+
+    def stop(status: Status, summary: str, *artifacts: Artifact) -> Result:
+        run.emit("workflow_result", status=status, summary=summary)
+        tainted = any(a.tainted for a in (*inputs, *artifacts))
+        return Result(status, summary, artifacts, run.used, run.run_id, tainted)
+
+    run.emit("round", n=0, stage="baseline")
+    status, summary, log = run_steps(run, check, False, timeout)
+    if status == "failed":  # a failing suite gives no fail-then-pass signal
+        return stop("failed", f"the check fails before any change: {summary}", log)
+    if status != "done":
+        return stop(status, f"baseline check: {summary}", log)
+
+    for p in test_paths:  # made here, so the sandbox can mount a new directory
+        path = Path(os.path.realpath(run.workdir / p))
+        if not path.is_relative_to(run.workdir) or any(
+            part.casefold() == ".git" for part in path.relative_to(run.workdir).parts
+        ):
+            return stop("failed", f"test path {p} must be inside the workdir")
+        path.mkdir(parents=True, exist_ok=True)
+    patterns = ["*" if p in ("", ".") else p.rstrip("/") + "/*" for p in test_paths]
+    before = snapshot(run.workdir, patterns)
+    where = ", ".join(test_paths)
+    goal = (
+        f"{objective}\n\nAdd tests, as new files under {where}, that fail now because "
+        "this goal is not met, and pass once it is. Do not change existing files or "
+        "the code under test."
+    )
+    feedback: Artifact | None = None
+    left, n = check_to_reproduce, 0
+    while True:
+        n += 1
+        run.emit("round", n=n, stage="reproduce")
+        tested = run.run_agent(
+            tester,
+            Task(
+                goal
+                + (
+                    "\n\nThe checks still pass with your tests. Their output is "
+                    "the log input; make the tests fail for the reason the goal states."
+                    if feedback
+                    else ""
+                ),
+                (*inputs, *((feedback,) if feedback else ())),
+                "The new tests fail on the current code because the goal is not met.",
+            ),
+        )
+        if tested.status != "done":
+            return stop(tested.status, f"tester stopped in round {n}: {tested.summary}")
+        after = snapshot(run.workdir, patterns)
+        if changed := sorted(k for k in before if after.get(k) != before[k]):
+            return stop(
+                "failed", f"the tester changed {', '.join(changed)}; it may only add"
+            )
+        added = sorted(set(after) - set(before))
+        if not added:
+            return stop("failed", f"the tester added no files under {where}")
+        run.emit("round", n=n, stage="confirm")
+        status, summary, log = run_steps(run, check, False, timeout)
+        if status == "failed":
+            break
+        if status != "done":
+            return stop(status, f"check after the tester in round {n}: {summary}", log)
+        if not left:
+            return stop(
+                "failed", f"the check passes with the new tests: {summary}", log
+            )
+        left -= 1
+        feedback = log
+
+    reproduction = Artifact(
+        "reproduction",
+        f"A tester added {', '.join(added)} before the fix, and the coder could not "
+        "change them. Check that they test what the goal asks. The check with them, "
+        f"before the fix:\n\n{log.content}",
+        "log",
+        Origin.AGENT,
+        tested.trace_id,
+        tested.untrusted,
+    )
+    return fix_review(
+        run,
+        objective,
+        check=check,
+        timeout=timeout,
+        check_paths=(*fix.pop("check_paths", ()), *added),
+        skills=skills,
+        inputs=inputs,
+        failed_check=log,
+        review_inputs=(reproduction,),
+        **fix,
+    )
+
+
+def parse_choice(text: str, ids: Sequence[str]) -> str:
+    """The candidate id a selector chose. Raises ProtocolError."""
+    items = json_items(text, "choice", ("id", "reason"))
+    if len(items) != 1 or items[0]["id"] not in ids:
+        raise ProtocolError(f"choose exactly one of {', '.join(ids)}")
+    return items[0]["id"]
+
+
+def best_of_n(
+    run: Run,
+    objective: str,
+    *,
+    check: Sequence[str],
+    n: int = 3,
+    stop_after: int | None = None,
+    models: Sequence[str] = (),
+    allow_check_edits: bool = False,
+    check_paths: Sequence[str] = (),
+    timeout: float = 600,
+    skills: Mapping[str, tuple[str, ...]] | None = None,
+    inputs: tuple[Artifact, ...] = (),
+    **fix: Any,
+) -> Result:
+    """Up to n coders, one after another, each on its own clone of the workdir's HEAD
+    with an equal share of the budget; stop once stop_after (default n) pass check. A
+    selector picks one of those that passed; its change is applied to the workdir,
+    then fix_review checks and reviews it (workflow-proposals.md 4). models, if
+    given, are the coders' models in turn. fix takes fix_review's other keyword
+    arguments."""
+    skills = skills or {}
+    coder = with_skills(CODER, skills.get("coder", ()))
+    selector = with_skills(SELECTOR, skills.get("selector", ()))
+    want = n if stop_after is None else min(stop_after, n)
+
+    def stop(status: Status, summary: str) -> Result:
+        run.emit("workflow_result", status=status, summary=summary)
+        tainted = any(a.tainted for a in inputs)
+        return Result(status, summary, (), run.used, run.run_id, tainted)
+
+    try:
+        base = git.head(run.workdir)
+        dirty = git.run(run.workdir, "status", "--porcelain").strip()
+    except GitError:
+        return stop("failed", "best-of-n needs a git repo with a commit")
+    if dirty:  # a clone starts from HEAD, so it would not see these changes
+        return stop("failed", "best-of-n needs a clean tree; commit first")
+    left, scope = run._limit(run.session.budget)
+    if left is None:
+        return stop("budget", f"{scope} budget exhausted")
+    k = n + 1  # n candidates and the review share what is left
+    share = Budget(
+        turns=max(1, left.turns // k),
+        tool_calls=max(1, left.tool_calls // k),
+        tokens=max(1, left.tokens // k),
+        cost_usd=None if left.cost_usd is None else left.cost_usd / k,
+        wall_seconds=left.wall_seconds / k,
+    )
+    root = state_dir() / "work" / run.run_id / "candidates" / (run.node or "run")
+    passed: list[tuple[str, Path, str, Result]] = []  # id, copy, branch, coder result
+    dropped: list[str] = []
+    for i in range(1, n + 1):
+        if len(passed) >= want or run.session.cancel.is_set():
+            break
+        cid, dest = f"c{i}", root / f"c{i}"
+        branch = f"timu/{run.run_id}/{cid}"
+        run.emit("round", n=i, stage="candidate")
+        try:
+            git.provision(run.workdir, dest, base, branch)
+        except GitError as e:
+            return stop("failed", f"cannot copy the workdir for {cid}: {e}")
+        cand = run.view(dest, share)
+        if models:
+            cand.models["coder"] = models[(i - 1) % len(models)]
+        checker = Check(cand, check, check_paths, allow_check_edits, timeout)
+        coded = cand.run_agent(
+            coder, Task(objective, inputs, "The goal is met and the tests pass.")
+        )
+        if coded.status != "done":
+            dropped.append(f"{cid} coder {coded.status}")
+            continue
+        status, summary, _log = checker(i)
+        if status != "done":
+            dropped.append(f"{cid}: {summary}")
+            continue
+        git.commit(dest, f"timu {cid}: {objective.splitlines()[0][:60]}")
+        passed.append((cid, dest, branch, coded))
+    if run.session.cancel.is_set():
+        return stop("cancelled", "cancelled while running candidates")
+    if not passed:
+        return stop("failed", f"no candidate passed the check: {'; '.join(dropped)}")
+
+    chosen = passed[0]
+    if len(passed) > 1:
+        ids = [p[0] for p in passed]
+        diffs = tuple(
+            Artifact(
+                f"candidate-{cid}",
+                git.diff(dest, base)[:MAX_LOG],
+                "diff",
+                Origin.AGENT,
+                coded.trace_id,
+                coded.untrusted,
+            )
+            for cid, dest, _, coded in passed
+        )
+        run.emit("round", n=0, stage="select")
+        picked = run.run_agent(
+            selector,
+            Task(
+                f"Pick the candidate that best meets this goal:\n\n{objective}",
+                (*inputs, *diffs),
+                check=protocol(partial(parse_choice, ids=ids)),
+            ),
+        )
+        if picked.status != "done":
+            return stop(picked.status, f"selector stopped: {picked.summary}")
+        try:
+            choice = parse_choice(picked.summary, ids)
+        except ProtocolError as e:
+            return stop("failed", f"the selection: {e}")
+        chosen = next(p for p in passed if p[0] == choice)
+
+    cid, dest, branch, coded = chosen
+    try:
+        git.take_branch(run.workdir, dest, branch, base)
+    except (GitError, OSError) as e:
+        return stop("failed", f"cannot apply {cid}: {e}")
+    run.emit("round", n=int(cid[1:]), stage="chosen")
+    result = fix_review(
+        run,
+        objective,
+        check=check,
+        timeout=timeout,
+        check_paths=check_paths,
+        allow_check_edits=allow_check_edits,
+        skills=skills,
+        inputs=inputs,
+        first=coded,
+        **fix,
+    )
+    summary = f"{cid} of {len(passed)} passing candidates: {result.summary}"
+    return replace(result, summary=summary)
 
 
 def research_fix_review(
@@ -659,7 +1032,6 @@ def lead(
 
 
 MAX_LOG = 64 * 1024  # bytes of output kept per command
-CHECK_TIMEOUT = 600  # seconds per command of a fix-review check
 
 
 def run_steps(
@@ -796,6 +1168,38 @@ def _edited(
     )
 
 
+class Check:
+    """A fix's deterministic check: commands run offline after each coder run, and the
+    files that implement them (check_files) or match paths, which a fix may not
+    change unless allow_edits. The files are hashed when the Check is made."""
+
+    def __init__(
+        self,
+        run: Run,
+        commands: Sequence[str],
+        paths: Sequence[str] = (),
+        allow_edits: bool = False,
+        timeout: float = 600,
+    ) -> None:
+        self.run, self.commands = run, commands
+        self.allow_edits, self.timeout = allow_edits, timeout
+        self.patterns = (*check_files(commands, run.workdir), *paths)
+        self.guarded = snapshot(run.workdir, self.patterns) if commands else {}
+
+    def __call__(self, n: int) -> tuple[Status, str, Artifact | None]:
+        """Run the check after round n: status, summary and log. The log is None if a
+        fix changed a guarded file; the check did not run then."""
+        self.run.emit("round", n=n, stage="check")
+        edited = _edited(self.run.workdir, self.guarded, self.patterns)
+        if edited and not self.allow_edits:
+            why = (
+                f"round {n} changed {', '.join(edited)}, which the check runs; "
+                "review the change, or set allow_check_edits = true"
+            )
+            return "failed", why, None
+        return run_steps(self.run, self.commands, False, self.timeout)
+
+
 def check_fix_review(
     run: Run,
     objective: str,
@@ -810,49 +1214,29 @@ def check_fix_review(
     inputs: tuple[Artifact, ...] = (),
     **fix: Any,
 ) -> Result:
-    """Run check; if it fails, fix_review with the log as an input and run check
-    again. A failing re-check goes back to fix_review at most check_to_fix times
-    (graph.md 7.7). fix takes fix_review's other keyword arguments. network applies to the first run
-    only: later runs execute code the coder wrote, so they run offline and reuse what
-    the first run fetched. A fix that changes a file implementing check (check_files)
-    or one matching check_paths fails the run, unless allow_check_edits."""
+    """Run check; if it fails, fix_review from its log with the same check (graph.md
+    7.7). fix takes fix_review's other keyword arguments. network applies to the
+    first run only: later runs execute code the coder wrote, so they run offline and
+    reuse what the first run fetched."""
     status, summary, log = run_steps(run, check, network, timeout)
-    patterns = (*check_files(check, run.workdir), *check_paths)
-    before = snapshot(run.workdir, patterns)
-    review: Artifact | None = None
-    goal = f"{objective}\n\nThe checks failed. Their output is the log input; make them pass."
-    rounds = check_to_fix + 1
-    for n in range(1, rounds + 1):
-        if status != "failed":
-            break
-        run.emit("round", n=n, stage="fix")
-        fixed = fix_review(
-            run,
-            goal,
-            skills=skills,
-            inputs=(*inputs, log),
-            **fix,
-        )
-        review = next((a for a in fixed.artifacts if a.name == "review"), review)
-        if fixed.status != "done":
-            status, summary = fixed.status, f"fix round {n}: {fixed.summary}"
-            break
-        edited = _edited(run.workdir, before, patterns)
-        if edited and not allow_check_edits:
-            status = "failed"
-            summary = (
-                f"fix round {n} changed {', '.join(edited)}, which the check runs; "
-                "review the change, or set allow_check_edits = true"
-            )
-            break
-        status, summary, log = run_steps(run, check, False, timeout)
-    else:
-        if status == "failed":
-            summary = f"checks still fail after {rounds} fix rounds: {summary}"
-    run.emit("workflow_result", status=status, summary=summary)
-    artifacts = (log, review) if review else (log,)
-    untrusted = network or any(a.tainted for a in (*inputs, *artifacts))
-    return Result(status, summary, artifacts, run.used, run.run_id, untrusted)
+    if status != "failed":
+        run.emit("workflow_result", status=status, summary=summary)
+        tainted = any(a.tainted for a in (*inputs, log))  # log.tainted is network
+        return Result(status, summary, (log,), run.used, run.run_id, tainted)
+    fixed = fix_review(
+        run,
+        objective,
+        check=check,
+        timeout=timeout,
+        check_to_fix=check_to_fix,
+        allow_check_edits=allow_check_edits,
+        check_paths=check_paths,
+        skills=skills,
+        inputs=inputs,
+        failed_check=log,
+        **fix,
+    )
+    return replace(fixed, artifacts=fixed.artifacts[::-1])  # log, then review
 
 
 SEVERITY = ("critical", "high", "medium", "low")
@@ -964,21 +1348,29 @@ def review_validate_fix(
     *,
     verify_to_fix: int = 0,
     report_path: str = "REVIEW.md",
+    check: Sequence[str] = (),
+    check_to_fix: int = 0,
+    allow_check_edits: bool = False,
+    check_paths: Sequence[str] = (),
+    timeout: float = 600,
     skills: Mapping[str, tuple[str, ...]] | None = None,
     inputs: tuple[Artifact, ...] = (),
 ) -> Result:
     """Review, validate each finding, fix the confirmed ones, most severe first, then
     verify each fix. Unfixed findings go back to the coder at most verify_to_fix
-    times. The report lists every finding with each step's verdict. inputs go to the
+    times. check, if given, runs as in fix_review, after each coder run and before
+    the verifier; a failing log goes back to the coder at most check_to_fix times.
+    The report lists every finding with each step's verdict. inputs go to the
     reviewer and the coder. Raises ReportError if report_path fails design 4.3."""
     file_root(run.workdir, report_path)
-    if is_gitignored(run.workdir, report_path) is False:
+    if git.is_ignored(run.workdir, report_path) is False:
         run.emit("warning", message=f"{report_path} is not gitignored")
     skills = skills or {}
     finder, validator, coder, verifier = (
         with_skills(r, skills.get(r.name, ()))
         for r in (FINDER, VALIDATOR, CODER, VERIFIER)
     )
+    checker = Check(run, check, check_paths, allow_check_edits, timeout)
     findings: tuple[Finding, ...] = ()
     notes: dict[str, dict[str, tuple[str, str]]] = {}
     results: list[Result] = []
@@ -1050,20 +1442,44 @@ def review_validate_fix(
         return done("done", f"no confirmed findings ({len(findings)} rejected)")
 
     rounds = verify_to_fix + 1
-    for n in range(1, rounds + 1):
+    verifies, checks_left = 0, check_to_fix
+    log: Artifact | None = None  # a failing check's log, for the next coder run
+    n = 0
+    while verifies < rounds:
+        n += 1
+        goal = (
+            f"{objective}\n\nFix each finding in the findings input, in the order "
+            "given: most severe first. Say which you fixed and which you did not."
+        )
+        if log:
+            goal += (
+                "\n\nThe checks failed. Their output is the log input; make them pass."
+            )
         coded = step(
             "fix",
             coder,
             Task(
-                f"{objective}\n\nFix each finding in the findings input, in the order "
-                "given: most severe first. Say which you fixed and which you did not.",
-                (*inputs, given(todo, validated)),
+                goal,
+                (*inputs, given(todo, validated), *((log,) if log else ())),
                 "Each finding is fixed and the tests pass.",
             ),
             n,
         )
         if coded.status != "done":
             return done(coded.status, f"coder stopped in round {n}: {coded.summary}")
+        evidence: tuple[Artifact, ...] = ()
+        if check:
+            status, summary, ran = checker(n)
+            if ran is None:
+                return done(status, summary)
+            if status == "failed" and checks_left:
+                checks_left -= 1
+                log = ran
+                continue
+            if status != "done":
+                return done(status, f"check in round {n}: {summary}")
+            log, evidence = None, (ran,)
+        verifies += 1
         work = Artifact(
             "coder-summary",
             coded.summary,
@@ -1079,7 +1495,7 @@ def review_validate_fix(
             verifier,
             Task(
                 "Check whether each finding in the findings input is fixed.",
-                (given(todo, coded), work),
+                (given(todo, coded), work, *evidence),
                 check=protocol(
                     partial(parse_verdicts, ids=todo_ids, statuses=VERIFICATIONS)
                 ),
@@ -1131,6 +1547,8 @@ class Workflow:
     artifacts: tuple[str, ...] = ()  # names of the artifacts a Result may carry
     graph_only: bool = False  # needs params that only a graph file can set
     required: tuple[str, ...] = ()  # params without a default
+    # the most coder, tester and reviewer-fed fix runs for params; None: no bound
+    runs: Callable[[Mapping[str, Any]], int] | None = None
 
 
 def non_negative_int(v: Any) -> int:
@@ -1173,6 +1591,12 @@ def paths(v: Any) -> tuple[str, ...]:
     return tuple(v)
 
 
+def names(v: Any) -> tuple[str, ...]:
+    if not isinstance(v, list | tuple) or not all(isinstance(x, str) and x for x in v):
+        raise ValueError("must be a list of non-empty strings")
+    return tuple(v)
+
+
 class Commands:
     """A list of shell commands. The graph may substitute outputs into them
     (graph.md 7.7); this converter sees them after substitution."""
@@ -1189,6 +1613,23 @@ class Commands:
 
 COMMANDS = Commands()
 
+
+def _runs(*edges: str, base: int | str = 1) -> Callable[[Mapping[str, Any]], int]:
+    """Workflow.runs: base runs, or the param base names (default 3), plus one per
+    loop edge. Raises TypeError if a value is not an int, such as a graph Ref."""
+
+    def count(v: Any) -> int:
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise TypeError(f"{v!r} is not a count")
+        return v
+
+    def runs(p: Mapping[str, Any]) -> int:
+        first = count(p.get(base, 3)) if isinstance(base, str) else base
+        return first + sum(count(p.get(e, 0)) for e in edges)
+
+    return runs
+
+
 FIX_PARAMS: Mapping[str, Param] = {
     "review_to_fix": non_negative_int,
     "report_path": report_file,
@@ -1201,6 +1642,7 @@ CHECK_PARAMS: Mapping[str, Param] = {
     "allow_check_edits": boolean,
     "check_paths": paths,
     "coder_summary": boolean,
+    "timeout": positive_int,
 }
 
 WORKFLOWS = {
@@ -1216,6 +1658,45 @@ WORKFLOWS = {
             ),
             {**FIX_PARAMS, **CHECK_PARAMS},
             ("review",),
+            runs=_runs("check_to_fix", "review_to_fix"),
+        ),
+        Workflow(
+            "reproduce-fix-review",
+            "a tester adds failing tests, then fix-review makes them pass",
+            ("tester", "coder", "reviewer"),
+            False,
+            lambda run, obj, o: reproduce_fix_review(
+                run, obj, skills=o.skills, inputs=o.inputs, **o.params
+            ),
+            {
+                **FIX_PARAMS,
+                **CHECK_PARAMS,
+                "test_paths": paths,
+                "check_to_reproduce": non_negative_int,
+            },
+            ("review", "log"),
+            required=("check",),
+            runs=_runs("check_to_reproduce", "check_to_fix", "review_to_fix", base=2),
+        ),
+        Workflow(
+            "best-of-n",
+            "coders on separate copies; the check filters them, one is picked and "
+            "reviewed",
+            ("coder", "selector", "reviewer"),
+            False,
+            lambda run, obj, o: best_of_n(
+                run, obj, skills=o.skills, inputs=o.inputs, **o.params
+            ),
+            {
+                **FIX_PARAMS,
+                **CHECK_PARAMS,
+                "n": positive_int,
+                "stop_after": positive_int,
+                "models": names,
+            },
+            ("review", "log"),
+            required=("check",),
+            runs=_runs("check_to_fix", "review_to_fix", base="n"),
         ),
         Workflow(
             "research-fix-review",
@@ -1227,6 +1708,7 @@ WORKFLOWS = {
             ),
             {**FIX_PARAMS, **CHECK_PARAMS},
             ("review", "research", "sources"),
+            runs=_runs("check_to_fix", "review_to_fix"),
         ),
         Workflow(
             "review-validate-fix",
@@ -1236,8 +1718,13 @@ WORKFLOWS = {
             lambda run, obj, o: review_validate_fix(
                 run, obj, skills=o.skills, inputs=o.inputs, **o.params
             ),
-            {"verify_to_fix": non_negative_int, "report_path": report_file},
+            {
+                "verify_to_fix": non_negative_int,
+                "report_path": report_file,
+                **{k: v for k, v in CHECK_PARAMS.items() if k != "coder_summary"},
+            },
             ("review",),
+            runs=_runs("check_to_fix", "verify_to_fix"),
         ),
         Workflow(
             "commands",
@@ -1249,6 +1736,7 @@ WORKFLOWS = {
             ("log",),
             graph_only=True,
             required=("steps",),
+            runs=lambda p: 0,
         ),
         Workflow(
             "check-fix-review",
@@ -1270,6 +1758,7 @@ WORKFLOWS = {
             ("log", "review"),
             graph_only=True,
             required=("check",),
+            runs=_runs("check_to_fix", "review_to_fix"),
         ),
         Workflow(
             "lead",

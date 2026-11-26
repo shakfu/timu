@@ -4,6 +4,7 @@ and the workflow registry."""
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import shutil
@@ -14,15 +15,18 @@ from typing import Any
 
 import pytest
 
-from timu import Budget, Capability, Event, Origin, Role, Task, Usage
+from timu import Artifact, Budget, Capability, Event, Origin, Role, Task, Usage
+from timu.git import is_ignored as is_gitignored
+from timu.git import take_branch
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider, call, calls, text
-from timu.report import MAX_REPORT, ReportError, is_gitignored, write_report
+from timu.report import MAX_REPORT, ReportError, write_report
 from timu.roles import (
     CODER,
     FINDER,
     REVIEWER,
     REVIEWER_WRITE,
+    TESTER,
     VALIDATOR,
     VERIFIER,
     with_skills,
@@ -33,10 +37,15 @@ from timu.workflow import (
     WORKFLOWS,
     Options,
     Run,
+    _same_log,
+    best_of_n,
     check_files,
     check_fix_review,
     commands,
     fix_review,
+    lead,
+    reproduce_fix_review,
+    research_fix_review,
     review_validate_fix,
     verdict,
 )
@@ -265,6 +274,8 @@ SCRIPTS = {
     ],
     "researcher": [text("facts")],
     "coder": [text("fixed")],
+    "tester": [calls(call("write", path="tests/test_new.py", content="x")), text("ok")],
+    "selector": [text(block(choice=[{"id": "c1", "reason": "smaller"}]))],
     # a verdict for fix-review and a finding for review-validate-fix
     "reviewer": [text("VERDICT: APPROVE\n" + block(findings=[F1]))],
     "validator": [text(block(verdicts=[verdict_for("F1", "confirmed")]))],
@@ -287,17 +298,27 @@ def test_workflow_roles_cover_the_roles_it_starts(tmp_path: Path, name: str) -> 
         "commands": {"steps": ["true"]},
         # fails once, so the fix loop runs, then passes
         "check-fix-review": {"check": [FAIL_ONCE]},
+        # passes on the base, fails with the tester's test, then passes
+        "reproduce-fix-review": {"check": [FAIL_SECOND]},
+        # two candidates pass, so the selector runs
+        "best-of-n": {"check": ["true"], "n": 2},
     }
+    if name == "best-of-n":
+        git_repo(tmp_path)
     params = by_name.get(name, {})
     result = WORKFLOWS[name].run(run, "objective", Options({}, params=params))
     assert result.status == "done", result.summary
     assert set(started) == set(WORKFLOWS[name].roles)
     checks = [r for i, r in enumerate(started[1:]) if started[i] == "coder"]
     assert len(checks) == started.count("coder")  # no coder run is the last
+    if name == "best-of-n":  # candidates not chosen are dropped; the chosen is reviewed
+        assert started[-1] == "reviewer"
+        return
     assert set(checks) <= {"reviewer", "verifier"}  # every fix is checked
 
 
 FAIL_ONCE = "test -e .ran || { touch .ran; exit 1; }"
+FAIL_SECOND = 'n=$(cat .n 2>/dev/null || echo 0); echo $((n + 1)) > .n; test "$n" != 1'
 
 
 # ---- command steps ----
@@ -398,6 +419,12 @@ def test_check_fix_review_skips_the_model_when_checks_pass(tmp_path: Path) -> No
     assert provider.requests == []
 
 
+def test_a_passing_check_keeps_the_taint_of_its_inputs(tmp_path: Path) -> None:
+    run, _, _ = make_run(tmp_path, [])
+    web = Artifact("research", "x", "research", Origin.NET, "a1", True)
+    assert check_fix_review(run, "o", check=["true"], inputs=(web,)).untrusted
+
+
 def test_check_fix_review_fixes_then_checks_again(tmp_path: Path) -> None:
     replies = [
         calls(call("write", path="fixed.txt", content="ok")),
@@ -406,8 +433,9 @@ def test_check_fix_review_fixes_then_checks_again(tmp_path: Path) -> None:
     ]
     run, provider, _ = make_run(tmp_path, replies)
     r = check_fix_review(run, "make the check pass", check=["test -f fixed.txt"])
-    assert (r.status, r.summary) == ("done", "1 commands passed")
+    assert (r.status, r.summary) == ("done", "approved in round 1")
     assert [a.name for a in r.artifacts] == ["log", "review"]
+    assert r.artifacts[0].content.endswith("[exit 0]\n")  # the passing re-check
     coder_task = provider.requests[0].messages[1].content
     assert "The checks failed" in coder_task and "[exit 1]" in coder_task
 
@@ -436,7 +464,7 @@ def test_check_fix_review_refuses_a_fix_that_edits_the_check(tmp_path: Path) -> 
     assert (r.status, r.summary) == (
         "failed",
         (
-            "fix round 1 changed Makefile, which the check runs; review the change, "
+            "round 1 changed Makefile, which the check runs; review the change, "
             "or set allow_check_edits = true"
         ),
     )
@@ -458,7 +486,7 @@ def test_check_fix_review_watches_a_script_the_check_names(tmp_path: Path) -> No
     ]
     run, _, _ = make_run(tmp_path, replies)
     r = check_fix_review(run, "o", check=["sh scripts/check.sh"])
-    assert r.summary.startswith("fix round 1 changed scripts/check.sh, which")
+    assert r.summary.startswith("round 1 changed scripts/check.sh, which")
 
 
 def test_check_fix_review_checks_the_coders_code_offline(tmp_path: Path) -> None:
@@ -475,20 +503,37 @@ def test_check_fix_review_checks_the_coders_code_offline(tmp_path: Path) -> None
     assert [p.network for p in box.policies] == [True, False]
 
 
+def test_a_networked_first_check_taints_the_result(tmp_path: Path) -> None:
+    """The coder read output from a run with network on. With no review, only the
+    offline re-check's log reaches the result."""
+    run, _, _ = make_run(tmp_path, [text("tried")])
+    r = check_fix_review(run, "o", check=["false"], network=True)
+    assert r.status == "failed"
+    assert [(a.name, a.tainted) for a in r.artifacts] == [("log", False)]
+    assert r.untrusted
+
+
 def test_check_fix_review_does_not_loop_unless_asked(tmp_path: Path) -> None:
-    replies = [text("tried"), text("VERDICT: APPROVE")]
-    run, _, _ = make_run(tmp_path, replies)
+    run, provider, _ = make_run(tmp_path, [text("tried")])
     r = check_fix_review(run, "o", check=["false"])
     assert r.status == "failed"
-    assert r.summary == "checks still fail after 1 fix rounds: `false` failed: exit 1"
+    assert r.summary == "check in round 1: `false` failed: exit 1"
+    assert len(provider.requests) == 1  # a failing re-check skips the review
 
 
 def test_check_to_fix_loops_only_the_check_edge(tmp_path: Path) -> None:
-    """Each edge has its own limit: two check rounds, one review each (E2)."""
-    replies = [text("tried"), text("VERDICT: APPROVE")] * 3
+    """Each edge has its own limit (E2): a failing re-check goes back to the coder,
+    not to a review."""
+    replies = [
+        calls(call("write", path="n.txt", content="1")),
+        text("tried"),
+        calls(call("write", path="n.txt", content="2")),
+        text("tried again"),
+    ]
     run, provider, _ = make_run(tmp_path, replies)
-    r = check_fix_review(run, "o", check=["false"], check_to_fix=1)
-    assert r.summary == "checks still fail after 2 fix rounds: `false` failed: exit 1"
+    cmd = "cat n.txt 2>/dev/null; false"  # a new output each round
+    r = check_fix_review(run, "o", check=[cmd], check_to_fix=1)
+    assert r.summary == f"check in round 2: `{cmd}` failed: exit 1"
     assert len(provider.requests) == 4
 
 
@@ -576,8 +621,78 @@ def test_check_to_fix_sends_the_log_back(tmp_path: Path) -> None:
     result = fix_review(run, "fix", check=["test -f calc.py"], check_to_fix=1)
     assert (result.status, result.summary) == ("done", "approved in round 2")
     second_coder_task = provider.requests[1].messages[1].content
-    assert "The checks failed after your change" in second_coder_task
+    assert "The checks failed." in second_coder_task
     assert "[exit 1]" in second_coder_task
+
+
+def test_a_check_failure_after_changes_keeps_the_review(tmp_path: Path) -> None:
+    """A failing check does not replace a review the coder has not yet answered."""
+    replies = [
+        calls(call("write", path="calc.py", content="good\n")),
+        text("fixed"),
+        text(CHANGES),
+        calls(call("write", path="calc.py", content="bad\n")),
+        text("changed"),
+        calls(call("write", path="calc.py", content="good\n")),
+        text("fixed again"),
+        text(APPROVE),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    result = fix_review(
+        run, "fix", check=["grep -q good calc.py"], check_to_fix=1, review_to_fix=1
+    )
+    assert (result.status, result.summary) == ("done", "approved in round 3")
+    third_coder_task = provider.requests[5].messages[1].content
+    assert "The checks failed." in third_coder_task
+    assert "[exit 1]" in third_coder_task
+    assert "The reviewer asked for changes" in third_coder_task
+    assert "still subtracts" in third_coder_task
+    review_task = provider.requests[7].messages[1].content
+    assert "[exit 1]" not in review_task
+
+
+@needs_git
+def test_a_round_that_changes_nothing_stops_the_run(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    replies = [*coder_turn(), text(CHANGES), text("nothing to do")]
+    run, provider, _ = make_run(tmp_path, replies)
+    result = fix_review(run, "fix", review_to_fix=2)
+    assert (result.status, result.summary) == ("failed", "round 2 made no change")
+    assert len(provider.requests) == 4  # no second review
+
+
+def test_the_same_check_failure_twice_stops_the_run(tmp_path: Path) -> None:
+    replies = [
+        calls(call("write", path="a.txt", content="a")),
+        text("tried"),
+        calls(call("write", path="b.txt", content="b")),
+        text("tried again"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    result = fix_review(run, "fix", check=["echo took 0.5s; false"], check_to_fix=3)
+    assert result.summary == "check in round 2 failed with the same output as before"
+    assert len(provider.requests) == 4
+
+
+def test_same_log_ignores_timings_and_the_workdir() -> None:
+    def log(text: str) -> Artifact:
+        return Artifact("log", text, "log")
+
+    w = Path("/w/copy")
+    a = log("/w/copy/t.py::x FAILED\n1 failed in 0.52s\n")
+    assert _same_log(a, log("/w/copy/t.py::x FAILED\n1 failed in 1.07s\n"), w)
+    assert not _same_log(a, log("/w/copy/t.py::y FAILED\n1 failed in 0.52s\n"), w)
+
+
+def test_a_round_the_budget_cannot_cover_is_not_started(tmp_path: Path) -> None:
+    replies = [*coder_turn(), text(CHANGES)]  # round 1: 3 turns
+    run, provider, _ = make_run(tmp_path, replies, budget=Budget(turns=5))
+    result = fix_review(run, "fix", review_to_fix=1)
+    assert (result.status, result.summary) == (
+        "budget",
+        "round 2 not started: less budget is left than a round used",
+    )
+    assert len(provider.requests) == 3
 
 
 def test_check_to_fix_bounds_the_check_edge(tmp_path: Path) -> None:
@@ -611,6 +726,45 @@ def test_coder_summary_can_be_withheld_from_the_reviewer(tmp_path: Path) -> None
     assert "coder-summary" not in review_task
     assert "fixed calc.py" not in review_task
     assert 'name="log"' in review_task
+
+
+# the registry fills these from Options, and workflows from their own steps
+SUPPLIED = {"skills", "inputs", "search", "fetch"}
+SUPPLIED |= {"failed_check", "review_inputs", "first"}
+# fix_review params that a forwarding workflow keeps from graph files, and why
+NOT_FORWARDED = {
+    # an ablation setting for the sim's fix-review arms (H2)
+    "check-fix-review": {"coder_summary"},
+}
+FUNCTIONS = {
+    "fix-review": fix_review,
+    "research-fix-review": research_fix_review,
+    "reproduce-fix-review": reproduce_fix_review,
+    "best-of-n": best_of_n,
+    "review-validate-fix": review_validate_fix,
+    "commands": commands,
+    "check-fix-review": check_fix_review,
+    "lead": lead,
+}
+
+
+def keywords(f: Any) -> tuple[set[str], bool]:
+    """f's keyword-only params, and whether it forwards **kwargs to fix_review."""
+    ps = inspect.signature(f).parameters.values()
+    own = {p.name for p in ps if p.kind is p.KEYWORD_ONLY} - SUPPLIED
+    return own, any(p.kind is p.VAR_KEYWORD for p in ps)
+
+
+@pytest.mark.parametrize("name", sorted(WORKFLOWS))
+def test_params_match_the_function(name: str) -> None:
+    """A param in the function but not in Workflow.params is unreachable from the CLI
+    and graph files, unless NOT_FORWARDED names it; one in params but not in the
+    function fails at run time."""
+    declared = set(WORKFLOWS[name].params)
+    own, forwards = keywords(FUNCTIONS[name])
+    if forwards:
+        own |= keywords(fix_review)[0] - NOT_FORWARDED.get(name, set())
+    assert declared == own
 
 
 def test_missing_verdict_fails(tmp_path: Path) -> None:
@@ -809,6 +963,43 @@ def test_review_validate_fix_does_not_loop_unless_asked(tmp_path: Path) -> None:
     assert len(provider.requests) == 5
 
 
+def test_review_validate_fix_checks_before_the_verifier(tmp_path: Path) -> None:
+    """A failing check goes back to the coder; the verifier gets the passing log."""
+    one = [THREE, verdicts(F1="confirmed", F2="rejected", F3="rejected")]
+    replies = [
+        *one,
+        calls(call("write", path="calc.py", content="bad\n")),
+        text("tried"),
+        calls(call("write", path="calc.py", content="good\n")),
+        text("fixed"),
+        verdicts(F1="fixed"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(
+        run, "review", check=["grep -q good calc.py"], check_to_fix=1
+    )
+    assert (r.status, r.summary) == ("done", "fixed 1 confirmed findings in round 2")
+    second_fix = provider.requests[4].messages[1].content
+    assert "The checks failed" in second_fix and "[exit 1]" in second_fix
+    verify_task = provider.requests[6].messages[1].content
+    assert 'name="log"' in verify_task and "[exit 0]" in verify_task
+
+
+def test_review_validate_fix_fails_on_a_check_without_a_retry(tmp_path: Path) -> None:
+    replies = [
+        THREE,
+        verdicts(F1="confirmed", F2="rejected", F3="rejected"),
+        text("tried"),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = review_validate_fix(run, "review", check=["false"])
+    assert (r.status, r.summary) == (
+        "failed",
+        "check in round 1: `false` failed: exit 1",
+    )
+    assert len(provider.requests) == 3  # no verifier
+
+
 def test_verify_to_fix_sends_back_only_unfixed_findings(tmp_path: Path) -> None:
     replies = [
         THREE,
@@ -889,3 +1080,217 @@ def test_review_validate_fix_recovers_from_a_bad_block(tmp_path: Path) -> None:
     assert (r.status, r.summary) == ("done", "no confirmed findings (3 rejected)")
     retry = provider.requests[1].messages[-1].content
     assert "no json block; end with the json block" in retry
+
+
+# ---- reproduce_fix_review ----
+
+# passes until the tester's test exists, then until the coder's fix exists
+REPRODUCED = "! test -f tests/test_x.py || test -f fixed.txt"
+ADD_TEST = calls(call("write", path="tests/test_x.py", content="assert fixed\n"))
+
+
+def test_reproduce_fix_review_fixes_against_the_new_test(tmp_path: Path) -> None:
+    replies = [
+        ADD_TEST,
+        text("added tests/test_x.py"),
+        calls(call("write", id="w2", path="fixed.txt", content="ok")),
+        text("fixed"),
+        text(APPROVE),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = reproduce_fix_review(run, "fix it", check=[REPRODUCED])
+    assert (r.status, r.summary) == ("done", "approved in round 1")
+    tester_task = provider.requests[0].messages[1].content
+    assert "new files under tests" in tester_task
+    coder_task = provider.requests[2].messages[1].content
+    assert "The checks failed" in coder_task and "[exit 1]" in coder_task
+    review_task = provider.requests[4].messages[1].content
+    assert 'name="reproduction"' in review_task and "tests/test_x.py" in review_task
+
+
+def test_reproduce_needs_a_passing_suite_first(tmp_path: Path) -> None:
+    run, provider, _ = make_run(tmp_path, [])
+    r = reproduce_fix_review(run, "o", check=["false"])
+    assert r.summary == "the check fails before any change: `false` failed: exit 1"
+    assert provider.requests == []
+
+
+def test_the_tester_may_only_add_files(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_old.py").write_text("x = 1\n")
+    replies = [
+        calls(call("write", path="tests/test_old.py", content="x = 2\n")),
+        text("edited"),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    r = reproduce_fix_review(run, "o", check=["true"])
+    assert r.summary == "the tester changed tests/test_old.py; it may only add"
+
+
+def test_the_tester_writes_only_under_test_paths(tmp_path: Path) -> None:
+    replies = [calls(call("write", path="calc.py", content="x")), text("done")]
+    run, _, _ = make_run(tmp_path, replies)
+    r = reproduce_fix_review(run, "o", check=["true"])
+    assert r.summary == "the tester added no files under tests"
+    assert not (tmp_path / "calc.py").exists()
+    assert TESTER.write_roots == ()  # the workflow sets them per run
+
+
+def test_a_test_that_does_not_fail_goes_back_to_the_tester(tmp_path: Path) -> None:
+    replies = [
+        calls(call("write", path="tests/test_a.py", content="pass")),
+        text("added"),
+        ADD_TEST,
+        text("added a failing one"),
+        calls(call("write", id="w2", path="fixed.txt", content="ok")),
+        text("fixed"),
+        text(APPROVE),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = reproduce_fix_review(run, "o", check=[REPRODUCED], check_to_reproduce=1)
+    assert r.status == "done", r.summary
+    second_tester_task = provider.requests[2].messages[1].content
+    assert "The checks still pass with your tests" in second_tester_task
+    (tmp_path / "again").mkdir()
+    run, _, _ = make_run(tmp_path / "again", replies[:2])
+    r = reproduce_fix_review(run, "o", check=["true"])
+    assert r.summary == "the check passes with the new tests: 1 commands passed"
+
+
+def test_the_coder_may_not_change_the_new_tests(tmp_path: Path) -> None:
+    replies = [
+        ADD_TEST,
+        text("added"),
+        calls(call("write", id="w2", path="tests/test_x.py", content="pass\n")),
+        text("weakened it"),
+    ]
+    run, _, _ = make_run(tmp_path, replies)
+    r = reproduce_fix_review(run, "o", check=[REPRODUCED])
+    assert r.summary.startswith("round 1 changed tests/test_x.py, which the check")
+
+
+def test_a_test_path_must_be_inside_the_workdir(tmp_path: Path) -> None:
+    run, _, _ = make_run(tmp_path, [])
+    r = reproduce_fix_review(run, "o", check=["true"], test_paths=["../out"])
+    assert r.summary == "test path ../out must be inside the workdir"
+    assert not (tmp_path.parent / "out").exists()
+
+
+# ---- best_of_n ----
+
+GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@localhost"]
+
+
+def git_repo(path: Path, files: dict[str, str] | None = None) -> Path:
+    """path as a git repo with one commit holding files."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    for rel, content in (files or {"README": "base\n"}).items():
+        (path / rel).write_text(content)
+    subprocess.run([*GIT, "add", "-A"], cwd=path, check=True)
+    subprocess.run([*GIT, "commit", "-qm", "base"], cwd=path, check=True)
+    return path
+
+
+def rev(path: Path) -> str:
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+def write_fixed(content: str, cid: str) -> list[Reply]:
+    return [
+        calls(call("write", id=f"w{cid}", path="fixed.txt", content=content)),
+        text(f"fixed in {cid}"),
+    ]
+
+
+@needs_git
+def test_best_of_n_stops_at_the_first_pass(tmp_path: Path) -> None:
+    git_repo(tmp_path)
+    run, provider, _ = make_run(tmp_path, [*write_fixed("one", "1"), text(APPROVE)])
+    r = best_of_n(run, "fix", check=["test -f fixed.txt"], stop_after=1)
+    assert (r.status, r.summary) == (
+        "done",
+        "c1 of 1 passing candidates: approved in round 1",
+    )
+    assert (tmp_path / "fixed.txt").read_text() == "one"
+    assert len(provider.requests) == 3  # one coder, no selector, the review
+
+
+@needs_git
+def test_best_of_n_picks_among_the_candidates_that_pass(tmp_path: Path) -> None:
+    git_repo(tmp_path)
+    replies = [
+        text("tried"),  # c1 fails the check
+        *write_fixed("two", "2"),
+        *write_fixed("three", "3"),
+        text(block(choice=[{"id": "c3", "reason": "handles more cases"}])),
+        text(APPROVE),
+    ]
+    run, provider, _ = make_run(tmp_path, replies)
+    r = best_of_n(run, "fix", check=["test -f fixed.txt"], n=3)
+    assert r.summary == "c3 of 2 passing candidates: approved in round 1"
+    assert (tmp_path / "fixed.txt").read_text() == "three"
+    select_task = provider.requests[5].messages[1].content
+    assert 'name="candidate-c2"' in select_task and 'name="candidate-c3"' in select_task
+    assert "candidate-c1" not in select_task
+
+
+@needs_git
+def test_best_of_n_fails_when_no_candidate_passes(tmp_path: Path) -> None:
+    git_repo(tmp_path)
+    run, provider, _ = make_run(tmp_path, [text("tried"), text("tried")])
+    r = best_of_n(run, "fix", check=["false"], n=2)
+    fails = "c1: `false` failed: exit 1; c2: `false` failed: exit 1"
+    assert (r.status, r.summary) == (
+        "failed",
+        f"no candidate passed the check: {fails}",
+    )
+    assert len(provider.requests) == 2
+
+
+@needs_git
+def test_best_of_n_needs_a_clean_repo(tmp_path: Path) -> None:
+    run, _, _ = make_run(tmp_path, [])
+    assert best_of_n(run, "o", check=["true"]).summary == (
+        "best-of-n needs a git repo with a commit"
+    )
+    git_repo(tmp_path)
+    (tmp_path / "README").write_text("changed\n")
+    assert best_of_n(run, "o", check=["true"]).summary == (
+        "best-of-n needs a clean tree; commit first"
+    )
+
+
+@needs_git
+def test_take_branch_copies_changes_and_removals(tmp_path: Path) -> None:
+    ws = git_repo(tmp_path / "ws", {"keep.txt": "k\n", "gone.txt": "g\n"})
+    copy = tmp_path / "copy"
+    subprocess.run(["git", "clone", "-q", str(ws), str(copy)], check=True)
+    subprocess.run(["git", "checkout", "-qb", "c1"], cwd=copy, check=True)
+    (copy / "gone.txt").unlink()
+    (copy / "keep.txt").write_text("changed\n")
+    (copy / "new.txt").write_text("n\n")
+    subprocess.run([*GIT, "add", "-A"], cwd=copy, check=True)
+    subprocess.run([*GIT, "commit", "-qm", "c1"], cwd=copy, check=True)
+    base = rev(ws)
+    take_branch(ws, copy, "c1", base)
+    assert sorted(p.name for p in ws.iterdir() if p.name != ".git") == [
+        "keep.txt",
+        "new.txt",
+    ]
+    assert (ws / "keep.txt").read_text() == "changed\n"
+    assert rev(ws) == base  # the engine commits later; HEAD does not move
+
+
+def test_a_view_charges_its_parent_and_keeps_its_own_cap(tmp_path: Path) -> None:
+    run, _, _ = make_run(tmp_path, coder_turn())
+    view = run.view(tmp_path, Budget(turns=1))
+    r = view.run_agent(CODER, Task("fix"))
+    assert r.status == "budget"
+    assert view.used.turns == run.used.turns == run.session.used.turns == 1

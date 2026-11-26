@@ -3,6 +3,7 @@ a provider by its `[provider] type`."""
 
 from __future__ import annotations
 
+import importlib
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -25,20 +26,35 @@ from timu.types import Usage
 
 ENTRY_POINTS = "timu.providers"
 BUILTIN = "chat-completions"  # OpenAI-compatible chat completions, over urllib
+# Built-in types, which no package can replace: module, and the SDK it needs, if any.
+BUILTINS: dict[str, tuple[str, str]] = {
+    BUILTIN: ("timu.provider.openai", ""),
+    "anthropic": ("timu.provider.anthropic_sdk", "anthropic"),
+    "openai": ("timu.provider.openai_sdk", "openai"),
+}
+EXTRA = "uv tool install 'timu[extras]'"  # installs the SDKs
 
 
 @cache
 def factory(name: str) -> ProviderFactory:
-    """The factory for provider type name. The built-in name cannot be replaced by a
-    package. Raises LookupError if no installed package provides name, TypeError if
-    its entry point is not callable, and whatever importing the package raises."""
-    if name == BUILTIN:
-        from timu.provider.openai import from_settings
-
-        return from_settings
+    """The factory for provider type name. A built-in name cannot be replaced by a
+    package. Raises LookupError if no installed package provides name, or a built-in
+    type's SDK is missing, TypeError if an entry point is not callable, and whatever
+    importing the package raises."""
+    if name in BUILTINS:
+        module, sdk = BUILTINS[name]
+        try:
+            loaded = importlib.import_module(module)
+        except ModuleNotFoundError as e:
+            if sdk and e.name == sdk:
+                raise LookupError(
+                    f"provider type {name!r} needs the {sdk} package: {EXTRA}"
+                ) from None
+            raise
+        return loaded.from_settings  # type: ignore[no-any-return]
     found = entry_points(group=ENTRY_POINTS, name=name)
     if not found:
-        names = sorted({BUILTIN, *entry_points(group=ENTRY_POINTS).names})
+        names = sorted({*BUILTINS, *entry_points(group=ENTRY_POINTS).names})
         raise LookupError(f"no provider type {name!r}; installed: {', '.join(names)}")
     loaded = next(iter(found)).load()
     if not callable(loaded):
@@ -101,6 +117,7 @@ class Priced:
 
 __all__ = [
     "BUILTIN",
+    "BUILTINS",
     "CONTEXT_OVERFLOW",
     "ENTRY_POINTS",
     "Message",

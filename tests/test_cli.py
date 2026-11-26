@@ -178,6 +178,42 @@ def test_a_failing_check_exits_1(tmp_path: Path, repo: Path) -> None:
     assert "check in round 1: `false` failed: exit 1" in err
 
 
+def test_a_required_param_is_a_usage_error(tmp_path: Path, repo: Path) -> None:
+    code, _, err = cli(
+        tmp_path,
+        ["-C", str(repo), "--workflow", "reproduce-fix-review", "x"],
+        [],
+    )
+    assert code == 2
+    assert "reproduce-fix-review needs check" in err
+
+
+def test_reproduce_flags_reach_the_workflow(tmp_path: Path, repo: Path) -> None:
+    code, _, err = cli(
+        tmp_path,
+        ["-C", str(repo), "--unsafe-no-sandbox", "--workflow", "reproduce-fix-review",
+         "--check", "true", "--test-path", "spec", "x"],
+        [text("wrote nothing")],
+    )  # fmt: skip
+    assert code == 1
+    assert "the tester added no files under spec" in err
+
+
+def test_best_of_n_flags_reach_the_workflow(tmp_path: Path, repo: Path) -> None:
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@localhost"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-qm", "base"], cwd=repo, check=True)
+    code, _, err = cli(
+        tmp_path,
+        ["-C", str(repo), "--unsafe-no-sandbox", "--workflow", "best-of-n",
+         "--check", "false", "--candidates", "2", "x"],
+        [text("tried"), text("tried")],
+    )  # fmt: skip
+    assert code == 1
+    assert "c2: `false` failed: exit 1" in err
+
+
 def test_no_coder_summary_hides_it_from_the_reviewer(
     tmp_path: Path, repo: Path
 ) -> None:

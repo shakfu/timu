@@ -10,8 +10,13 @@ SRC = Path(__file__).parent.parent / "src" / "timu"
 
 
 def test_has_no_runtime_dependencies() -> None:
-    """The distribution must not declare runtime dependencies."""
-    assert not (requires("timu") or [])
+    """The distribution must not require any dependency. The SDKs for the anthropic
+    and openai provider types are the one optional extra."""
+    declared = requires("timu") or []
+    assert [r for r in declared if "extra ==" not in r] == []
+    optional = {r.split(">=")[0].split(";")[0].strip() for r in declared}
+    assert optional == {"anthropic", "openai"}
+    assert all(r.endswith("extra == 'extras'") for r in declared)
 
 
 def test_no_global_rebinding() -> None:

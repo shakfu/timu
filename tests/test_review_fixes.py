@@ -20,12 +20,11 @@ import pytest
 
 from timu import Agent, Budget, Event, Role, Task
 from timu.cli import ConsoleSink, main, printable
+from timu.git import head, provision
 from timu.graph import (
     bare_repos,
     extract,
-    head,
     parse_graph,
-    provision,
     resumable,
     seal,
     spec,

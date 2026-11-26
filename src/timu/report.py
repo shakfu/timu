@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 from timu.tools.fs import atomic_write, reserved
@@ -47,19 +46,3 @@ def write_report(workdir: Path, path: str, text: str) -> Path:
     except OSError as e:
         raise ReportError(f"cannot write {path}: {e.strerror}") from None
     return target
-
-
-def is_gitignored(workdir: Path, path: str) -> bool | None:
-    """True or False in a git repo; None outside one or without git."""
-    try:
-        r = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "check-ignore", "-q", "--", path],
-            cwd=workdir,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return {0: True, 1: False}.get(r.returncode)

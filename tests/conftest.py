@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from http_server import Server, serve
 from timu import Agent, Budget, Context, Event, Role, Tool, ToolOutput
 from timu.provider.base import Reply
 from timu.provider.fake import FakeProvider
@@ -95,3 +96,10 @@ def make_agent(tmp_path: Path) -> MakeAgent:
         )
 
     return make
+
+
+@pytest.fixture
+def server() -> Iterator[Server]:
+    """A local server that replays server.responses and records server.requests."""
+    with serve() as srv:
+        yield srv

@@ -48,7 +48,8 @@ from pathlib import Path
 from typing import Any
 
 from timu.config import ConfigError, load_config, user_config_path
-from timu.graph import GraphError, _git
+from timu.git import GitError
+from timu.git import run as _git
 from timu.sandbox import NoSandbox, Policy, Sandbox, detect
 from timu.tool import state_dir
 from timu.tools.shell import run_sh, scrubbed_env
@@ -70,6 +71,14 @@ ARMS: Mapping[str, tuple[str, ...]] = {
         "--no-coder-summary",
     ),
 }
+
+
+
+def arm_params(arm: str) -> set[str]:
+    """The workflow params an arm's flags set; it runs only where all apply."""
+    flags = (a[2:] for a in ARMS[arm] if a.startswith("--"))
+    return {f.removeprefix("no-").replace("-", "_") for f in flags}
+
 
 Runner = Callable[[list[str], dict[str, str], float], tuple[int, str]]
 """runner(timu argv, env, timeout) -> (exit code, stderr)."""
@@ -489,7 +498,7 @@ def score_oracle(
             dest.parent, "clone", "--quiet", "--no-checkout", "--", str(src), str(dest)
         )
         _git(dest, "checkout", "--quiet", "--detach", head)
-    except GraphError as e:
+    except GitError as e:
         trial.oracle, trial.oracle_tail = "error", str(e)
         return
     shutil.rmtree(dest / ".git")
@@ -644,7 +653,7 @@ def cmd_run(args: argparse.Namespace, runner: Runner = subprocess_runner) -> int
         for m in lineups
         for arm in arms
         for t in tasks
-        if arm == "default" or "check" in WORKFLOWS[t.workflow].params
+        if arm_params(arm) <= set(WORKFLOWS[t.workflow].params)
         for n in range(1, args.trials + 1)
     ]
     by_name = {t.name: t for t in tasks}
@@ -695,7 +704,7 @@ def cmd_run(args: argparse.Namespace, runner: Runner = subprocess_runner) -> int
                 sandbox,
                 runner,
             )
-        except (OSError, subprocess.CalledProcessError, GraphError, ValueError) as e:
+        except (OSError, subprocess.CalledProcessError, GitError, ValueError) as e:
             trial.error = f"{type(e).__name__}: {e}"
         if trial.exit == 130:
             trial.error = "interrupted"
@@ -820,8 +829,8 @@ def parser() -> argparse.ArgumentParser:
         "--arm",
         action="append",
         choices=list(ARMS),
-        help="extra `timu run` arguments per trial; repeat to compare. A check arm "
-        "runs only tasks whose workflow takes a check (default: default)",
+        help="extra `timu run` arguments per trial; repeat to compare. An arm runs "
+        "only tasks whose workflow takes every param it sets (default: default)",
     )
     run.add_argument(
         "--config",

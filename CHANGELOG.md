@@ -8,9 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `check-fix-review` is now a first check, then `fix-review` with the same check. A failing re-check goes back to the coder before the review, not to a new coder-and-review round, so `check_to_fix = N` allows N more coder runs and no extra reviews. The two workflows had separate check loops and edit guards, and the order spent a review on a tree that still failed. `fix-review` and `research-fix-review` take `timeout` per check command, as `check-fix-review` does.
+
 - `timu run` now works on a clone and commits to a branch there, as graph nodes do. `--in-place` keeps the old behavior and is required outside a git repo. Path rules could not keep an agent-edited checkout safe for the user's git: a bare repo, or a nested repo moved to `$TMPDIR` and back, planted config that git later ran unsandboxed. The cost is that a run starts from `HEAD`, without uncommitted or gitignored files.
 
 ### Added
+
+- Built-in provider types `anthropic` (Messages API) and `openai` (Responses API), through the official SDKs, from the one optional extra: `uv tool install 'timu[extras]'`. Core still requires nothing; a type whose SDK is missing stops before the run and names the command. Each checks its own key variable by default, and the SDK's retries are off, so timu's retry rule, with its restart marker, applies to all three types. Built in over a separate package so that one install covers them, and over clients on urllib so that the SDKs own each API's wire format.
+
+  `openai` sends `store = false` and asks for encrypted reasoning, so reasoning carries across turns with nothing kept at OpenAI; chat completions drops it. `anthropic` caches the prompt prefix on every turn. A history the agent trimmed invalidates the Claude thinking blocks after the trim, and the API rejects the request; the provider resends it once without thinking blocks, so the turn loses earlier reasoning instead of the run failing.
+
+- `timu graph plan` asks a planner to write a graph file, then stops (workflow-proposals.md 2). The planner reads only the projects named in `--repos`. timu appends a final `check-fix-review` per project and writes a `[plan]` table. While the table is there, `timu graph run` allows only model workflows on the named projects, with no network, `ref`, `models` or `budget` keys. It requires one chain per project and caps the worst-case coder runs. A plan is model output, so command steps and network stay out of it. A file to edit and run over an in-run approval prompt: the file is the review step, and `--resume` already works on it. `api.plan_graph` is the same in Python.
+
+- `timu graph run --dry-run` prints the worst-case number of coder runs, from a `runs` formula each workflow declares.
+
+- `reproduce-fix-review`: the check must pass, a tester adds tests that make it fail, then `fix-review` runs with them as a check the coder cannot edit (workflow-proposals.md 1). The tester may only add files: an edit to an existing test could weaken it. A separate tester over the coder writing its own test, so the agent that must pass the check does not write it.
+
+- `best-of-n`: coders on separate clones, one after another, each with an equal share of the budget; the check drops failures, a selector picks among the rest, and the pick is reviewed (workflow-proposals.md 4). The budget is split n + 1 ways, so the review keeps a share. Sequential over parallel, since it needs no new concurrency and `--stop-after 1` makes it a fresh-context retry.
+
+- `review-validate-fix` takes `check`, run before the verifier, as `fix-review` does.
+
+- `fix-review` stops before its round limit when another round cannot help: a retry round left the tree unchanged, the check failed with the same output as before once timings and paths are removed, or less budget is left than the largest round used. The last case ends with status `budget`, since a round cut off midway leaves a half-edited tree.
 
 - `fix-review` and `research-fix-review` take a `check`: commands timu runs offline after each coder run, before the review (`--check CMD`). A failing check skips the review; `check_to_fix` sends its log back to the coder. The reviewer gets the passing log. Before, the run was accepted on the reviewer's verdict alone, and the reviewer only reported whether it ran the tests. A fix that edits what the check runs fails the run, as in `check-fix-review`. `coder_summary = false` keeps the coder's summary from the reviewer, to measure whether that summary sways the verdict.
 
@@ -51,6 +69,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Agents trim old tool output, as design 14 claimed they did. Before, every message stayed, so a long run ended with a context-length error or used up the token budget. Once a reply reports over 64k input tokens, results older than the last 3 turns become a stub with their size and first line. On a context-length error, all but the last turn's results are trimmed and the turn is retried. `delegate` and `load_skill` results are kept. Trimming at a size rather than every turn leaves short runs' prompt prefix unchanged, so provider prompt caching still applies.
 
 ### Fixed
+
+- The sim's `timu-*` oracles run the pinned commit's suite with the sim's own Python. `test_has_no_runtime_dependencies` there read the installed timu's metadata, not the tree's, so the new optional extra failed every trial. The oracle Makefile now deselects it, as it does the host-only tests.
+
+- `scripts/sim.py run --arm` ran an arm on any task whose workflow took `check`, so `check` arms would have passed `--review-to-fix` to `review-validate-fix` once it gained a check. An arm now runs only where the workflow takes every param its flags set.
+
+- In `fix-review`, a check that failed after a `CHANGES` review sent the coder only its log, so the review's findings were dropped until the next review. The coder now gets both.
 
 - The sim's `timu-*` task oracles run the full timu suite, about 30 s idle. On a loaded machine they hit the shared 120 s oracle limit and scored `timeout`. A task can now set `oracle_timeout` in `task.toml`; the `timu-*` tasks set 600 s. A per-task limit over a higher global one keeps a hung oracle on a small fixture capped at 120 s.
 

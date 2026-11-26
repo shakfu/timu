@@ -34,11 +34,13 @@ The built-in workflows for `timu run`, in `src/timu/workflow.py`:
 | Workflow | Kind | Steps |
 |-|-|-|
 | `fix-review` (default) | pipeline | Coder, then reviewer. One of the report's first three non-empty lines is `VERDICT: APPROVE` or `VERDICT: CHANGES`. `CHANGES` fails the run, unless `--review-to-fix N` sends the report back to the coder up to N times. A report with no verdict fails the run. `--no-coder-summary` keeps the coder's summary from the reviewer. `--check CMD` runs a command offline after each coder run, before the review; a failure skips the review and fails the run, unless `--check-to-fix N` sends the log back to the coder up to N times. |
+| `reproduce-fix-review` | pipeline | `--check CMD` must pass first. A tester adds tests under `--test-path DIR` (default `tests`) that make it fail; it may only add files. Then `fix-review` runs with the same check, and the coder may not change the new tests. The reviewer sees them and their failing log. `--check-to-reproduce N` sends a check that still passes back to the tester. |
+| `best-of-n` | pipeline | Up to `--candidates N` (default 3) coders, one after another, each on its own clone of `HEAD` with an equal share of the budget. `--check CMD` drops those that fail. `--stop-after N` stops once N pass. With more than one left, a selector picks one from their diffs. Its change is applied to the workdir, then checked and reviewed as in `fix-review`. Needs a clean git tree. |
 | `research-fix-review` | pipeline | Researcher first. Its findings and source URLs go to the coder as untrusted inputs. Then `fix-review`. |
-| `review-validate-fix` | pipeline | Reviewer, validator, coder, verifier. The reviewer reports findings. The validator confirms or rejects each one. The coder fixes the confirmed ones, most severe first. The verifier checks each fix. `--verify-to-fix N` sends unfixed findings back to the coder up to N times. The report lists every finding with each step's verdict. |
+| `review-validate-fix` | pipeline | Reviewer, validator, coder, verifier. The reviewer reports findings. The validator confirms or rejects each one. The coder fixes the confirmed ones, most severe first. The verifier checks each fix. `--verify-to-fix N` sends unfixed findings back to the coder up to N times. `--check CMD` runs before the verifier, as in `fix-review`. The report lists every finding with each step's verdict. |
 | `lead` | delegation | The lead delegates to the researcher, coder and reviewer. Every coder result includes a review, which timu runs, not the lead. Delegation depth is at most 2. |
 
-No step repeats unless a loop flag asks for it. Each loop flag names one back-edge, such as review to fix, and caps how many times it is taken.
+No step repeats unless a loop flag asks for it. Each loop flag names one back-edge, such as review to fix, and caps how many times it is taken. `fix-review` stops before its cap when another round cannot help: the coder changed nothing, the check failed with the same output as before, or less budget is left than a round used.
 
 Each role can use its own model: set `[roles.<name>] model` in `timu.toml`. `review-validate-fix` uses the roles `reviewer`, `validator`, `coder` and `verifier`.
 
@@ -100,24 +102,47 @@ The API key comes from `OPENROUTER_API_KEY`, or the variable `api_key_env` names
 
 The sandbox hides `$HOME` from commands. List any toolchain that lives there, such as uv's Python, in `extra_read`, or commands that use it fail.
 
-### Providers from packages
+### Anthropic and OpenAI
 
-`[provider] type` selects the model client. The default, `chat-completions`, is timu's own OpenAI-compatible client. Any other name is looked up in the `timu.providers` entry-point group, so a separately installed package can add, for example, an SDK-based Anthropic client:
+`[provider] type` selects the model client:
+
+| type | API | Default key |
+|-|-|-|
+| `chat-completions` (default) | OpenAI-compatible chat completions, timu's own client: OpenRouter, local servers | `OPENROUTER_API_KEY` |
+| `anthropic` | Anthropic's Messages API, through the official SDK | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI's Responses API, through the official SDK | `OPENAI_API_KEY` |
+
+The SDK types need the extra: `uv tool install 'timu[extras]'`. Without it, a run that selects one stops and names the command. timu checks that the type's key is set before the run starts. Set `api_key_env = ""` to let the SDK find its own credentials, such as an `ant auth login` profile.
 
 ```toml
-# the package's pyproject.toml
-[project.entry-points."timu.providers"]
-anthropic = "timu_sdk.anthropic:from_settings"
-
-# ~/.config/timu/timu.toml
 [provider]
 type = "anthropic"
 model = "claude-opus-5-5"
 api_key_file = "~/.config/timu/anthropic.key"
-options = { thinking = { budget_tokens = 4096 } }   # passed to the package as is
+options = { max_tokens = 32000, output_config = { effort = "high" } }
 ```
 
-The entry point is a `ProviderFactory`: it takes a `ProviderSettings` and returns a `Provider`. Both are public API in `timu.provider`, and the contract beyond the signatures is in `src/timu/provider/base.py`. For a package's type, `base_url` and `api_key_env` default to empty, so the package's own defaults apply. A package cannot replace `chat-completions`. Only the user's config picks a type, as with every other provider setting.
+- `options` are request parameters, passed as is. For `anthropic`, `max_tokens` defaults to 64000 and `cache = false` turns off prompt caching, which is on. For `openai`, requests default to `store = false` with encrypted reasoning returned, so the model's reasoning carries across turns and nothing is stored at OpenAI; `options` can replace either.
+- Neither API reports a cost. Set `price` for `--max-cost` to apply (below).
+- With `anthropic`, a trimmed history invalidates the thinking blocks after the trim. timu then resends the request once without thinking blocks.
+
+### Providers from packages
+
+Any other `type` is looked up in the `timu.providers` entry-point group, so a separately installed package can add a client:
+
+```toml
+# the package's pyproject.toml
+[project.entry-points."timu.providers"]
+gemini = "timu_gemini:from_settings"
+
+# ~/.config/timu/timu.toml
+[provider]
+type = "gemini"
+model = "<model id>"
+options = { }   # passed to the package as is
+```
+
+The entry point is a `ProviderFactory`: it takes a `ProviderSettings` and returns a `Provider`. Both are public API in `timu.provider`, and the contract beyond the signatures is in `src/timu/provider/base.py`. For a package's type, `base_url` and `api_key_env` default to empty, so the package's own defaults apply. A package cannot replace a built-in type. Only the user's config picks a type, as with every other provider setting.
 
 Roles can use different providers. `[providers.NAME]` takes the keys of `[provider]`, and `[roles.X] provider = "NAME"` selects it:
 
@@ -217,7 +242,7 @@ timu graph run graph.toml
 
 - `${node.output}` may appear only in `params`, and each param is checked against the workflow's schema. `report_path` takes no output. Free text reaches a node only through `inputs`.
 
-- Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review with the failure log as an input and checks again. `check_to_fix` and `review_to_fix` allow loops on each edge; both default to 0. Both take `network = true` and `timeout` in seconds per command. `check-fix-review` uses network for its first `check` run only; re-checks run coder-written code, so they run offline. A node with `network = true` below a node that runs a model fails to load unless it sets `trust_upstream = true`. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
+- Two workflows run commands from the graph file in the sandbox, with no model. `commands` runs `steps` in order. `check-fix-review` runs `check`; if it fails, it runs fix-review from the failure log, with the same `check`. `check_to_fix` and `review_to_fix` allow loops on each edge; both default to 0. Both take `network = true` and `timeout` in seconds per command. `check-fix-review` uses network for its first `check` run only; re-checks run coder-written code, so they run offline. A node with `network = true` below a node that runs a model fails to load unless it sets `trust_upstream = true`. In a command, `${node.output}` is replaced by a file path or a version-like value, shell-quoted; anything else fails the node.
 
   ```toml
   [nodes.wheel]
@@ -251,7 +276,26 @@ timu graph run --resume <run id> graph.toml  # reuse the nodes that run finished
 
 - `--max-parallel` runs ready nodes in threads. Console lines then start with the node id. Approval prompts come one at a time, and other nodes' output waits while you answer.
 
+- `--dry-run` also prints the worst-case number of coder runs: each node's 1 plus its loop params. A node that runs `lead`, or takes a count from an upstream output, has no bound.
+
 - `--resume` reuses a node that ended `done` in the earlier run, if its definition is unchanged, its `ref` is at the same commit, every node it needs is reused too, and its copy is still at the commit that run made. Every other node runs again, and timu prints why.
+
+### Planning a graph
+
+`timu graph plan` asks a planner to write a graph file. It runs no node.
+
+```sh
+timu graph plan --repos lib,app --check "make test" -o plan.toml "Drop Python 3.10"
+timu graph run --dry-run plan.toml
+timu graph run plan.toml
+```
+
+- The planner reads only the `--repos` projects, and has no shell, network or write access.
+- timu checks the answer and appends a `check-fix-review` node with `--check` after the last node on each project. An answer that fails the checks goes back to the planner with the reason, at most `--parse-to-plan` times (default 1).
+- The file starts with a `[plan]` table. While it is there, `timu graph run` allows only `fix-review`, `reproduce-fix-review`, `review-validate-fix` and `check-fix-review` nodes, on the named projects, with no network, `ref`, `models` or `budget` keys. Nodes on one project form one chain, and the worst case may not exceed `--max-coder-runs` (default 20). Delete the table to take the file over.
+- `--input FILE` gives the planner extra context, such as issue text. It marks the plan untrusted, so each node's objective needs approval before its node runs.
+
+`api.plan_graph` does the same from Python and returns a `PlanOutcome`.
 
 ## Python API
 

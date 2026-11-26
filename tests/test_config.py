@@ -285,7 +285,11 @@ def test_a_package_provider_reads_a_key_file(
 @pytest.mark.parametrize(
     ("kind", "options", "message"),
     [
-        ("nope", {}, "no provider type 'nope'; installed: broken, chat-completions"),
+        (
+            "nope",
+            {},
+            "no provider type 'nope'; installed: anthropic, broken, chat-completions",
+        ),
         ("sdk", {"bad": True}, "provider type sdk: options.bad is not allowed"),
         ("broken", {}, "provider type broken: RuntimeError: sdk exploded"),
         ("notcallable", {}, "cannot load: TypeError: provider type 'notcallable'"),

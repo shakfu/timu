@@ -31,6 +31,10 @@ CODER = Role(
     write_roots=(".",),
 )
 
+# reproduce-fix-review: the coder's tools; the workflow narrows write_roots to the
+# test paths, so it cannot change the code under test.
+TESTER = replace(CODER, name="tester", prompt=prompt("tester"), write_roots=())
+
 # Report mode B (default): the report is the final message; the workflow writes it.
 REVIEWER = Role(
     "reviewer",
@@ -55,7 +59,14 @@ REVIEWER_WRITE = replace(
 FINDER = replace(REVIEWER, prompt=prompt("finder"))
 VALIDATOR = replace(REVIEWER, name="validator", prompt=prompt("validator"))
 VERIFIER = replace(REVIEWER, name="verifier", prompt=prompt("verifier"))
+# best-of-n: picks one of the candidates that passed the check.
+SELECTOR = replace(REVIEWER, name="selector", prompt=prompt("selector"))
 
+
+# timu graph plan: reads the named projects, writes nothing. The plan sets read_roots.
+PLANNER = Role(
+    "planner", prompt("planner"), (READ, LIST, SEARCH), frozenset({R}), read_roots=()
+)
 
 LEAD = Role(
     "lead",
@@ -86,9 +97,12 @@ def with_skills(role: Role, names: tuple[str, ...]) -> Role:
 # The role names timu.toml may configure under [roles.<name>].
 ROLE_NAMES = (
     CODER.name,
+    TESTER.name,
     REVIEWER.name,
     VALIDATOR.name,
     VERIFIER.name,
+    SELECTOR.name,
+    PLANNER.name,
     LEAD.name,
     researcher().name,
 )

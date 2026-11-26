@@ -17,20 +17,18 @@ import pytest
 
 from timu import Budget, Event
 from timu.cli import main
+from timu.git import GitError, commit, diff, provision
+from timu.git import no_drivers as _no_drivers
 from timu.graph import (
     Graph,
     GraphError,
     Ref,
     Template,
-    _no_drivers,
     chains,
-    commit,
-    diff,
     extract,
     find_project,
     find_projects,
     parse_graph,
-    provision,
     resumable,
     run_graph,
     serial_order,
@@ -321,7 +319,7 @@ def test_provision_copies_the_commit_and_leaves_the_source_alone(
     assert git(ws, "rev-parse", "HEAD").strip() == base
     assert git(ws, "branch", "--show-current").strip() == "timu/r1/a"
     assert git(src, "for-each-ref") == before  # no branch added to the source
-    with pytest.raises(GraphError, match="is not a commit"):
+    with pytest.raises(GitError, match="is not a commit"):
         provision(src, tmp_path / "work" / "b", "nope", "x")
 
 
@@ -1174,6 +1172,8 @@ def test_cli_dry_run_prints_the_plan_and_runs_nothing(tmp_path: Path) -> None:
         f"  2. b: fix-review on {projects / 'b'} after a\n"
         "       coder c, reviewer r\n"
         "       cost cap none\n"
+        # b takes review_to_fix from a's output
+        "worst case: no bound; a node runs lead or takes a count from upstream\n"
         "graph limits: 200 turns, 400 tool calls, 2000000 tokens, 3600 s\n"
         "ceiling: none; b set no budget.cost_usd and --max-cost is not given\n"
     )

@@ -20,28 +20,31 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
 from timu.config import Config, ConfigError, load_config
 from timu.events import Event, EventSink, JsonlSink
+from timu.git import GitError, provision
+from timu.git import run as git
 from timu.graph import (
     Graph,
     GraphError,
     GraphResult,
     NodeResult,
-    _git,
+    find_project,
     find_projects,
     load_graph,
-    provision,
     resumable,
     seal,
 )
 from timu.graph import (
     run_graph as _run_graph,
 )
+from timu.plan import Planned
+from timu.plan import plan as _plan
 from timu.provider.base import Provider
 from timu.report import ReportError
 from timu.role import Role, RoleError
@@ -228,6 +231,8 @@ def run(
             given[key] = wf.params[key](value)
         except ValueError as e:
             raise UsageError(f"{key} {e}") from None
+    if missing := [k for k in wf.required if k not in given]:
+        raise UsageError(f"{workflow} needs {', '.join(missing)}")
     config = config or _config()
     providers = providers or check_providers(config, wf.roles)
     if not workdir.is_dir():
@@ -237,9 +242,9 @@ def run(
     if not in_place:
         try:
             top = Path(
-                os.path.realpath(_git(source, "rev-parse", "--show-toplevel").strip())
+                os.path.realpath(git(source, "rev-parse", "--show-toplevel").strip())
             )
-        except GraphError:
+        except GitError:
             raise UsageError(f"{source} is not in a git repo; use --in-place") from None
     copied: dict[str, Any] = {}
 
@@ -325,8 +330,10 @@ def run_graph(
             prior=prior,
         )
 
-    if gate is None:
-        gate = any(w.approve_untrusted for w in workflows)
+    if gate is None:  # a planner that read untrusted input wrote every objective
+        gate = any(w.approve_untrusted for w in workflows) or bool(
+            g.plan and g.plan.untrusted
+        )
     result, error, session, trace = _execute(
         config,
         providers,
@@ -350,6 +357,96 @@ def run_graph(
         trace,
         result,
         projects=projects,
+    )
+
+
+@dataclass(frozen=True)
+class PlanOutcome:
+    """What plan_graph made. graph and text are None unless status is done."""
+
+    status: str  # done, failed, budget or cancelled
+    summary: str
+    usage: Usage
+    run_id: str
+    trace: Path
+    graph: Graph | None = None  # parsed and checked
+    text: str | None = None  # the file contents, [plan] table included
+    worst_case: int | None = None  # coder runs (workflow-proposals.md 2.4)
+    errors: tuple[str, ...] = ()  # why each rejected answer was rejected
+    path: Path | None = None  # where text was written, if it was
+    result: Planned | None = None  # None if an error stopped the plan after spending
+
+
+def plan_graph(
+    objective: str,
+    repos: Sequence[str],
+    *,
+    check: Sequence[str],
+    out: Path | None = None,
+    force: bool = False,
+    inputs: Sequence[Artifact] = (),
+    max_coder_runs: int = 20,
+    max_nodes: int = 8,
+    parse_to_plan: int = 1,
+    config: Config | None = None,
+    sink: EventSink | None = None,
+    max_cost: float | None = None,
+    cancel: threading.Event | None = None,
+    providers: Providers | None = None,
+) -> PlanOutcome:
+    """Ask a planner for a graph file over repos, project names under [projects]
+    roots (workflow-proposals.md 2.8). Writes out if given and the plan is done; an
+    existing out needs force. Runs no node. inputs are untrusted extra context: they
+    mark the plan untrusted, so each node's objective needs approval when it runs.
+    Raises UsageError."""
+    if not repos:
+        raise UsageError("a plan needs at least one project")
+    if not check:
+        raise UsageError("a plan needs a check")
+    if out is not None and out.exists() and not force:
+        raise UsageError(f"{out} exists; pass force to replace it")
+    config = config or _config()
+    providers = providers or check_providers(config, ("planner",))
+    try:
+        paths = {r: find_project(r, config.project_roots) for r in repos}
+    except GraphError as e:
+        raise UsageError(str(e)) from None
+
+    def body(session: Session) -> Planned:
+        planned = _plan(
+            session.at(next(iter(paths.values()))),
+            objective,
+            paths,
+            check=check,
+            inputs=inputs,
+            max_coder_runs=max_coder_runs,
+            max_nodes=max_nodes,
+            parse_to_plan=parse_to_plan,
+        )
+        session.emit("workflow_result", status=planned.status, summary=planned.summary)
+        return planned
+
+    planned, error, session, trace = _execute(
+        config, providers, False, None, sink, cancel, max_cost, False, body
+    )
+    if planned is None:
+        return PlanOutcome("failed", error, session.used, session.run_id, trace)
+    path = None
+    if planned.status == "done" and planned.text is not None and out is not None:
+        out.write_text(planned.text, encoding="utf-8")
+        path = out
+    return PlanOutcome(
+        planned.status,
+        planned.summary,
+        session.used,
+        session.run_id,
+        trace,
+        planned.graph,
+        planned.text,
+        planned.worst_case,
+        planned.errors,
+        path,
+        planned,
     )
 
 
@@ -398,7 +495,7 @@ def _run_on_copy(
     branch = f"timu/{session.run_id}/run"
     try:
         base, dirty = provision(top, copy, "HEAD", branch)
-    except GraphError as e:
+    except GitError as e:
         raise GraphError(f"{e}; commit first, or use --in-place") from None
     if not (copy / rel).is_dir():
         raise GraphError(f"{rel} is not in HEAD; commit it, or use --in-place")
@@ -487,7 +584,7 @@ def _execute(
             )
         try:
             return body(session), "", session, trace
-        except (RoleError, ReportError, GraphError) as e:
+        except (RoleError, ReportError, GraphError, GitError) as e:
             if not (session.used.turns or session.used.tool_calls):
                 raise UsageError(str(e)) from None
             return None, str(e), session, trace

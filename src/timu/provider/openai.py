@@ -13,7 +13,6 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from typing import Any
 
 from timu.provider.base import (
@@ -25,11 +24,14 @@ from timu.provider.base import (
     Stop,
     ToolCall,
 )
+from timu.provider.retry import Failure as _Failure
+from timu.provider.retry import is_context_error as _is_context_error
+from timu.provider.retry import retry_after as _retry_after
+from timu.provider.retry import retrying
 from timu.tool import Tool
 from timu.types import Usage
 
 MAX_RESPONSE = 64 * 1024 * 1024  # bytes
-MAX_RETRY_AFTER = 60.0  # seconds; a longer Retry-After falls back to backoff
 STOPS: dict[str, Stop] = {
     "stop": "end",
     "tool_calls": "tool_use",
@@ -37,22 +39,6 @@ STOPS: dict[str, Stop] = {
     "length": "length",
     "content_filter": "refused",
 }
-CONTEXT_HINTS = (
-    "context size",
-    "context length",
-    "context window",
-    "maximum context",
-    "prompt is too long",
-    "too many tokens",
-)
-
-
-@dataclass(frozen=True)
-class _Failure:
-    error: str
-    retryable: bool
-    delay: float | None = None  # from Retry-After
-    delivered: bool = False  # text reached on_text before the failure
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -131,21 +117,13 @@ class OpenAIProvider:
                 for t in tools
             ]
         data = json.dumps(body).encode()
-        for attempt in range(self.retries + 1):
-            outcome = self._attempt(data, on_text)
-            if isinstance(outcome, Reply):
-                return outcome
-            if not outcome.retryable or attempt == self.retries:
-                return Reply("", stop="error", error=outcome.error)
-            if outcome.delivered and on_text:
-                # The retry streams the reply again; mark where it restarts.
-                on_text(f"\n[{outcome.error}; retrying the reply]\n")
-            self._sleep(
-                outcome.delay
-                if outcome.delay is not None
-                else self.retry_delay * 2**attempt
-            )
-        raise AssertionError("unreachable")  # the loop always returns
+        return retrying(
+            lambda: self._attempt(data, on_text),
+            on_text,
+            self.retries,
+            self.retry_delay,
+            self._sleep,
+        )
 
     def _attempt(self, data: bytes, on_text: OnText | None) -> Reply | _Failure:
         headers = {"content-type": "application/json", "accept": "text/event-stream"}
@@ -405,20 +383,3 @@ def _num(v: Any) -> float:
 
 def _clean(b: bytes) -> str:
     return b.decode("utf-8", "replace").replace("\0", "\ufffd")
-
-
-def _is_context_error(body: str) -> bool:
-    """OpenAI's code and llama-server's type first; wording, which varies, after."""
-    if "context_length_exceeded" in body or "exceed_context_size_error" in body:
-        return True
-    lower = body.lower()
-    return any(h in lower for h in CONTEXT_HINTS)
-
-
-def _retry_after(headers: Any) -> float | None:
-    """Retry-After in seconds, if given as a number and not too long."""
-    try:
-        secs = float(headers.get("retry-after", ""))
-    except (TypeError, ValueError, AttributeError):
-        return None
-    return secs if 0 <= secs <= MAX_RETRY_AFTER else None

@@ -34,11 +34,12 @@ from timu.graph import (
     load_graph,
     resumable,
     serial_order,
+    worst_case,
 )
 from timu.provider.base import Provider
 from timu.role import Role
 from timu.trace import BY, TraceError, cache_note, load, render, totals
-from timu.types import Artifact, Usage
+from timu.types import Artifact, Origin, Usage
 from timu.workflow import (
     RUN_ID,
     WORKFLOW_BUDGET,
@@ -54,6 +55,7 @@ EXIT = {
     "cancelled": 130,
 }
 T = TypeVar("T")
+O = TypeVar("O", api.Outcome, api.PlanOutcome)
 USAGE_ERROR = 2
 # C0 and C1 controls but newline and tab, and bidi overrides: on a terminal they can
 # move the cursor, hide text or reorder it. Lone surrogates cannot be encoded at all.
@@ -69,6 +71,10 @@ RUN_PARAMS = {
     "check": "check",
     "check_to_fix": "check_to_fix",
     "coder_summary": "coder_summary",
+    "test_paths": "test_path",
+    "check_to_reproduce": "check_to_reproduce",
+    "n": "candidates",
+    "stop_after": "stop_after",
 }
 
 
@@ -265,6 +271,32 @@ def parser() -> argparse.ArgumentParser:
         help="how many times a failing --check goes back to the coder (default: 0)",
     )
     run.add_argument(
+        "--test-path",
+        action="append",
+        metavar="DIR",
+        help="reproduce-fix-review: where the tester may add tests; repeat for more "
+        "(default: tests)",
+    )
+    run.add_argument(
+        "--check-to-reproduce",
+        type=int,
+        default=0,
+        help="reproduce-fix-review: how many times a check that passes with the new "
+        "tests goes back to the tester (default: 0)",
+    )
+    run.add_argument(
+        "--candidates",
+        type=int,
+        metavar="N",
+        help="best-of-n: how many coders may run (default: 3)",
+    )
+    run.add_argument(
+        "--stop-after",
+        type=int,
+        metavar="N",
+        help="best-of-n: stop once this many candidates pass the check (default: all)",
+    )
+    run.add_argument(
         "--coder-summary",
         action=argparse.BooleanOptionalAction,
         help="give the reviewer the coder's summary of its work (default: on)",
@@ -299,6 +331,56 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the nodes in order, their models and cost caps, and the ceiling; "
         "run nothing",
+    )
+    graph_plan = graph_sub.add_parser(
+        "plan",
+        parents=[common],
+        help="ask a planner for a graph file; run nothing (workflow-proposals.md 2)",
+    )
+    graph_plan.add_argument("objective")
+    graph_plan.add_argument(
+        "--repos",
+        required=True,
+        help="comma-separated projects the plan may touch and the planner may read",
+    )
+    graph_plan.add_argument(
+        "--check",
+        action="append",
+        required=True,
+        metavar="CMD",
+        help="the final check on each project; repeat for more",
+    )
+    graph_plan.add_argument(
+        "-o", "--out", type=Path, default=Path("plan.toml"), help="default: plan.toml"
+    )
+    graph_plan.add_argument(
+        "--force", action="store_true", help="replace an existing output file"
+    )
+    graph_plan.add_argument(
+        "--max-coder-runs",
+        type=positive,
+        default=20,
+        help="reject a plan whose worst case makes more coder runs (default: 20)",
+    )
+    graph_plan.add_argument(
+        "--max-nodes",
+        type=positive,
+        default=8,
+        help="nodes the planner may write, besides the final checks (default: 8)",
+    )
+    graph_plan.add_argument(
+        "--parse-to-plan",
+        type=int,
+        default=1,
+        help="how many times a rejected plan goes back to the planner (default: 1)",
+    )
+    graph_plan.add_argument(
+        "--input",
+        type=Path,
+        action="append",
+        metavar="FILE",
+        help="extra context for the planner, such as issue text; it marks the plan "
+        "untrusted, so each node's objective needs approval when it runs",
     )
     show = sub.add_parser("trace", help="show a run's agent tree, status and cost")
     show.add_argument(
@@ -347,6 +429,8 @@ def main(
         return show_trace(args.run, out, err)
     if args.command == "report":
         return show_report(args.by, out, err)
+    if args.command == "graph" and args.graph_command == "plan":
+        return plan_graph_file(args, provider_for, out, err)
     if args.command == "graph":
         return run_graph_file(args, provider_for, out, err)
     workflow = WORKFLOWS[args.workflow]
@@ -406,8 +490,8 @@ def _interactive(
     args: argparse.Namespace,
     out: TextIO,
     err: TextIO,
-    call: Callable[[threading.Event, EventSink, api.Approve], api.Outcome],
-) -> api.Outcome | int:
+    call: Callable[[threading.Event, EventSink, api.Approve], O],
+) -> O | int:
     """call with a cancel event that the first Ctrl-C sets, a console sink, and a
     terminal prompt for approvals. While the prompt waits, console output pauses, so
     other nodes' lines do not break into it. Returns the outcome, or an exit code
@@ -446,6 +530,69 @@ def _interactive(
         _spent(outcome.usage, outcome.trace, err)
         return EXIT["failed"]
     return outcome
+
+
+def plan_graph_file(
+    args: argparse.Namespace,
+    provider_for: Callable[[Role], Provider] | None,
+    out: TextIO,
+    err: TextIO,
+) -> int:
+    """`timu graph plan OBJECTIVE`: write a checked graph file, then print how to run
+    it."""
+    repos = [r.strip() for r in args.repos.split(",") if r.strip()]
+    if args.parse_to_plan < 0:
+        err.write("timu: --parse-to-plan must be a non-negative integer\n")
+        return USAGE_ERROR
+    inputs = []
+    for f in args.input or ():
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            err.write(f"timu: {e}\n")
+            return USAGE_ERROR
+        inputs.append(
+            Artifact(f"input-{f.name}", text, "input", Origin.USER, str(f), True)
+        )
+    loaded = _load(args, ("planner",), provider_for, err)
+    if isinstance(loaded, int):
+        return loaded
+    config, providers = loaded
+    outcome = _interactive(
+        args,
+        out,
+        err,
+        lambda cancel, sink, approve: api.plan_graph(
+            args.objective,
+            repos,
+            check=args.check,
+            out=args.out,
+            force=args.force,
+            inputs=inputs,
+            max_coder_runs=args.max_coder_runs,
+            max_nodes=args.max_nodes,
+            parse_to_plan=args.parse_to_plan,
+            config=config,
+            sink=sink,
+            max_cost=args.max_cost,
+            cancel=cancel,
+            providers=providers,
+        ),
+    )
+    if isinstance(outcome, int):
+        return outcome
+    if outcome.path is None:
+        err.writelines(
+            printable(f"timu: rejected: {why}") + "\n" for why in outcome.errors
+        )
+        err.write(printable(f"timu: {outcome.status}: {outcome.summary}") + "\n")
+        _spent(outcome.usage, outcome.trace, err)
+        return EXIT[outcome.status]
+    err.write(f"timu: wrote {outcome.path}: {outcome.summary}\n")
+    err.write(f"timu:   timu graph run --dry-run {outcome.path}\n")
+    err.write(f"timu:   timu graph run {outcome.path}\n")
+    _spent(outcome.usage, outcome.trace, err)
+    return 0
 
 
 def run_graph_file(
@@ -571,6 +718,12 @@ def plan(
         else:
             caps += cap
     total = graph.budget or WORKFLOW_BUDGET
+    runs = worst_case(graph)
+    lines.append(
+        f"worst case: {runs} coder runs"
+        if runs is not None
+        else "worst case: no bound; a node runs lead or takes a count from upstream"
+    )
     lines.append(
         f"graph limits: {total.turns} turns, {total.tool_calls} tool calls, "
         f"{total.tokens} tokens, {total.wall_seconds:g} s"

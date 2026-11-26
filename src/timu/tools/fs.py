@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+from timu import git
 from timu.tool import PROTECTED, Context, Tool, ToolOutput
 from timu.types import Capability
 
@@ -181,40 +182,13 @@ def atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def _git_files(base: Path) -> list[Path] | None:
-    """Tracked and untracked files under base, without ignored ones. None if base is
-    not in a git repo. fsmonitor is off because it runs a configured command."""
-    try:
-        out = subprocess.run(
-            [
-                "git",
-                "-c",
-                "core.fsmonitor=false",
-                "ls-files",
-                "-co",
-                "--exclude-standard",
-                "-z",
-            ],
-            cwd=base,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if out.returncode != 0:
-        return None
-    return [base / os.fsdecode(n) for n in sorted(out.stdout.split(b"\0")) if n]
-
-
 def _files(ctx: Context, base: Path) -> Iterator[Path]:
     """Regular files under base inside the read roots, skipping .git and gitignored
     files. Yields resolved paths."""
     if base.is_file():
         yield base
         return
-    listed = _git_files(base)
+    listed = git.files(base)
     if listed is None:
         listed = []
         for dirpath, dirnames, filenames in os.walk(base):
