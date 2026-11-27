@@ -73,7 +73,6 @@ ARMS: Mapping[str, tuple[str, ...]] = {
 }
 
 
-
 def arm_params(arm: str) -> set[str]:
     """The workflow params an arm's flags set; it runs only where all apply."""
     flags = (a[2:] for a in ARMS[arm] if a.startswith("--"))
